@@ -34,6 +34,13 @@ pub const FS_WROTE: &str = "_mjx/fs/wrote";
 pub const INSPECTOR_FRAME: &str = "_mjx/inspector/frame";
 /// Browser to server: send me the whole thread again (used after a reload).
 pub const SESSION_REPLAY: &str = "_mjx/session/replay";
+/// Server to browser: a turn started on an earlier socket has ended.
+///
+/// ACP signals the end of a turn with the response to `session/prompt`, and
+/// that response is owed to whichever browser sent the prompt. When that
+/// browser has gone, nothing in the protocol tells the one now watching that
+/// the turn it inherited is over, and it would show "generating" forever.
+pub const SESSION_TURN_ENDED: &str = "_mjx/session/turn_ended";
 /// Server to browser: another socket has taken this connection over, and this
 /// one is about to close.
 ///
@@ -145,6 +152,16 @@ pub struct InspectorFrame {
     pub intercepted: bool,
 }
 
+/// Payload of [`SESSION_TURN_ENDED`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTurnEnded {
+    /// Which session's turn ended.
+    pub session_id: String,
+    /// Why it ended, spelled as ACP spells it in a `PromptResponse`.
+    pub stop_reason: String,
+}
+
 /// Payload of the [`SESSION_REPLAY`] request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +186,7 @@ mod tests {
             FS_WROTE,
             INSPECTOR_FRAME,
             SESSION_REPLAY,
+            SESSION_TURN_ENDED,
             CONNECTION_TAKEN_OVER,
         ] {
             assert!(method::is_extension(m), "{m} must start with _");

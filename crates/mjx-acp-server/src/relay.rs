@@ -237,6 +237,13 @@ pub struct Relay<I: Interceptor> {
     agent_info: ext::AgentInfo,
     /// The agent's answers to the once-per-agent handshake.
     handshake: tokio::sync::Mutex<Handshake>,
+    /// Questions the agent has put to the browser and is still waiting on.
+    ///
+    /// A browser that leaves mid-turn takes the answer with it, and
+    /// `session/request_permission` parks the turn until *someone* answers.
+    /// Asking the next browser is what makes a reload resume a turn that is
+    /// still running rather than one that has quietly stalled.
+    unanswered: tokio::sync::Mutex<Vec<Frame>>,
     /// Thread state, so a browser that reloads can be given the conversation
     /// back instead of an empty page.
     sessions: tokio::sync::Mutex<SessionStore>,
@@ -357,6 +364,7 @@ pub fn start<I: Interceptor>(
         },
         agent_info,
         handshake: tokio::sync::Mutex::new(Handshake::default()),
+        unanswered: tokio::sync::Mutex::new(Vec::new()),
         sessions: tokio::sync::Mutex::new(SessionStore::new()),
     });
 
@@ -611,12 +619,39 @@ impl<I: Interceptor> Relay<I> {
             .map(str::to_owned)
             .or_else(|| method.map(|m| m.to_string()));
 
+        // Which turn this response ends, read before the store forgets it. Only
+        // needed if the response turns out to be undeliverable, but by then the
+        // record is gone.
+        let ends_turn = if direction == Direction::AgentToClient
+            && matches!(frame, Frame::Response { .. })
+            && label.as_deref() == Some(method::agent::SESSION_PROMPT)
+        {
+            let sessions = self.sessions.lock().await;
+            frame
+                .id()
+                .and_then(|id| sessions.session_of_prompt(id))
+                .map(str::to_owned)
+        } else {
+            None
+        };
+
         {
             let mut sessions = self.sessions.lock().await;
             match direction {
                 Direction::ClientToAgent => sessions.observe_from_client(&frame),
                 Direction::AgentToClient => sessions.observe_from_agent(&frame),
             }
+        }
+
+        // The browser has answered something the agent asked, so stop offering
+        // it to the next browser.
+        if direction == Direction::ClientToAgent
+            && let Frame::Response { id, .. } = &frame
+        {
+            self.unanswered
+                .lock()
+                .await
+                .retain(|asked| asked.id() != Some(id));
         }
 
         // Keep the agent's side of the handshake, so the next browser to attach
@@ -638,11 +673,17 @@ impl<I: Interceptor> Relay<I> {
 
         match disposition {
             Disposition::Forward => {
-                self.forward(direction, &frame).await;
+                // Only what really reaches the browser is worth re-asking. The
+                // interceptor's `fs/*` and `terminal/*` traffic is answered by
+                // the server and never seen there.
+                if direction == Direction::AgentToClient && matches!(frame, Frame::Request { .. }) {
+                    self.unanswered.lock().await.push(frame.clone());
+                }
+                self.forward(direction, &frame, ends_turn).await;
                 self.announce_after_handshake(direction, &frame, label.as_deref())
                     .await;
             }
-            Disposition::Rewrite(rewritten) => self.forward(direction, &rewritten).await,
+            Disposition::Rewrite(rewritten) => self.forward(direction, &rewritten, None).await,
             Disposition::Intercept => {
                 // The browser never sees this frame, so mirror it to the
                 // inspector; otherwise a tool whose job is showing the protocol
@@ -688,6 +729,27 @@ impl<I: Interceptor> Relay<I> {
         };
 
         self.outbox.to_browser(&reply);
+
+        // Only after the replay is on the wire. A permission prompt that
+        // arrived first would be folded into the thread, and the replay would
+        // then replace that thread wholesale and wipe it.
+        if method == ext::SESSION_REPLAY {
+            self.reask_unanswered().await;
+        }
+    }
+
+    /// Puts the agent's outstanding questions to the browser now attached.
+    ///
+    /// They keep the agent's own ids, so the answer correlates without the
+    /// browser having to know it is answering something it never heard asked.
+    async fn reask_unanswered(&self) {
+        for frame in self.unanswered.lock().await.iter() {
+            tracing::debug!(
+                method = frame.method(),
+                "re-asking a departed browser's question"
+            );
+            self.outbox.to_browser(frame);
+        }
     }
 
     /// Answers a handshake this agent has already been through.
@@ -754,7 +816,7 @@ impl<I: Interceptor> Relay<I> {
     /// The agent answers the ids the relay minted; the browser is waiting on
     /// its own. Translating here rather than at every call site means the one
     /// place that can drop a frame is the one place that knows why.
-    async fn forward(&self, direction: Direction, frame: &Frame) {
+    async fn forward(&self, direction: Direction, frame: &Frame, ends_turn: Option<String>) {
         if direction == Direction::AgentToClient
             && let Frame::Response { id, payload } = frame
         {
@@ -763,6 +825,19 @@ impl<I: Interceptor> Relay<I> {
                 // now attached would answer a question it never asked, and
                 // could be read as the answer to a question it did.
                 tracing::debug!(%id, "dropped a response owed to a browser that left");
+                if let Some(session_id) = ends_turn {
+                    // Except that this one carried news. A prompt response is
+                    // the only thing in ACP that says a turn is over, so a
+                    // browser that inherited the turn has to hear it some other
+                    // way or it waits for an end that has already happened.
+                    self.outbox.notify_browser(
+                        ext::SESSION_TURN_ENDED,
+                        &ext::SessionTurnEnded {
+                            session_id,
+                            stop_reason: stop_reason_of(payload),
+                        },
+                    );
+                }
                 return;
             };
             let frame = Frame::Response {
@@ -778,6 +853,20 @@ impl<I: Interceptor> Relay<I> {
     fn send(&self, direction: Direction, line: String) {
         self.outbox.send_line(direction, line);
     }
+}
+
+/// Why a turn ended, as ACP spells it.
+///
+/// A failed prompt still ends the turn — the same reading `SessionStore` takes
+/// — so an error response reports `cancelled` rather than nothing at all.
+fn stop_reason_of(payload: &ResponsePayload) -> String {
+    let ResponsePayload::Result(result) = payload else {
+        return "cancelled".into();
+    };
+    serde_json::from_str::<serde_json::Value>(result.get())
+        .ok()
+        .and_then(|value| value.get("stopReason")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "cancelled".into())
 }
 
 /// The wire spelling of a direction, matching the TypeScript union.

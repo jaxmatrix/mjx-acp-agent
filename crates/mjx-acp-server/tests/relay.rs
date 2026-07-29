@@ -807,6 +807,71 @@ async fn a_reload_mid_turn_rejoins_the_agent_and_its_conversation() {
         "nothing the agent said before the reload survived"
     );
 
+    // The turn is not merely preserved, it is still running: the question the
+    // first tab never answered is put to this one, and answering it lets the
+    // agent carry on to the end.
+    let ended = second.wait_for_ext(ext::SESSION_TURN_ENDED).await;
+    assert_eq!(ended["sessionId"], session_id.as_str());
+    assert_eq!(ended["stopReason"], "end_turn");
+    assert!(
+        second
+            .client_requests
+            .contains(&method::client::SESSION_REQUEST_PERMISSION.to_string()),
+        "the parked question was never re-asked: {:?}",
+        second.client_requests
+    );
+
+    // And the finished turn is what the thread now says.
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    assert_eq!(thread["status"], "idle");
+    assert_eq!(thread["stopReason"], "end_turn");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_question_answered_before_the_reload_is_not_asked_again() {
+    // Re-asking is for questions still outstanding. Repeating one the previous
+    // browser already answered would ask the user to approve the same edit
+    // twice, and the agent is no longer listening for the answer.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session(&mut first).await;
+    // `request` answers every permission prompt on the way through, so by the
+    // time this returns the whole turn is done and nothing is outstanding.
+    first
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    drop(first);
+
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake(&mut second).await;
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+
+    assert!(
+        second.client_requests.is_empty(),
+        "asked again for something already answered: {:?}",
+        second.client_requests
+    );
+
     server.stop().await;
 }
 

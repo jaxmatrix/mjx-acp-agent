@@ -46,6 +46,15 @@ impl SessionStore {
         self.threads.len()
     }
 
+    /// The session a `session/prompt` still in flight belongs to.
+    ///
+    /// A peek, not a take: the relay needs to know which turn a response ends
+    /// *before* [`SessionStore::observe_from_agent`] consumes the record, so it
+    /// can tell a browser that inherited the turn that it is over.
+    pub fn session_of_prompt(&self, id: &RequestId) -> Option<&str> {
+        self.pending_prompts.get(id).map(String::as_str)
+    }
+
     /// Whether nothing is being tracked.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
