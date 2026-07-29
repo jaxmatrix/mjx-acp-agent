@@ -162,6 +162,32 @@ fn the_thread_survives_a_replay_round_trip() {
 }
 
 #[test]
+fn the_serialized_thread_matches_the_checked_in_fixture() {
+    // `fixtures/session-thread.json` is this thread as `_mjx/session/replay`
+    // puts it on the wire, and the browser reads the same file back through its
+    // replay adapter. Pinning it here is what stops the two models drifting in
+    // their *serialization* rather than in their folding: a renamed field or a
+    // newly-omitted empty collection is invisible to every other test and shows
+    // up in a real reload as a blank page.
+    //
+    // Regenerate with:  MJX_UPDATE_FIXTURES=1 cargo test -p mjx-acp-thread
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/session-thread.json");
+    let serialized = format!("{}\n", serde_json::to_string_pretty(&folded()).unwrap());
+
+    if std::env::var_os("MJX_UPDATE_FIXTURES").is_some() {
+        std::fs::write(&path, &serialized).expect("could not write the fixture");
+        return;
+    }
+
+    let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        checked_in, serialized,
+        "the replay fixture is out of date; regenerate with MJX_UPDATE_FIXTURES=1"
+    );
+}
+
+#[test]
 fn folding_is_deterministic() {
     let a = serde_json::to_string(&folded()).unwrap();
     let b = serde_json::to_string(&folded()).unwrap();
