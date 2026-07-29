@@ -135,6 +135,65 @@ export interface SessionMode {
   description?: string | null;
 }
 
+/** One selectable value of a `select` config option. */
+export interface SessionConfigSelectOption {
+  value: string;
+  name: string;
+  description?: string | null;
+}
+
+/** Selectable values under a heading, for agents that group them. */
+export interface SessionConfigSelectGroup {
+  group: string;
+  name: string;
+  options: SessionConfigSelectOption[];
+}
+
+/**
+ * A per-session setting the agent exposes — the model, the thinking level, and
+ * whatever else it chooses to offer.
+ *
+ * `category` is a UX hint and nothing more. It is optional, the spec reserves
+ * the right to add values, and vendors may invent their own with a `_` prefix,
+ * so an unfamiliar one must still render.
+ */
+export type SessionConfigOption = {
+  id: string;
+  name: string;
+  description?: string | null;
+  category?: string | null;
+} & (
+  | {
+      type: "select";
+      currentValue: string;
+      /** Flat or grouped; the wire format has no discriminator for which. */
+      options: SessionConfigSelectOption[] | SessionConfigSelectGroup[];
+    }
+  | { type: "boolean"; currentValue: boolean }
+);
+
+/** A select option's values, once it is known which of the two shapes they are. */
+export type SelectShape =
+  | { grouped: true; groups: SessionConfigSelectGroup[] }
+  | { grouped: false; values: SessionConfigSelectOption[] };
+
+/**
+ * Tells a grouped list of selectable values from a flat one.
+ *
+ * The two are an untagged union on the wire — there is no discriminator — so
+ * the shape of the first entry is the only thing to go on. Getting this wrong
+ * does not throw: it renders a selector with nothing in it, which is why it is
+ * here with a test rather than inline in the component.
+ */
+export function selectShape(
+  options: SessionConfigSelectOption[] | SessionConfigSelectGroup[],
+): SelectShape {
+  const first = options[0];
+  return first && "group" in first && Array.isArray(first.options)
+    ? { grouped: true, groups: options as SessionConfigSelectGroup[] }
+    : { grouped: false, values: options as SessionConfigSelectOption[] };
+}
+
 /** The whole conversation. */
 export interface Thread {
   entries: Entry[];
@@ -144,6 +203,7 @@ export interface Thread {
   usage?: Usage;
   availableCommands: AvailableCommand[];
   modes?: { currentModeId: string; availableModes: SessionMode[] };
+  configOptions: SessionConfigOption[];
   terminals: Record<string, Terminal>;
 }
 
@@ -154,6 +214,7 @@ export function emptyThread(): Thread {
     plan: [],
     status: "idle",
     availableCommands: [],
+    configOptions: [],
     terminals: {},
   };
 }

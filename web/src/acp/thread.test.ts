@@ -10,7 +10,14 @@ import {
   clearPermission,
   setTerminalExit,
 } from "./thread";
-import { chunkText, emptyThread, type Entry, type Thread, type ToolCall } from "./types";
+import {
+  chunkText,
+  emptyThread,
+  type Entry,
+  type SessionConfigOption,
+  type Thread,
+  type ToolCall,
+} from "./types";
 
 /** Wraps an update in the notification the reducer takes. */
 function n(update: unknown): SessionNotification {
@@ -24,6 +31,21 @@ function fold(...updates: unknown[]): Thread {
 
 function text(t: string) {
   return { type: "text", text: t };
+}
+
+/** A model selector, as an agent would advertise it. */
+function modelOption(currentValue: string): SessionConfigOption {
+  return {
+    id: "model",
+    name: "Model",
+    category: "model",
+    type: "select",
+    currentValue,
+    options: [
+      { value: "sonnet", name: "Sonnet" },
+      { value: "opus", name: "Opus" },
+    ],
+  };
 }
 
 /** The single tool call in a thread. */
@@ -325,6 +347,37 @@ describe("plan, commands and usage", () => {
     };
     const updated = applyUpdate(base, n({ sessionUpdate: "current_mode_update", currentModeId: "ask" }));
     expect(updated.modes?.currentModeId).toBe("ask");
+  });
+
+  // The mirror image of the rule above, and the reason the two arms are not
+  // written the same way. Mirrors `a_config_option_update_stands_on_its_own`.
+  test("a config option update stands on its own", () => {
+    const thread = fold({
+      sessionUpdate: "config_option_update",
+      configOptions: [modelOption("sonnet")],
+    });
+
+    expect(thread.configOptions).toHaveLength(1);
+    expect(thread.configOptions[0]?.name).toBe("Model");
+  });
+
+  test("a config option update replaces rather than merges", () => {
+    const base: Thread = {
+      ...emptyThread(),
+      configOptions: [
+        modelOption("sonnet"),
+        { id: "web", name: "Web search", type: "boolean", currentValue: true },
+      ],
+    };
+    const updated = applyUpdate(
+      base,
+      n({ sessionUpdate: "config_option_update", configOptions: [modelOption("opus")] }),
+    );
+
+    // The dropped boolean is not a bug: an agent that stops offering an option
+    // says so by leaving it out of the set it sends.
+    expect(updated.configOptions).toHaveLength(1);
+    expect(updated.configOptions[0]).toMatchObject({ currentValue: "opus" });
   });
 });
 

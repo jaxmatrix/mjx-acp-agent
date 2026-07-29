@@ -212,6 +212,14 @@ pub struct Thread {
     /// Mode state, once the agent reports any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modes: Option<Modes>,
+    /// Per-session settings the agent exposes — the model, the thinking level,
+    /// and whatever else it chooses to offer.
+    ///
+    /// Not wrapped the way [`Modes`] is: a mode state splits "which one" from
+    /// "which are available" into two fields, whereas a config option carries
+    /// its own current value, so there is nothing to pair it with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_options: Vec<acp::SessionConfigOption>,
     /// Counter behind the generated entry ids.
     #[serde(skip)]
     next_id: usize,
