@@ -1,0 +1,43 @@
+# mjx-acp-viewer configuration.
+#
+# Everything here has a working default; the file exists so you can point the
+# server at a different workspace or add your own agent.
+
+[server]
+# Loopback only. Binding elsewhere requires --i-know-this-is-unauthenticated.
+bind = "127.0.0.1:4321"
+
+[workspace]
+# Roots that fs/read_text_file and fs/write_text_file are jailed to, and the
+# choices offered as `cwd` in the agent picker. Relative to this file.
+roots = ["demo/workspace"]
+
+[registry]
+# The ACP agent registry. Fetched once and cached; the catalog still works
+# offline from the cache or from the [[agents]] entries below.
+url = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
+cache_dir = ".mjx-cache"
+
+# Agents defined here take precedence over the registry entry with the same id.
+# Use this to point at an already-installed binary instead of paying npx.
+
+[[agents]]
+id = "mock"
+name = "Mock Agent"
+description = "Scripted agent. No credentials, no network. Exercises every UI surface."
+command = "target/debug/mjx-mock-agent"
+
+[[agents]]
+id = "kilo"
+name = "Kilo"
+description = "The open source coding agent."
+command = "kilo"
+args = ["acp"]
+
+# claude-acp, gemini and codex-acp resolve from the registry:
+#
+#   claude-acp  npx -y @agentclientprotocol/claude-agent-acp@<pinned>
+#   gemini      npx -y @google/gemini-cli@<pinned> --acp
+#   codex-acp   npx -y @agentclientprotocol/codex-acp@<pinned>
+#
+# claude-acp needs no configuration — it reuses the `claude` CLI's own auth.
