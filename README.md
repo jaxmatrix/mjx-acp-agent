@@ -69,7 +69,7 @@ these coexist with the protocol rather than colliding with it.
 
 | Method | Direction | Carries |
 |---|---|---|
-| `_mjx/agent/info` | → browser | which agent started, its command line and cwd |
+| `_mjx/agent/info` | → browser | which agent started, its command line and cwd, and the id to resume it with |
 | `_mjx/agent/stderr` | → browser | the agent's diagnostics, so a crash is visible |
 | `_mjx/terminal/created` | → browser | a terminal exists, before any of its output |
 | `_mjx/terminal/output` | → browser | incremental PTY bytes, base64 |
@@ -77,9 +77,36 @@ these coexist with the protocol rather than colliding with it.
 | `_mjx/fs/wrote` | → browser | a file changed, with before and after |
 | `_mjx/inspector/frame` | → browser | a frame the browser never saw, for the inspector |
 | `_mjx/session/replay` | → server | give me the thread state you folded |
+| `_mjx/session/turn_ended` | → browser | a turn started on an earlier socket has finished |
+| `_mjx/connection/taken_over` | → browser | another tab attached; this socket is closing |
 
 `_mjx/*` is between the browser and this server only. An agent never receives
 one.
+
+### Reloading, and agents that outlive the socket
+
+Closing a tab is not quitting an editor, so the agent does not die with the
+socket. It keeps running, along with the thread the server folded and any
+terminals it started, and the browser is given an id on `_mjx/agent/info` to
+come back with as `?resume=`. On the way back the server answers `initialize`
+and `session/new` from what the agent said the first time — so the reload gets
+the session it already had rather than a second one beside it — and the browser
+replaces its thread from `_mjx/session/replay`.
+
+Two consequences worth knowing:
+
+- **A turn that was running keeps running.** A question the agent asked and the
+  departed browser never answered is put to the browser that replaces it, which
+  is what stops a reload during a permission prompt parking the agent forever.
+- **A second tab takes over rather than being refused.** On a reload the new
+  socket can arrive before the old one's close has been processed, so refusing
+  would make an ordinary refresh fail. The displaced tab is told, and offers to
+  take it back.
+
+An agent nobody comes back to is reaped after `[server] resume_ttl_secs`, five
+minutes by default; `0` turns the whole thing off. `GET /api/connections` shows
+what is currently pooled — without the ids, since a connection id is the
+capability to talk to a running agent and nothing authenticates that endpoint.
 
 ### Two thread models, pinned together
 
@@ -173,7 +200,7 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 | `crates/mjx-acp-thread` | The thread model — a GPUI-free port of Zed's `acp_thread` |
 | `crates/mjx-agent-catalog` | ACP registry fetch and agent command resolution |
 | `crates/mjx-workspace` | Filesystem jail and PTY terminal manager |
-| `crates/mjx-acp-server` | The relay: static assets, `/api/agents`, `/ws` |
+| `crates/mjx-acp-server` | The relay: static assets, `/api/*`, `/ws`, and the pool of running agents |
 | `crates/mjx-mock-agent` | Scripted credential-free agent, for the demo and the tests |
 | `web/` | The browser client; `web/src/acp/` is protocol-only and React-free |
 | `demo/pristine/` | The demo's source project, copied to the ignored `demo/workspace/` |
@@ -182,11 +209,14 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 
 ## Known limitations
 
-- **A page reload starts over.** The agent subprocess lives and dies with the
-  WebSocket, so refreshing gets a new agent and a new session. The server does
-  fold and keep thread state, and serves it over `_mjx/session/replay`, but
-  surviving a reload needs the agent to outlive the socket — a connection-pooling
-  change that isn't done.
+- **A reload keeps the conversation, but not the terminal scrollback.** The
+  agent outlives the socket, so refreshing rejoins the same agent and the same
+  session, and a turn that was running carries on. What a terminal printed
+  before the reload is gone, though: that lives in the workspace rather than in
+  the thread the server folds.
+- **A dropped connection is not reconnected for you.** A new socket can rejoin
+  a running agent, but nothing retries automatically after a network blip —
+  reload the page.
 - **Terminals are display-only.** ACP gives a client no way to type into a
   terminal the agent started, so neither does this.
 - **Binary-only registry agents are not installed for you.** Roughly fifteen

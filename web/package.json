@@ -11,6 +11,7 @@
     "test": "vitest run",
     "typecheck": "tsc -b --noEmit",
     "smoke": "node scripts/smoke.mjs",
+    "smoke:resume": "node scripts/resume-smoke.mjs",
     "capture-fixture": "node scripts/capture-fixture.mjs"
   },
   "dependencies": {

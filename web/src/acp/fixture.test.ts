@@ -16,13 +16,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import type { SessionNotification, SessionUpdate } from "@agentclientprotocol/sdk";
 
+import { threadFromReplay } from "./replay";
 import { appendUserPrompt, applyUpdate } from "./thread";
 import { chunkText, emptyThread, type Thread } from "./types";
 
-const fixturePath = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "../../../fixtures/session-updates.jsonl",
-);
+const fixtures = join(dirname(fileURLToPath(import.meta.url)), "../../../fixtures");
+const fixturePath = join(fixtures, "session-updates.jsonl");
 
 const updates: SessionUpdate[] = readFileSync(fixturePath, "utf8")
   .split("\n")
@@ -98,5 +97,20 @@ describe("the recorded turn", () => {
 
   test("folding is deterministic", () => {
     expect(JSON.stringify(folded())).toBe(JSON.stringify(folded()));
+  });
+
+  test("the server's replay rebuilds exactly what this model folds", () => {
+    // The other assertions here check that both models fold to the same
+    // *shape*. This one checks that the shape survives the wire: a reload gets
+    // the thread as Rust serialized it, and anything the adapter mistranslates
+    // is a conversation that comes back wrong. `toEqual` rather than
+    // `toStrictEqual` on purpose — Rust omits a field where the browser holds
+    // `undefined`, and those mean the same thing.
+    //
+    // Regenerate with:  MJX_UPDATE_FIXTURES=1 cargo test -p mjx-acp-thread
+    const replayed: unknown = JSON.parse(
+      readFileSync(join(fixtures, "session-thread.json"), "utf8"),
+    );
+    expect(threadFromReplay(replayed)).toEqual(folded());
   });
 });

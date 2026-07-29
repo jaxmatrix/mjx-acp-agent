@@ -13,9 +13,12 @@
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
-use mjx_acp_core::{Direction, Frame, JsonRpcError, MethodCorrelator, ext, method};
+use mjx_acp_core::{
+    Direction, Frame, JsonRpcError, MethodCorrelator, ResponsePayload, ext, method,
+};
 
-use crate::agent_process::AgentProcess;
+use crate::agent_process::{AgentHandle, AgentProcess};
+use crate::id_bridge::IdBridge;
 use crate::sessions::SessionStore;
 
 /// How a frame should be handled.
@@ -23,7 +26,10 @@ use crate::sessions::SessionStore;
 /// Only `Forward` is used by the trait defaults; the other two exist for the
 /// filesystem and terminal interceptor, which is the only thing that rewrites
 /// or answers a frame.
-#[allow(dead_code, reason = "Rewrite and Intercept are used by the fs/terminal interceptor")]
+#[allow(
+    dead_code,
+    reason = "Rewrite and Intercept are used by the fs/terminal interceptor"
+)]
 pub enum Disposition {
     /// Pass it on unchanged.
     Forward,
@@ -66,17 +72,112 @@ pub trait Interceptor: Send + Sync + 'static {
     fn stop(&self) {}
 }
 
+/// The browser end of an outbox: whichever socket is attached right now, if any.
+///
+/// An agent outlives the socket that started it, so the thing on the far end of
+/// this changes over a connection's life — a reload detaches one browser and
+/// attaches the next. The indirection lives *inside* the sink rather than around
+/// [`Outbox`], because clones of the outbox are already out in detached tasks by
+/// the time a swap happens (the interceptor's event mirror, and one task per
+/// in-flight `fs/*` or `terminal/*` request) and those clones cannot be
+/// re-pointed after the fact.
+#[derive(Clone, Default)]
+pub struct BrowserSink(Arc<std::sync::Mutex<Attached>>);
+
+/// Whichever socket the sink points at, and which attachment that is.
+#[derive(Default)]
+struct Attached {
+    /// Bumped on every attach. A socket on its way out compares this against
+    /// the number it was given, so it can tell "nobody is here now" from "I
+    /// have been replaced" — and never clears a sink pointing at its successor.
+    generation: u64,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+impl BrowserSink {
+    /// Points the sink at a new socket, returning that attachment's number and
+    /// the receiver its writer task should drain.
+    ///
+    /// The socket already attached, if any, is dropped. Its writer keeps
+    /// running until it has drained what is already queued, so a notice written
+    /// immediately before this call still reaches the browser being displaced.
+    pub fn attach(&self) -> (u64, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut slot = self.slot();
+        slot.generation += 1;
+        slot.sender = Some(tx);
+        (slot.generation, rx)
+    }
+
+    /// Forgets the socket attached as `generation`, if it is still the one
+    /// attached. Frames sent from then on go nowhere.
+    ///
+    /// A socket that has already been taken over must not clear the sink on its
+    /// way out: that would disconnect the tab which just replaced it.
+    pub fn detach(&self, generation: u64) {
+        let mut slot = self.slot();
+        if slot.generation == generation {
+            slot.sender = None;
+        }
+    }
+
+    /// Whether `generation` is still the attachment the sink points at.
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.slot().generation == generation
+    }
+
+    /// Whether a live socket is attached.
+    ///
+    /// A writer task that has ended has dropped its receiver, so the sender is
+    /// closed even though the slot still holds it. Checking that here means a
+    /// socket that went away is never reported as attached, without needing the
+    /// code that noticed to reach back into the sink.
+    pub fn is_attached(&self) -> bool {
+        self.slot()
+            .sender
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
+    }
+
+    /// Sends one line to the attached socket, if there is one.
+    ///
+    /// A frame sent while detached is **dropped**, not queued. What the browser
+    /// misses it gets back from `_mjx/session/replay`, which is a truthful
+    /// snapshot; a queue would instead replay the whole detached period after
+    /// the replay had already rebuilt the thread, duplicating it.
+    fn send(&self, line: String) {
+        let mut slot = self.slot();
+        let Some(sender) = slot.sender.as_ref() else {
+            return;
+        };
+        if sender.send(line).is_err() {
+            // The writer task is gone, so the socket is too. Clear the slot
+            // rather than keep reporting ourselves attached to a dead socket.
+            slot.sender = None;
+        }
+    }
+
+    fn slot(&self) -> std::sync::MutexGuard<'_, Attached> {
+        // A panic in one connection's send must not poison every other
+        // connection's outbox: the value behind the lock is a plain `Option`
+        // and cannot be left half-updated.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// The two sinks a relay writes to.
 #[derive(Clone)]
 pub struct Outbox {
-    to_browser: tokio::sync::mpsc::UnboundedSender<String>,
+    to_browser: BrowserSink,
     to_agent: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl Outbox {
     /// Sends a frame to the browser.
     pub fn to_browser(&self, frame: &Frame) {
-        let _ = self.to_browser.send(frame.to_line());
+        self.to_browser.send(frame.to_line());
     }
 
     /// Sends a frame to the agent. Used by an interceptor to answer a request
@@ -90,15 +191,28 @@ impl Outbox {
     /// exercise an interceptor without a live connection.
     #[cfg(test)]
     pub fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        let (to_browser, _) = tokio::sync::mpsc::unbounded_channel();
         let (to_agent, to_agent_rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Self {
-                to_browser,
+                to_browser: BrowserSink::default(),
                 to_agent,
             },
             to_agent_rx,
         )
+    }
+
+    /// Sends an already-serialized line towards one side.
+    ///
+    /// The relay forwards frames verbatim, including ones it could not parse,
+    /// so this takes a line rather than a [`Frame`]. It exists so nothing
+    /// reaches past [`BrowserSink`] into a sender that a reattach would replace.
+    fn send_line(&self, direction: Direction, line: String) {
+        match direction {
+            Direction::ClientToAgent => {
+                let _ = self.to_agent.send(line);
+            }
+            Direction::AgentToClient => self.to_browser.send(line),
+        }
     }
 
     /// Sends an `_mjx/*` notification to the browser.
@@ -114,32 +228,122 @@ impl Outbox {
 pub struct Relay<I: Interceptor> {
     interceptor: Arc<I>,
     correlator: tokio::sync::Mutex<MethodCorrelator>,
+    /// Browser request ids, mapped onto one id space the agent sees. See
+    /// [`IdBridge`] for why an agent that outlives a socket needs one.
+    ids: tokio::sync::Mutex<IdBridge>,
     outbox: Outbox,
-    /// Held until the `initialize` handshake completes.
+    /// Announced to each browser once its handshake is answered.
     /// See [`Relay::announce_after_handshake`].
-    agent_info: tokio::sync::Mutex<Option<ext::AgentInfo>>,
+    agent_info: ext::AgentInfo,
+    /// The agent's answers to the once-per-agent handshake.
+    handshake: tokio::sync::Mutex<Handshake>,
+    /// Questions the agent has put to the browser and is still waiting on.
+    ///
+    /// A browser that leaves mid-turn takes the answer with it, and
+    /// `session/request_permission` parks the turn until *someone* answers.
+    /// Asking the next browser is what makes a reload resume a turn that is
+    /// still running rather than one that has quietly stalled.
+    unanswered: tokio::sync::Mutex<Vec<Frame>>,
     /// Thread state, so a browser that reloads can be given the conversation
     /// back instead of an empty page.
     sessions: tokio::sync::Mutex<SessionStore>,
 }
 
-/// Runs one connection until either side hangs up.
+/// The agent's answers to the handshake, kept so a browser that reattaches can
+/// be given the same ones without the agent seeing either question twice.
 ///
-/// `browser_rx` yields text frames from the WebSocket; `browser_tx` accepts
-/// them. Keeping this generic over the socket rather than taking an
-/// `axum::extract::ws::WebSocket` is what lets the tests drive it over an
-/// in-memory channel.
-pub async fn run<I, Rx, Tx>(
+/// This is the relay's third interception, and the reason is that both of these
+/// are once-per-*agent* rather than once-per-socket. A second `initialize` on a
+/// live agent is at best redundant and at worst resets it; a second
+/// `session/new` is precisely the bug — a reload starting a fresh conversation
+/// beside the one still running.
+#[derive(Default)]
+struct Handshake {
+    initialize: Option<Box<serde_json::value::RawValue>>,
+    new_session: Option<Box<serde_json::value::RawValue>>,
+    /// Whether the browser now attached should have its first `session/new`
+    /// answered from the recording. Cleared once it has been, so a client that
+    /// deliberately opens a second session still gets a real one.
+    replay_new_session: bool,
+}
+
+impl Handshake {
+    /// Starts a new attachment. The browser arriving is about to ask both
+    /// questions again, and gets the recorded answers if there are any.
+    fn reattach(&mut self) {
+        self.replay_new_session = self.new_session.is_some();
+    }
+
+    /// Remembers what the agent answered, keyed by the method it answers.
+    fn record(&mut self, method: &str, result: &serde_json::value::RawValue) {
+        let slot = match method {
+            method::agent::INITIALIZE => &mut self.initialize,
+            method::agent::SESSION_NEW => &mut self.new_session,
+            _ => return,
+        };
+        // The first answer is the one that holds. A later `session/new` is a
+        // second session, not a correction of the first.
+        slot.get_or_insert_with(|| result.to_owned());
+    }
+
+    /// The recorded answer to `method`, if this attachment should be given it.
+    fn recorded(&mut self, method: &str) -> Option<Box<serde_json::value::RawValue>> {
+        match method {
+            method::agent::INITIALIZE => self.initialize.clone(),
+            method::agent::SESSION_NEW if self.replay_new_session => {
+                self.replay_new_session = false;
+                self.new_session.clone()
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Why an attachment ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detached {
+    /// The browser's socket closed. The agent is untouched and can be
+    /// reattached to.
+    BrowserLeft,
+    /// Another socket attached in this one's place.
+    TakenOver,
+    /// The agent closed its stdout. Nothing can be resumed after this.
+    AgentGone,
+}
+
+/// One agent and everything about it that outlives a browser socket.
+///
+/// The split is the whole point: closing a tab is not quitting an editor, so
+/// the subprocess, the thread state and the workspace's running terminals stay
+/// here while the socket comes and goes. Only the two tasks that touch the
+/// socket itself are rebuilt per [`Connection::attach`].
+pub struct Connection<I: Interceptor> {
+    relay: Arc<Relay<I>>,
+    /// The tasks that talk to the subprocess: the stdin writer, the stderr
+    /// relay and the stdout reader. They keep running with nobody attached,
+    /// which is what lets a turn continue across a reload.
+    agent_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The reader of the socket currently attached, so a socket taking over can
+    /// end the one it displaces. Stored with its attachment number so a socket
+    /// leaving normally does not clear its successor's entry.
+    reader: std::sync::Mutex<Option<(u64, tokio::task::AbortHandle)>>,
+    handle: tokio::sync::Mutex<Option<AgentHandle>>,
+    /// False once the agent's stdout closes or we shut it down. A `watch`
+    /// rather than a `Notify` because `wait_for` also reports a value that was
+    /// already set, so an agent that dies before anyone attaches is still seen.
+    agent_alive: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Starts an agent and everything that outlives a browser socket.
+///
+/// Nothing is attached yet: frames the agent produces before the first
+/// [`Connection::attach`] are dropped, and recovered from the thread the
+/// [`SessionStore`] folds.
+pub fn start<I: Interceptor>(
     interceptor: Arc<I>,
     agent: AgentProcess,
-    mut browser_rx: Rx,
-    mut browser_tx: Tx,
     agent_info: ext::AgentInfo,
-) where
-    I: Interceptor,
-    Rx: futures::Stream<Item = String> + Unpin + Send + 'static,
-    Tx: futures::Sink<String> + Unpin + Send + 'static,
-{
+) -> Arc<Connection<I>> {
     let AgentProcess {
         handle,
         stdin: mut agent_stdin,
@@ -147,17 +351,20 @@ pub async fn run<I, Rx, Tx>(
         stderr: mut agent_stderr,
     } = agent;
 
-    let (to_browser, mut to_browser_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (to_agent, mut to_agent_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let agent_alive = Arc::new(tokio::sync::watch::channel(true).0);
 
     let relay = Arc::new(Relay {
         interceptor,
         correlator: tokio::sync::Mutex::new(MethodCorrelator::new()),
+        ids: tokio::sync::Mutex::new(IdBridge::new()),
         outbox: Outbox {
-            to_browser,
+            to_browser: BrowserSink::default(),
             to_agent,
         },
-        agent_info: tokio::sync::Mutex::new(Some(agent_info)),
+        agent_info,
+        handshake: tokio::sync::Mutex::new(Handshake::default()),
+        unanswered: tokio::sync::Mutex::new(Vec::new()),
         sessions: tokio::sync::Mutex::new(SessionStore::new()),
     });
 
@@ -165,14 +372,6 @@ pub async fn run<I, Rx, Tx>(
 
     // Single writer per destination: handlers run concurrently, and two of them
     // interleaving halves of a frame onto one stream would corrupt both.
-    let browser_writer = tokio::spawn(async move {
-        while let Some(line) = to_browser_rx.recv().await {
-            if browser_tx.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
-
     let agent_writer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         while let Some(mut line) = to_agent_rx.recv().await {
@@ -198,47 +397,172 @@ pub async fn run<I, Rx, Tx>(
         })
     };
 
-    let browser_to_agent = {
-        let relay = relay.clone();
-        tokio::spawn(async move {
-            while let Some(line) = browser_rx.next().await {
-                relay.handle(Direction::ClientToAgent, line).await;
-            }
-            tracing::debug!("browser disconnected");
-        })
-    };
-
     let agent_to_browser = {
         let relay = relay.clone();
+        let agent_alive = agent_alive.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = agent_stdout.next_line().await {
                 relay.handle(Direction::AgentToClient, line).await;
             }
             tracing::debug!("agent closed stdout");
+            let _ = agent_alive.send(false);
         })
     };
 
-    // Either party leaving ends the connection: an agent with no browser has
-    // nobody to ask for permission, and a browser with no agent has nothing to
-    // talk to.
-    tokio::select! {
-        _ = browser_to_agent => {}
-        _ = agent_to_browser => {}
+    Arc::new(Connection {
+        relay,
+        agent_tasks: std::sync::Mutex::new(vec![agent_writer, stderr_relay, agent_to_browser]),
+        reader: std::sync::Mutex::new(None),
+        handle: tokio::sync::Mutex::new(Some(handle)),
+        agent_alive,
+    })
+}
+
+impl<I: Interceptor> Connection<I> {
+    /// Serves one browser socket, returning when it — or the agent — goes away.
+    ///
+    /// `browser_rx` yields text frames from the WebSocket; `browser_tx` accepts
+    /// them. Keeping this generic over the socket rather than taking an
+    /// `axum::extract::ws::WebSocket` is what lets the tests drive it over an
+    /// in-memory channel.
+    pub async fn attach<Rx, Tx>(&self, mut browser_rx: Rx, mut browser_tx: Tx) -> Detached
+    where
+        Rx: futures::Stream<Item = String> + Unpin + Send + 'static,
+        Tx: futures::Sink<String> + Unpin + Send + 'static,
+    {
+        // Whatever the previous browser left in flight is owed to a browser
+        // that is no longer here, and the one arriving now numbers its own
+        // requests from one.
+        self.relay.ids.lock().await.reattach();
+        self.relay.handshake.lock().await.reattach();
+
+        // Take over from whoever is here. The second tab always wins: a browser
+        // that reloads can open its new socket before the old one's close has
+        // been processed, and refusing the second attachment would make an
+        // ordinary refresh fail — the exact thing this is all for.
+        let evicted = self.take_reader();
+        if evicted.is_some() {
+            self.relay
+                .outbox
+                .notify_browser(ext::CONNECTION_TAKEN_OVER, &serde_json::json!({}));
+        }
+
+        // The sink is swapped before the displaced reader is ended, so that
+        // reader wakes up already knowing it has been replaced. Its writer
+        // keeps draining until the queue is empty, which is what gets the
+        // notice above onto the wire.
+        let (generation, mut to_browser_rx) = self.relay.outbox.to_browser.attach();
+        if let Some(evicted) = evicted {
+            evicted.abort();
+        }
+
+        let browser_writer = tokio::spawn(async move {
+            while let Some(line) = to_browser_rx.recv().await {
+                if browser_tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut reader = {
+            let relay = self.relay.clone();
+            tokio::spawn(async move {
+                while let Some(line) = browser_rx.next().await {
+                    relay.handle(Direction::ClientToAgent, line).await;
+                }
+                tracing::debug!("browser disconnected");
+            })
+        };
+        *self.reader_slot() = Some((generation, reader.abort_handle()));
+
+        // A dead agent still ends the socket: a browser with nothing to talk to
+        // is better told than left waiting. The converse is no longer true — an
+        // agent with no browser now waits for the next one.
+        let mut alive = self.agent_alive.subscribe();
+        let detached = tokio::select! {
+            _ = &mut reader => {
+                if self.relay.outbox.to_browser.is_current(generation) {
+                    Detached::BrowserLeft
+                } else {
+                    Detached::TakenOver
+                }
+            }
+            _ = alive.wait_for(|alive| !*alive) => Detached::AgentGone,
+        };
+
+        reader.abort();
+        // Both of these are no-ops once another socket has taken over, which is
+        // the point: its arrival is what ends our writer, and ending that writer
+        // ourselves would drop the notice telling this browser why.
+        self.relay.outbox.to_browser.detach(generation);
+        if detached != Detached::TakenOver {
+            browser_writer.abort();
+        }
+        // One lock, not two: `reader_slot()` is a plain mutex, so testing the
+        // slot in an `if let` and clearing it inside would wait on ourselves.
+        let mut slot = self.reader_slot();
+        if slot
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            *slot = None;
+        }
+        drop(slot);
+
+        detached
     }
 
-    // Resolved before the macro: an `.await` inside `tracing!` holds a
-    // non-Send temporary across it, which makes the whole future non-Send.
-    let session_count = relay.sessions.lock().await.len();
-    tracing::debug!(sessions = session_count, "connection ending");
-    relay.interceptor.stop();
-    stderr_relay.abort();
-    browser_writer.abort();
-    // Aborting the writer drops the agent's stdin, which is the signal most
-    // agents shut down on. It has to happen before we wait for the exit.
-    agent_writer.abort();
-    drop(relay);
+    /// Whether a browser is watching this connection right now.
+    pub fn is_attached(&self) -> bool {
+        self.relay.outbox.to_browser.is_attached()
+    }
 
-    handle.shutdown().await;
+    /// Whether the agent has gone. Nothing can be resumed from here.
+    pub fn is_finished(&self) -> bool {
+        !*self.agent_alive.borrow()
+    }
+
+    /// The agent's process id, while it is running.
+    pub async fn agent_pid(&self) -> Option<u32> {
+        self.handle.lock().await.as_ref().and_then(AgentHandle::pid)
+    }
+
+    fn take_reader(&self) -> Option<tokio::task::AbortHandle> {
+        self.reader_slot().take().map(|(_, handle)| handle)
+    }
+
+    fn reader_slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, tokio::task::AbortHandle)>> {
+        self.reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Ends the agent and everything running on its behalf.
+    pub async fn shutdown(&self) {
+        let _ = self.agent_alive.send(false);
+
+        // Resolved before the macro: an `.await` inside `tracing!` holds a
+        // non-Send temporary across it, which makes the whole future non-Send.
+        let session_count = self.relay.sessions.lock().await.len();
+        tracing::debug!(sessions = session_count, "connection ending");
+        self.relay.interceptor.stop();
+
+        // Aborting the stdin writer drops the agent's stdin, which is the
+        // signal most agents shut down on. It has to happen before we wait for
+        // the exit.
+        for task in self
+            .agent_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+
+        if let Some(handle) = self.handle.lock().await.take() {
+            handle.shutdown().await;
+        }
+    }
 }
 
 impl<I: Interceptor> Relay<I> {
@@ -257,20 +581,59 @@ impl<I: Interceptor> Relay<I> {
             }
         };
 
+        // `_mjx/*` is between the browser and this server; the agent has never
+        // heard of it and must not be sent it. Checked before anything else
+        // observes the frame, because an extension request is answered with the
+        // browser's own id and so must not be rebound below.
+        if direction == Direction::ClientToAgent && frame.method().is_some_and(method::is_extension)
+        {
+            self.handle_extension(&frame).await;
+            return;
+        }
+
+        // A browser that reattached asks the handshake again, because it is an
+        // ordinary ACP client and that is what an ACP client does on a new
+        // connection. Answering it here is what makes resuming transparent: the
+        // agent never sees either question twice, and no client needs to know
+        // it is talking to an agent that was already running.
+        if direction == Direction::ClientToAgent && self.answer_from_recording(&frame).await {
+            return;
+        }
+
+        // Rebind before the correlator and the session store see it, so both
+        // are keyed on the ids the agent will actually answer with. Everything
+        // from here on lives in the agent's id space; the browser's own ids
+        // reappear only in `forward`.
+        let frame = match (direction, &frame) {
+            (Direction::ClientToAgent, Frame::Request { id, method, params }) => Frame::Request {
+                id: self.ids.lock().await.for_agent(id.clone()),
+                method: method.clone(),
+                params: params.clone(),
+            },
+            _ => frame,
+        };
+
         let method = self.correlator.lock().await.observe(direction, &frame);
         let label = frame
             .method()
             .map(str::to_owned)
             .or_else(|| method.map(|m| m.to_string()));
 
-        // `_mjx/*` is between the browser and this server; the agent has never
-        // heard of it and must not be sent it.
-        if direction == Direction::ClientToAgent
-            && frame.method().is_some_and(method::is_extension)
+        // Which turn this response ends, read before the store forgets it. Only
+        // needed if the response turns out to be undeliverable, but by then the
+        // record is gone.
+        let ends_turn = if direction == Direction::AgentToClient
+            && matches!(frame, Frame::Response { .. })
+            && label.as_deref() == Some(method::agent::SESSION_PROMPT)
         {
-            self.handle_extension(&frame).await;
-            return;
-        }
+            let sessions = self.sessions.lock().await;
+            frame
+                .id()
+                .and_then(|id| sessions.session_of_prompt(id))
+                .map(str::to_owned)
+        } else {
+            None
+        };
 
         {
             let mut sessions = self.sessions.lock().await;
@@ -280,6 +643,29 @@ impl<I: Interceptor> Relay<I> {
             }
         }
 
+        // The browser has answered something the agent asked, so stop offering
+        // it to the next browser.
+        if direction == Direction::ClientToAgent
+            && let Frame::Response { id, .. } = &frame
+        {
+            self.unanswered
+                .lock()
+                .await
+                .retain(|asked| asked.id() != Some(id));
+        }
+
+        // Keep the agent's side of the handshake, so the next browser to attach
+        // can be given it without the agent being asked again.
+        if direction == Direction::AgentToClient
+            && let Frame::Response {
+                payload: ResponsePayload::Result(result),
+                ..
+            } = &frame
+            && let Some(method) = label.as_deref()
+        {
+            self.handshake.lock().await.record(method, result);
+        }
+
         let disposition = match direction {
             Direction::ClientToAgent => self.interceptor.on_client_frame(&frame, &self.outbox),
             Direction::AgentToClient => self.interceptor.on_agent_frame(&frame, &self.outbox),
@@ -287,11 +673,17 @@ impl<I: Interceptor> Relay<I> {
 
         match disposition {
             Disposition::Forward => {
-                self.send(direction, frame.to_line());
+                // Only what really reaches the browser is worth re-asking. The
+                // interceptor's `fs/*` and `terminal/*` traffic is answered by
+                // the server and never seen there.
+                if direction == Direction::AgentToClient && matches!(frame, Frame::Request { .. }) {
+                    self.unanswered.lock().await.push(frame.clone());
+                }
+                self.forward(direction, &frame, ends_turn).await;
                 self.announce_after_handshake(direction, &frame, label.as_deref())
                     .await;
             }
-            Disposition::Rewrite(rewritten) => self.send(direction, rewritten.to_line()),
+            Disposition::Rewrite(rewritten) => self.forward(direction, &rewritten, None).await,
             Disposition::Intercept => {
                 // The browser never sees this frame, so mirror it to the
                 // inspector; otherwise a tool whose job is showing the protocol
@@ -326,17 +718,61 @@ impl<I: Interceptor> Relay<I> {
                         // exists, and an empty thread is the honest answer.
                         None => Frame::result(id.clone(), &serde_json::json!(null)),
                     }
-                    .unwrap_or_else(|err| {
-                        Frame::error(id.clone(), JsonRpcError::internal(err))
-                    })
+                    .unwrap_or_else(|err| Frame::error(id.clone(), JsonRpcError::internal(err)))
                 }
-                Ok(None) => Frame::error(id.clone(), JsonRpcError::invalid_params("missing params")),
+                Ok(None) => {
+                    Frame::error(id.clone(), JsonRpcError::invalid_params("missing params"))
+                }
                 Err(err) => Frame::error(id.clone(), JsonRpcError::invalid_params(err)),
             },
             other => Frame::error(id.clone(), JsonRpcError::method_not_found(other)),
         };
 
         self.outbox.to_browser(&reply);
+
+        // Only after the replay is on the wire. A permission prompt that
+        // arrived first would be folded into the thread, and the replay would
+        // then replace that thread wholesale and wipe it.
+        if method == ext::SESSION_REPLAY {
+            self.reask_unanswered().await;
+        }
+    }
+
+    /// Puts the agent's outstanding questions to the browser now attached.
+    ///
+    /// They keep the agent's own ids, so the answer correlates without the
+    /// browser having to know it is answering something it never heard asked.
+    async fn reask_unanswered(&self) {
+        for frame in self.unanswered.lock().await.iter() {
+            tracing::debug!(
+                method = frame.method(),
+                "re-asking a departed browser's question"
+            );
+            self.outbox.to_browser(frame);
+        }
+    }
+
+    /// Answers a handshake this agent has already been through.
+    ///
+    /// Returns whether it did, in which case the frame goes no further.
+    /// A question with no recorded answer — a browser that reloaded during the
+    /// millisecond `initialize` was in flight — falls through and is asked for
+    /// real, which is the only thing that could still work.
+    async fn answer_from_recording(&self, frame: &Frame) -> bool {
+        let Frame::Request { id, method, .. } = frame else {
+            return false;
+        };
+        let Some(result) = self.handshake.lock().await.recorded(method) else {
+            return false;
+        };
+
+        tracing::debug!(method, "answering a repeat handshake from the recording");
+        self.outbox.to_browser(&Frame::Response {
+            id: id.clone(),
+            payload: ResponsePayload::Result(result),
+        });
+        self.announce(method, true);
+        true
     }
 
     /// Sends `_mjx/agent/info` once the `initialize` handshake has completed.
@@ -345,29 +781,92 @@ impl<I: Interceptor> Relay<I> {
     /// nothing about the connection is agreed until it returns — and a
     /// conformant client discards frames that arrive before its response. The
     /// browser would silently never learn which agent it got.
+    ///
+    /// It goes out once per *attachment*, not once per agent: every browser
+    /// that attaches needs to be told what it is talking to, and the one that
+    /// resumed needs to be told that it resumed.
     async fn announce_after_handshake(
         &self,
         direction: Direction,
         frame: &Frame,
         method: Option<&str>,
     ) {
-        if direction != Direction::AgentToClient
-            || !matches!(frame, Frame::Response { .. })
-            || method != Some(method::agent::INITIALIZE)
-        {
+        if direction != Direction::AgentToClient || !matches!(frame, Frame::Response { .. }) {
             return;
         }
-        if let Some(info) = self.agent_info.lock().await.take() {
-            self.outbox.notify_browser(ext::AGENT_INFO, &info);
+        if let Some(method) = method {
+            self.announce(method, false);
         }
     }
 
-    fn send(&self, direction: Direction, line: String) {
-        let _ = match direction {
-            Direction::ClientToAgent => self.outbox.to_agent.send(line),
-            Direction::AgentToClient => self.outbox.to_browser.send(line),
+    /// Announces the agent, if `method` is the handshake that had to come first.
+    fn announce(&self, method: &str, resumed: bool) {
+        if method != method::agent::INITIALIZE {
+            return;
+        }
+        let info = ext::AgentInfo {
+            resumed,
+            ..self.agent_info.clone()
         };
+        self.outbox.notify_browser(ext::AGENT_INFO, &info);
     }
+
+    /// Passes a frame on, putting a response back into the browser's id space.
+    ///
+    /// The agent answers the ids the relay minted; the browser is waiting on
+    /// its own. Translating here rather than at every call site means the one
+    /// place that can drop a frame is the one place that knows why.
+    async fn forward(&self, direction: Direction, frame: &Frame, ends_turn: Option<String>) {
+        if direction == Direction::AgentToClient
+            && let Frame::Response { id, payload } = frame
+        {
+            let Some(id) = self.ids.lock().await.for_browser(id) else {
+                // The browser that asked has gone. Delivering this to the one
+                // now attached would answer a question it never asked, and
+                // could be read as the answer to a question it did.
+                tracing::debug!(%id, "dropped a response owed to a browser that left");
+                if let Some(session_id) = ends_turn {
+                    // Except that this one carried news. A prompt response is
+                    // the only thing in ACP that says a turn is over, so a
+                    // browser that inherited the turn has to hear it some other
+                    // way or it waits for an end that has already happened.
+                    self.outbox.notify_browser(
+                        ext::SESSION_TURN_ENDED,
+                        &ext::SessionTurnEnded {
+                            session_id,
+                            stop_reason: stop_reason_of(payload),
+                        },
+                    );
+                }
+                return;
+            };
+            let frame = Frame::Response {
+                id,
+                payload: payload.clone(),
+            };
+            self.send(direction, frame.to_line());
+            return;
+        }
+        self.send(direction, frame.to_line());
+    }
+
+    fn send(&self, direction: Direction, line: String) {
+        self.outbox.send_line(direction, line);
+    }
+}
+
+/// Why a turn ended, as ACP spells it.
+///
+/// A failed prompt still ends the turn — the same reading `SessionStore` takes
+/// — so an error response reports `cancelled` rather than nothing at all.
+fn stop_reason_of(payload: &ResponsePayload) -> String {
+    let ResponsePayload::Result(result) = payload else {
+        return "cancelled".into();
+    };
+    serde_json::from_str::<serde_json::Value>(result.get())
+        .ok()
+        .and_then(|value| value.get("stopReason")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "cancelled".into())
 }
 
 /// The wire spelling of a direction, matching the TypeScript union.
@@ -521,5 +1020,179 @@ mod tests {
     fn direction_names_match_the_typescript_union() {
         assert_eq!(direction_name(Direction::ClientToAgent), "clientToAgent");
         assert_eq!(direction_name(Direction::AgentToClient), "agentToClient");
+    }
+
+    fn stderr_line(text: &str) -> Frame {
+        Frame::notification(ext::AGENT_STDERR, &ext::AgentStderr { line: text.into() }).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_frame_sent_while_nobody_is_attached_is_dropped() {
+        // Not queued. An agent left running while a browser is away can produce
+        // megabytes of terminal output, and flushing it on reattach would
+        // arrive *after* the replay that already rebuilt the thread — out of
+        // order, and duplicating what the replay just said.
+        let sink = BrowserSink::default();
+        assert!(!sink.is_attached());
+        sink.send(stderr_line("into the void").to_line());
+
+        let (_, mut browser) = sink.attach();
+        assert!(sink.is_attached());
+        sink.send(stderr_line("after attaching").to_line());
+
+        let line = browser
+            .recv()
+            .await
+            .expect("the attached socket gets frames");
+        assert!(line.contains("after attaching"), "{line}");
+        assert!(
+            browser.try_recv().is_err(),
+            "the frame sent while detached was queued rather than dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn attaching_again_replaces_the_socket_that_was_there() {
+        // This is take-over: the second tab wins, and the first one's writer
+        // ends because its receiver is dropped.
+        let sink = BrowserSink::default();
+        let (_, mut first) = sink.attach();
+        let (_, mut second) = sink.attach();
+
+        sink.send(stderr_line("hello").to_line());
+
+        assert!(
+            second.recv().await.is_some(),
+            "the newest socket should receive"
+        );
+        assert!(
+            first.recv().await.is_none(),
+            "the replaced socket's receiver should be closed, ending its writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_stops_delivery_without_ending_the_outbox() {
+        let sink = BrowserSink::default();
+        let (generation, mut browser) = sink.attach();
+        sink.detach(generation);
+        assert!(!sink.is_attached());
+
+        // Sending after a detach must not panic and must not deliver.
+        sink.send(stderr_line("nobody home").to_line());
+        assert!(browser.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_went_away_is_forgotten() {
+        // A connection reports whether a browser is watching it, and a socket
+        // whose writer has ended is not one.
+        let sink = BrowserSink::default();
+        let (_, browser) = sink.attach();
+        drop(browser);
+
+        assert!(!sink.is_attached(), "a closed sender is not an attachment");
+        sink.send(stderr_line("to a closed socket").to_line());
+        assert!(!sink.is_attached(), "a closed sender should clear the slot");
+    }
+
+    #[tokio::test]
+    async fn a_displaced_socket_cannot_detach_its_successor() {
+        // The ordering that makes take-over safe. The first socket wakes up
+        // *after* the second has attached, and calls `detach` with its own
+        // number on the way out; if that cleared the sink, the tab that just
+        // took over would go silent.
+        let sink = BrowserSink::default();
+        let (first, _first_rx) = sink.attach();
+        let (second, mut second_rx) = sink.attach();
+
+        sink.detach(first);
+
+        assert!(sink.is_current(second));
+        sink.send(stderr_line("still connected").to_line());
+        assert!(
+            second_rx.recv().await.is_some(),
+            "the successor was cut off"
+        );
+    }
+
+    fn result(json: serde_json::Value) -> Box<serde_json::value::RawValue> {
+        serde_json::value::to_raw_value(&json).unwrap()
+    }
+
+    #[test]
+    fn a_reattached_browser_is_given_the_handshake_the_agent_already_answered() {
+        let mut handshake = Handshake::default();
+        handshake.record(
+            method::agent::INITIALIZE,
+            &result(json!({"protocolVersion": 1})),
+        );
+        handshake.record(
+            method::agent::SESSION_NEW,
+            &result(json!({"sessionId": "s1"})),
+        );
+
+        handshake.reattach();
+
+        assert!(handshake.recorded(method::agent::INITIALIZE).is_some());
+        let session = handshake.recorded(method::agent::SESSION_NEW).unwrap();
+        assert!(session.get().contains("s1"));
+    }
+
+    #[test]
+    fn a_fresh_connection_has_nothing_to_answer_from() {
+        let mut handshake = Handshake::default();
+        handshake.reattach();
+        assert!(handshake.recorded(method::agent::INITIALIZE).is_none());
+        assert!(handshake.recorded(method::agent::SESSION_NEW).is_none());
+    }
+
+    #[test]
+    fn only_the_first_session_new_of_an_attachment_is_replayed() {
+        // A reload asks for the session it already had. A client that then
+        // deliberately opens a second one must reach the agent, or resuming
+        // would have quietly capped every client at one session forever.
+        let mut handshake = Handshake::default();
+        handshake.record(
+            method::agent::SESSION_NEW,
+            &result(json!({"sessionId": "s1"})),
+        );
+        handshake.reattach();
+
+        assert!(handshake.recorded(method::agent::SESSION_NEW).is_some());
+        assert!(
+            handshake.recorded(method::agent::SESSION_NEW).is_none(),
+            "the second session/new must reach the agent"
+        );
+    }
+
+    #[test]
+    fn the_first_answer_is_the_one_kept() {
+        // `record` sees every session/new response, including ones for extra
+        // sessions. The conversation to come back to is the first.
+        let mut handshake = Handshake::default();
+        handshake.record(
+            method::agent::SESSION_NEW,
+            &result(json!({"sessionId": "s1"})),
+        );
+        handshake.record(
+            method::agent::SESSION_NEW,
+            &result(json!({"sessionId": "s2"})),
+        );
+        handshake.reattach();
+
+        let session = handshake.recorded(method::agent::SESSION_NEW).unwrap();
+        assert!(session.get().contains("s1"), "{}", session.get());
+    }
+
+    #[test]
+    fn other_methods_are_not_recorded() {
+        let mut handshake = Handshake::default();
+        handshake.record(
+            method::agent::SESSION_PROMPT,
+            &result(json!({"stopReason": "end_turn"})),
+        );
+        handshake.reattach();
+        assert!(handshake.recorded(method::agent::SESSION_PROMPT).is_none());
     }
 }

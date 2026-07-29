@@ -7,9 +7,11 @@
 //! There is no authentication, deliberately, so the demo works with no setup.
 //! See SECURITY.md; the loopback default below is the compensating control.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -26,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 mod agent_process;
 mod config;
+mod id_bridge;
 mod relay;
 mod sessions;
 mod workspace_interceptor;
@@ -63,6 +66,116 @@ struct Args {
 struct AppState {
     config: Config,
     catalog: Catalog,
+    connections: Connections,
+}
+
+/// Agents that outlive their sockets, keyed by the id a browser passes back as
+/// `?resume=`.
+#[derive(Default)]
+struct Connections(std::sync::Mutex<HashMap<String, Arc<Pooled>>>);
+
+/// One agent, still running, waiting for a browser.
+struct Pooled {
+    /// What it was started for. A resume asking for a different agent or a
+    /// different directory is not this connection, and must not be answered by
+    /// it — an id is a handle to one conversation, not to the pool.
+    agent_id: String,
+    cwd: PathBuf,
+    connection: Arc<relay::Connection<WorkspaceInterceptor>>,
+    /// When the last socket went away; `None` while one is attached.
+    idle_since: std::sync::Mutex<Option<Instant>>,
+}
+
+impl Pooled {
+    /// How long this has had nobody watching it.
+    fn idle_for(&self) -> Option<Duration> {
+        self.idle_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|since| since.elapsed())
+    }
+
+    fn mark_attached(&self) {
+        *self
+            .idle_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn mark_idle(&self) {
+        *self
+            .idle_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+    }
+}
+
+impl AppState {
+    /// Ends every pooled agent. Called on the way out.
+    async fn shutdown_all(&self) {
+        let pooled = self.connections.take_all();
+        if pooled.is_empty() {
+            return;
+        }
+        tracing::info!(
+            agents = pooled.len(),
+            "stopping agents that outlived their sockets"
+        );
+        for pooled in pooled {
+            pooled.connection.shutdown().await;
+        }
+    }
+}
+
+impl Connections {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Pooled>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The pooled agent `id` names, if it is the one being asked for.
+    ///
+    /// A mismatched agent or directory is treated as no match rather than as an
+    /// error, for the same reason an unknown id is: the browser gets a fresh
+    /// agent, which is what it wanted, instead of a failed page load.
+    fn resume(&self, id: &str, agent_id: &str, cwd: &Path) -> Option<Arc<Pooled>> {
+        let pooled = self.lock().get(id).cloned()?;
+        (pooled.agent_id == agent_id && pooled.cwd == cwd).then_some(pooled)
+    }
+
+    fn insert(&self, id: String, pooled: Arc<Pooled>) {
+        self.lock().insert(id, pooled);
+    }
+
+    fn remove(&self, id: &str) -> Option<Arc<Pooled>> {
+        self.lock().remove(id)
+    }
+
+    /// Takes everything, for shutdown.
+    fn take_all(&self) -> Vec<Arc<Pooled>> {
+        self.lock().drain().map(|(_, pooled)| pooled).collect()
+    }
+
+    /// Takes every connection nobody came back to within `ttl`.
+    ///
+    /// Removed under the lock and shut down outside it: `shutdown` waits on a
+    /// subprocess, and holding a `std::sync::Mutex` across an await would be a
+    /// deadlock waiting to happen.
+    fn take_expired(&self, ttl: Duration) -> Vec<(String, Arc<Pooled>)> {
+        let mut connections = self.lock();
+        let expired: Vec<String> = connections
+            .iter()
+            .filter(|(_, pooled)| {
+                pooled.connection.is_finished() || pooled.idle_for().is_some_and(|idle| idle >= ttl)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|id| connections.remove(&id).map(|pooled| (id, pooled)))
+            .collect()
+    }
 }
 
 #[tokio::main]
@@ -110,21 +223,25 @@ async fn main() -> Result<()> {
         .web_dir
         .unwrap_or_else(|| config.base_dir.join("web/dist"));
     let bind = config.bind;
-    let state = Arc::new(AppState { config, catalog });
+    let state = Arc::new(AppState {
+        config,
+        catalog,
+        connections: Connections::default(),
+    });
+    tokio::spawn(reap_idle_connections(state.clone()));
 
     let mut app = Router::new()
         .route("/api/agents", get(list_agents))
         .route("/api/workspaces", get(list_workspaces))
+        .route("/api/connections", get(list_connections))
         .route("/ws", get(websocket))
-        .with_state(state);
+        .with_state(state.clone());
 
     if web_dir.is_dir() {
         // `index.html` is the fallback so a client-side route still resolves.
-        app = app.fallback_service(
-            tower_http::services::ServeDir::new(&web_dir).fallback(
-                tower_http::services::ServeFile::new(web_dir.join("index.html")),
-            ),
-        );
+        app = app.fallback_service(tower_http::services::ServeDir::new(&web_dir).fallback(
+            tower_http::services::ServeFile::new(web_dir.join("index.html")),
+        ));
         tracing::info!(dir = %web_dir.display(), "serving the web app");
     } else {
         tracing::warn!(
@@ -141,8 +258,48 @@ async fn main() -> Result<()> {
     let bound = listener.local_addr().unwrap_or(bind);
     tracing::info!("listening on http://{bound}");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(interrupted())
+        .await?;
+
+    // Agents outlive their sockets now, so at any moment there may be several
+    // running with nobody watching them. They have to be ended here: a
+    // subprocess whose parent has gone is reparented to init and keeps whatever
+    // terminals it started, which is exactly the orphan this feature is
+    // supposed to avoid rather than create.
+    state.shutdown_all().await;
     Ok(())
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// SIGKILL cannot be caught, so nothing here saves an agent from `kill -9` on
+/// the server. Ctrl-C and `systemctl stop` are what actually happen.
+async fn interrupted() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "could not listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutting down");
 }
 
 async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -192,6 +349,11 @@ struct Connect {
     /// Working directory for the session. Must be inside a workspace root.
     #[serde(default)]
     cwd: Option<String>,
+    /// A connection id from a previous socket, to rejoin the agent it started
+    /// rather than start another. Unknown or expired ids are not an error: the
+    /// browser gets a fresh agent and is told so.
+    #[serde(default)]
+    resume: Option<String>,
 }
 
 async fn websocket(
@@ -249,42 +411,77 @@ async fn websocket(
         .find(|e| e.id == connect.agent)
         .map_or_else(|| connect.agent.clone(), |e| e.name);
 
-    let agent = match AgentProcess::spawn(&command, &cwd) {
-        Ok(agent) => agent,
-        Err(err) => {
-            tracing::error!(%err, agent = connect.agent, "could not start the agent");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not start {}: {err:#}", connect.agent),
-            )
-                .into_response();
+    // Rejoin the agent this browser was already talking to, if it is still
+    // here. Everything about the connection — the subprocess, the thread, the
+    // running terminals — is on the other side of this.
+    let resumed = connect
+        .resume
+        .as_deref()
+        .and_then(|id| state.connections.resume(id, &connect.agent, &cwd));
+
+    let (id, pooled) = match resumed {
+        Some(pooled) => {
+            let id = connect.resume.clone().unwrap_or_default();
+            tracing::info!(connection = %id, agent = %connect.agent, "rejoining a running agent");
+            (id, pooled)
+        }
+        None => {
+            let agent = match AgentProcess::spawn(&command, &cwd) {
+                Ok(agent) => agent,
+                Err(err) => {
+                    tracing::error!(%err, agent = connect.agent, "could not start the agent");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("could not start {}: {err:#}", connect.agent),
+                    )
+                        .into_response();
+                }
+            };
+
+            // Random rather than sequential, because it has to stay unique
+            // across restarts of this server: a browser holding a stale id from
+            // a previous run must not be handed somebody else's conversation
+            // that happens to have been given the same number.
+            let id = uuid::Uuid::new_v4().to_string();
+            let info = ext::AgentInfo {
+                agent_id: connect.agent.clone(),
+                name: agent_name,
+                command: command.display(),
+                cwd: cwd.display().to_string(),
+                connection_id: id.clone(),
+                // Set per attachment by the relay, which is what knows whether
+                // it answered the handshake from a recording.
+                resumed: false,
+            };
+
+            // The jail is the session's cwd plus every configured root, so an
+            // agent can read a shared library directory while writing only its
+            // own project.
+            let interceptor = Arc::new(WorkspaceInterceptor::new(
+                state.config.workspace_roots.clone(),
+                cwd.clone(),
+            ));
+
+            tracing::info!(connection = %id, agent = %info.agent_id, cwd = %info.cwd, "agent started");
+            let pooled = Arc::new(Pooled {
+                agent_id: connect.agent.clone(),
+                cwd: cwd.clone(),
+                connection: relay::start(interceptor, agent, info),
+                idle_since: std::sync::Mutex::new(Some(Instant::now())),
+            });
+            // With resuming turned off there is nothing to come back to, so the
+            // connection is never registered and dies with its socket.
+            if !state.config.resume_ttl.is_zero() {
+                state.connections.insert(id.clone(), pooled.clone());
+            }
+            (id, pooled)
         }
     };
 
-    let info = ext::AgentInfo {
-        agent_id: connect.agent.clone(),
-        name: agent_name,
-        command: command.display(),
-        cwd: cwd.display().to_string(),
-    };
-
-    // The jail is the session's cwd plus every configured root, so an agent
-    // can read a shared library directory while writing only its own project.
-    let interceptor = Arc::new(WorkspaceInterceptor::new(
-        state.config.workspace_roots.clone(),
-        cwd,
-    ));
-
-    tracing::info!(agent = %info.agent_id, cwd = %info.cwd, "connection opened");
-    ws.on_upgrade(move |socket| serve(socket, agent, interceptor, info))
+    ws.on_upgrade(move |socket| serve(socket, state, id, pooled))
 }
 
-async fn serve(
-    socket: WebSocket,
-    agent: AgentProcess,
-    interceptor: Arc<WorkspaceInterceptor>,
-    info: ext::AgentInfo,
-) {
+async fn serve(socket: WebSocket, state: Arc<AppState>, id: String, pooled: Arc<Pooled>) {
     let (sink, stream) = socket.split();
 
     // Only text frames carry protocol. A close or a transport error ends the
@@ -312,7 +509,88 @@ async fn serve(
     let incoming = Box::pin(incoming);
     let outgoing = Box::pin(outgoing);
 
-    relay::run(interceptor, agent, incoming, outgoing, info.clone()).await;
+    pooled.mark_attached();
+    let detached = pooled.connection.attach(incoming, outgoing).await;
+    pooled.mark_idle();
+    tracing::info!(connection = %id, ?detached, "socket closed");
 
-    tracing::info!(agent = %info.agent_id, "connection closed");
+    // A browser leaving is not the agent leaving: it stays, and the reaper
+    // deals with it if nobody comes back. An agent that has gone is different —
+    // there is nothing left to resume, so retire the id now rather than let a
+    // reload attach to a corpse and wait for a handshake that never arrives.
+    if detached == relay::Detached::AgentGone
+        && let Some(pooled) = state.connections.remove(&id)
+    {
+        pooled.connection.shutdown().await;
+    }
+}
+
+/// Ends connections nobody came back to.
+///
+/// An agent that outlives its socket has to be reaped by something, or a closed
+/// tab leaves a subprocess and its terminals running for as long as the server
+/// does. The sweep is coarse on purpose: the TTL is minutes, so being a few
+/// seconds late costs nothing.
+async fn reap_idle_connections(state: Arc<AppState>) {
+    let ttl = state.config.resume_ttl;
+    if ttl.is_zero() {
+        return;
+    }
+    let interval = ttl.min(Duration::from_secs(15)).max(Duration::from_secs(1));
+
+    loop {
+        tokio::time::sleep(interval).await;
+        for (id, pooled) in state.connections.take_expired(ttl) {
+            // Resolved before the macro: an `.await` inside `tracing!` holds a
+            // non-Send temporary across it, which makes the whole future
+            // non-Send and so unspawnable.
+            let pid = pooled.connection.agent_pid().await;
+            tracing::info!(
+                connection = %id,
+                agent = %pooled.agent_id,
+                ?pid,
+                "reaping a connection nobody came back to"
+            );
+            pooled.connection.shutdown().await;
+        }
+    }
+}
+
+/// One pooled agent, for `GET /api/connections`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionSummary {
+    agent_id: String,
+    cwd: String,
+    attached: bool,
+    /// Seconds since the last socket went away; absent while one is attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    idle_seconds: Option<u64>,
+    /// The agent's process id, so that a reaped agent can be shown to be gone
+    /// rather than merely forgotten.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+}
+
+/// Lists the agents currently pooled.
+///
+/// Deliberately without their connection ids. A connection id is the capability
+/// to speak to a running agent — reading its conversation, prompting it, and
+/// through it reaching the workspace — and this endpoint has no authentication
+/// in front of it. Handing those out here would be a wider hole than the one
+/// SECURITY.md already describes.
+async fn list_connections(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let pooled: Vec<Arc<Pooled>> = state.connections.lock().values().cloned().collect();
+
+    let mut summaries = Vec::with_capacity(pooled.len());
+    for pooled in pooled {
+        summaries.push(ConnectionSummary {
+            agent_id: pooled.agent_id.clone(),
+            cwd: pooled.cwd.display().to_string(),
+            attached: pooled.connection.is_attached(),
+            idle_seconds: pooled.idle_for().map(|idle| idle.as_secs()),
+            pid: pooled.connection.agent_pid().await,
+        });
+    }
+    axum::Json(summaries)
 }

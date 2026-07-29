@@ -17,14 +17,20 @@ fn folded() -> Thread {
     let mut thread = Thread::new();
     // The capture starts after the prompt was sent, so mirror what the client
     // does: the user's message is on screen before the agent says anything.
-    thread.push_user_prompt(vec![acp::ContentBlock::from("fix the median bug in stats.js")]);
+    thread.push_user_prompt(vec![acp::ContentBlock::from(
+        "fix the median bug in stats.js",
+    )]);
 
     for (line_number, line) in FIXTURE.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let update: acp::SessionUpdate = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("fixture line {} is not a SessionUpdate: {e}", line_number + 1));
+        let update: acp::SessionUpdate = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!(
+                "fixture line {} is not a SessionUpdate: {e}",
+                line_number + 1
+            )
+        });
         thread.apply(&update);
     }
     thread
@@ -80,7 +86,11 @@ fn the_recorded_turn_folds_to_a_stable_shape() {
     assert!(first.chunks[1].text().contains("stats.js"));
 
     // Three tool calls, all finished.
-    let calls: Vec<_> = thread.entries.iter().filter_map(Entry::as_tool_call).collect();
+    let calls: Vec<_> = thread
+        .entries
+        .iter()
+        .filter_map(Entry::as_tool_call)
+        .collect();
     assert_eq!(calls.len(), 3);
     assert_eq!(
         calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
@@ -100,7 +110,11 @@ fn the_recorded_turn_folds_to_a_stable_shape() {
     let Some(acp::ToolCallContent::Diff(diff)) = edit.content.first() else {
         panic!("the edit tool call has no diff");
     };
-    assert!(diff.old_text.as_deref().is_some_and(|t| t.contains("return sorted[mid];")));
+    assert!(
+        diff.old_text
+            .as_deref()
+            .is_some_and(|t| t.contains("return sorted[mid];"))
+    );
     assert!(diff.new_text.contains("/ 2"));
 
     // The plan finished fully ticked off.
@@ -135,12 +149,42 @@ fn the_thread_survives_a_replay_round_trip() {
     );
 
     let restored_edit = restored.tool_call("call_edit").unwrap();
-    assert_eq!(restored_edit.content.len(), 1, "the diff was lost in replay");
+    assert_eq!(
+        restored_edit.content.len(),
+        1,
+        "the diff was lost in replay"
+    );
 
     let Entry::Assistant(first) = &restored.entries[1] else {
         panic!("expected an assistant message");
     };
     assert_eq!(first.chunks.len(), 2);
+}
+
+#[test]
+fn the_serialized_thread_matches_the_checked_in_fixture() {
+    // `fixtures/session-thread.json` is this thread as `_mjx/session/replay`
+    // puts it on the wire, and the browser reads the same file back through its
+    // replay adapter. Pinning it here is what stops the two models drifting in
+    // their *serialization* rather than in their folding: a renamed field or a
+    // newly-omitted empty collection is invisible to every other test and shows
+    // up in a real reload as a blank page.
+    //
+    // Regenerate with:  MJX_UPDATE_FIXTURES=1 cargo test -p mjx-acp-thread
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/session-thread.json");
+    let serialized = format!("{}\n", serde_json::to_string_pretty(&folded()).unwrap());
+
+    if std::env::var_os("MJX_UPDATE_FIXTURES").is_some() {
+        std::fs::write(&path, &serialized).expect("could not write the fixture");
+        return;
+    }
+
+    let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        checked_in, serialized,
+        "the replay fixture is out of date; regenerate with MJX_UPDATE_FIXTURES=1"
+    );
 }
 
 #[test]

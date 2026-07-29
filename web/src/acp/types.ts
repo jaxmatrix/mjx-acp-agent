@@ -176,6 +176,10 @@ export interface AgentInfo {
   name: string;
   command: string[];
   cwd: string;
+  /** Pass this back as `resume` to rejoin this agent after a reload. */
+  connectionId: string;
+  /** True when this socket rejoined an agent that was already running. */
+  resumed: boolean;
 }
 
 /** An entry in the agent picker, from `GET /api/agents`. */

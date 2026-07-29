@@ -5,13 +5,16 @@
 //! the browser's is checked against (see
 //! `crates/mjx-acp-thread/tests/fixture.rs`).
 //!
-//! **Limitation.** This state lives and dies with the WebSocket, because the
-//! agent subprocess does: closing the socket ends the connection and the agent
-//! with it. So replay currently helps a browser that lost its *in-memory* copy
-//! on a live connection, not one that reloaded the page — a reload starts a
-//! new agent and a new session. Surviving a reload needs the agent to outlive
-//! the socket, which is a connection-pooling change in the server, not a
-//! change here.
+//! This state lives with the *agent*, not with the socket. An agent outlives
+//! the browser that started it (see `relay::Connection`), so a page that
+//! reloads and comes back with its connection id is given this thread rather
+//! than an empty one.
+//!
+//! **What it does not hold.** Terminal scrollback: a terminal belongs to the
+//! workspace rather than to the thread, so a resumed page shows the tool call
+//! that started one without the output it produced. Nor does it hold a
+//! permission prompt — that is a request in flight, and the relay re-asks it
+//! after the replay instead.
 
 use std::collections::HashMap;
 
@@ -44,6 +47,15 @@ impl SessionStore {
     /// How many sessions are being tracked.
     pub fn len(&self) -> usize {
         self.threads.len()
+    }
+
+    /// The session a `session/prompt` still in flight belongs to.
+    ///
+    /// A peek, not a take: the relay needs to know which turn a response ends
+    /// *before* [`SessionStore::observe_from_agent`] consumes the record, so it
+    /// can tell a browser that inherited the turn that it is over.
+    pub fn session_of_prompt(&self, id: &RequestId) -> Option<&str> {
+        self.pending_prompts.get(id).map(String::as_str)
     }
 
     /// Whether nothing is being tracked.
@@ -102,7 +114,8 @@ impl SessionStore {
                     }
                 } else if let Some(index) = self.pending_new_sessions.iter().position(|p| p == id) {
                     self.pending_new_sessions.remove(index);
-                    if let Ok(response) = serde_json::from_str::<acp::NewSessionResponse>(result.get())
+                    if let Ok(response) =
+                        serde_json::from_str::<acp::NewSessionResponse>(result.get())
                     {
                         let thread = self
                             .threads
@@ -277,7 +290,9 @@ mod tests {
     fn unrelated_traffic_is_ignored() {
         let mut store = SessionStore::new();
         store.observe_from_client(&request(1, "initialize", json!({ "protocolVersion": 1 })));
-        store.observe_from_agent(&Frame::notification("_mjx/agent/stderr", &json!({ "line": "x" })).unwrap());
+        store.observe_from_agent(
+            &Frame::notification("_mjx/agent/stderr", &json!({ "line": "x" })).unwrap(),
+        );
         assert!(store.is_empty());
     }
 

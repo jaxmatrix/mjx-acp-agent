@@ -9,6 +9,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import { createWebSocketStream } from "@agentclientprotocol/sdk/experimental/ws-client";
 
 import { decodeChunk, ext, websocketUrl, type ConnectOptions } from "./connection";
+import { threadFromReplay } from "./replay";
 import {
   addTerminal,
   appendTerminalOutput,
@@ -37,6 +38,8 @@ export type SessionStatus =
   | { state: "connecting" }
   | { state: "ready"; sessionId: string }
   | { state: "failed"; message: string }
+  /** Another tab attached to this agent, and this socket is being closed. */
+  | { state: "takenOver" }
   | { state: "closed" };
 
 /** A live session. */
@@ -48,6 +51,15 @@ export class Session {
   #events: SessionEvents;
   /** Resolvers for permission prompts the user hasn't answered yet. */
   #pendingPermissions = new Map<string, (optionId: string | null) => void>();
+  /** Whether this socket rejoined an agent that was already running. */
+  #resumed = false;
+  /**
+   * Set when another tab took this connection over.
+   *
+   * The socket closes straight afterwards, and the close handler must not
+   * overwrite the explanation with a bare "closed".
+   */
+  #takenOver = false;
 
   constructor(initial: Thread, events: SessionEvents) {
     this.#thread = initial;
@@ -82,8 +94,13 @@ export class Session {
       this.#agent = connection.agent;
 
       connection.closed
-        .then(() => this.#events.status({ state: "closed" }))
+        .then(() => {
+          // A socket that was taken over has already been explained. Saying
+          // "closed" now would replace the reason with the symptom.
+          if (!this.#takenOver) this.#events.status({ state: "closed" });
+        })
         .catch((error: unknown) => {
+          if (this.#takenOver) return;
           this.#events.status({ state: "failed", message: describe(error) });
         });
 
@@ -111,11 +128,43 @@ export class Session {
         }));
       }
 
+      // On a resumed connection neither of those requests reached the agent:
+      // the server answered both from what the agent said the first time, so
+      // this is the same session it was already running. What it has been doing
+      // since is in the thread the server folded.
+      if (this.#resumed) await this.#replay(connection.agent, session.sessionId);
+
       void initialized;
       this.#events.status({ state: "ready", sessionId: session.sessionId });
     } catch (error) {
       this.#events.status({ state: "failed", message: describe(error) });
       throw error;
+    }
+  }
+
+  /**
+   * Takes the conversation back from the server after a reload.
+   *
+   * The thread is **replaced**, not merged. The server's copy is the whole
+   * conversation, folded from the same stream this side would have folded, so
+   * anything already here is a duplicate of part of it.
+   *
+   * A failure is survivable: the connection is real and the agent is running,
+   * so an empty timeline is a worse page rather than a broken one, and saying
+   * so beats refusing to connect.
+   */
+  async #replay(agent: acp.ClientContext, sessionId: string): Promise<void> {
+    try {
+      const replayed: unknown = await agent.request(ext.sessionReplay, { sessionId });
+      const thread = threadFromReplay(replayed);
+      if (thread) this.#update(() => thread);
+    } catch (error) {
+      this.#events.frame({
+        direction: "agentToClient",
+        method: ext.sessionReplay,
+        intercepted: true,
+        line: `could not replay the thread: ${describe(error)}`,
+      });
     }
   }
 
@@ -220,7 +269,32 @@ export class Session {
     const passthrough = <T>(value: unknown): T => value as T;
 
     app.onNotification(ext.agentInfo, passthrough<AgentInfo>, (ctx) => {
+      // Sent immediately after the handshake response, a full round trip
+      // before `session/new` resolves, so this is always set by the time
+      // `connect` reads it.
+      this.#resumed = ctx.params.resumed === true;
       this.#events.agentInfo(ctx.params);
+    });
+
+    app.onNotification(
+      ext.sessionTurnEnded,
+      passthrough<{ sessionId: string; stopReason: string }>,
+      (ctx) => {
+        // A turn started on a socket that has since gone. ACP ends a turn with
+        // the response to `session/prompt`, and that response was owed to the
+        // browser that sent it — so without this the thread would sit at
+        // "generating" for a turn that finished minutes ago.
+        this.#update((thread) => ({
+          ...thread,
+          status: "idle",
+          stopReason: ctx.params.stopReason as StopReason,
+        }));
+      },
+    );
+
+    app.onNotification(ext.connectionTakenOver, passthrough<unknown>, () => {
+      this.#takenOver = true;
+      this.#events.status({ state: "takenOver" });
     });
 
     app.onNotification(ext.agentStderr, passthrough<{ line: string }>, (ctx) => {

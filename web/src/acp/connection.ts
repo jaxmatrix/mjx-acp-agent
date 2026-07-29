@@ -15,14 +15,21 @@
 export interface ConnectOptions {
   agentId: string;
   cwd?: string;
+  /**
+   * A connection id from a previous socket, to rejoin the agent it started
+   * rather than start another. An unknown or expired one is not an error — the
+   * server says so on `_mjx/agent/info` and starts a fresh agent.
+   */
+  resume?: string;
 }
 
 /** The URL of the relay endpoint for `agentId`. */
-export function websocketUrl({ agentId, cwd }: ConnectOptions): string {
+export function websocketUrl({ agentId, cwd, resume }: ConnectOptions): string {
   const url = new URL("/ws", window.location.href);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.searchParams.set("agent", agentId);
   if (cwd) url.searchParams.set("cwd", cwd);
+  if (resume) url.searchParams.set("resume", resume);
   return url.toString();
 }
 
@@ -36,6 +43,8 @@ export const ext = {
   fsWrote: "_mjx/fs/wrote",
   inspectorFrame: "_mjx/inspector/frame",
   sessionReplay: "_mjx/session/replay",
+  sessionTurnEnded: "_mjx/session/turn_ended",
+  connectionTakenOver: "_mjx/connection/taken_over",
 } as const;
 
 /** Decodes a base64 terminal chunk into the bytes xterm.js wants. */

@@ -86,9 +86,28 @@ struct Server {
     dir: tempfile::TempDir,
 }
 
+/// What a test wants a server to be configured with.
+struct ServerOptions {
+    /// `[server] resume_ttl_secs`. Long by default, so a test that is not about
+    /// reaping never races the reaper.
+    resume_ttl_secs: u64,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            resume_ttl_secs: 300,
+        }
+    }
+}
+
 impl Server {
     /// Starts the server and waits until it reports the port it bound.
     async fn start() -> Self {
+        Self::start_with(ServerOptions::default()).await
+    }
+
+    async fn start_with(options: ServerOptions) -> Self {
         let repo = project_root();
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
@@ -107,12 +126,19 @@ impl Server {
         // tests never touch the network.
         let cache = base.join(".cache");
         std::fs::create_dir_all(&cache).unwrap();
-        std::fs::copy(repo.join("fixtures/registry.json"), cache.join("registry.json")).unwrap();
+        std::fs::copy(
+            repo.join("fixtures/registry.json"),
+            cache.join("registry.json"),
+        )
+        .unwrap();
 
         std::fs::write(
             base.join("mjx.toml"),
             format!(
                 r#"
+                [server]
+                resume_ttl_secs = {}
+
                 [workspace]
                 roots = ["workspace"]
 
@@ -125,6 +151,7 @@ impl Server {
                 name = "Mock Agent"
                 command = "{}"
                 "#,
+                options.resume_ttl_secs,
                 mock_agent_binary().display(),
             ),
         )
@@ -152,7 +179,11 @@ impl Server {
 
         // Drain stderr independently so a full pipe can never block the server.
         let mut stderr = BufReader::new(child.stderr.take().unwrap()).lines();
-        tokio::spawn(async move { while let Ok(Some(_)) = stderr.next_line().await {} });
+        tokio::spawn(async move {
+            while let Ok(Some(l)) = stderr.next_line().await {
+                eprintln!("[srv-err] {l}");
+            }
+        });
         let port = tokio::time::timeout(Duration::from_secs(30), async {
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(addr) = line.split("listening on http://").nth(1) {
@@ -165,7 +196,11 @@ impl Server {
         .expect("the server did not start within 30s");
 
         // Keep draining stdout too, for the same reason.
-        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        tokio::spawn(async move {
+            while let Ok(Some(l)) = lines.next_line().await {
+                eprintln!("[srv] {l}");
+            }
+        });
 
         Self { child, port, dir }
     }
@@ -184,6 +219,21 @@ impl Server {
     }
 
     async fn stop(mut self) {
+        let _ = self.child.kill().await;
+    }
+
+    /// Stops the server the way a person does, and waits for it to exit.
+    ///
+    /// `stop` sends SIGKILL, which nothing can clean up after. SIGTERM is what
+    /// Ctrl-C and a service manager send, and what the server can act on.
+    #[cfg(unix)]
+    async fn terminate(mut self) {
+        if let Some(pid) = self.child.id() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(15), self.child.wait()).await;
         let _ = self.child.kill().await;
     }
 }
@@ -288,15 +338,72 @@ impl Client {
                         &json!({ "outcome": { "outcome": "selected", "optionId": "allow_once" } }),
                     )
                     .unwrap(),
-                    _ => Frame::error(
-                        id,
-                        mjx_acp_core::JsonRpcError::method_not_found(&method),
-                    ),
+                    _ => Frame::error(id, mjx_acp_core::JsonRpcError::method_not_found(&method)),
                 };
                 self.send(&reply).await;
             }
             Frame::Response { id, .. } => panic!("unsolicited response to {id}"),
         }
+    }
+
+    /// Sends a request without waiting for its answer.
+    ///
+    /// Needed to be *in* a turn rather than after one: `request` pumps until
+    /// the response arrives, and a turn that is still running has not sent one.
+    async fn start_request(&mut self, method: &str, params: Value) -> RequestId {
+        let id = RequestId::Number(self.next_id);
+        self.next_id += 1;
+        self.send(&Frame::Request {
+            id: id.clone(),
+            method: method.into(),
+            params: Some(serde_json::value::to_raw_value(&params).unwrap()),
+        })
+        .await;
+        id
+    }
+
+    /// Pumps until the agent asks `method`, and leaves it deliberately
+    /// unanswered — which is what parks a turn mid-flight.
+    async fn wait_for_client_request(&mut self, method: &str) {
+        loop {
+            match self.next_frame().await {
+                Frame::Request { method: asked, .. } if asked == method => {
+                    self.client_requests.push(asked);
+                    return;
+                }
+                other => self.handle(other).await,
+            }
+        }
+    }
+
+    /// Reads until the server closes the socket.
+    ///
+    /// Notifications along the way are recorded but requests are not answered:
+    /// this is only ever used on a socket that is being shut down, and writing
+    /// to it would be a race with the close.
+    async fn expect_closed(&mut self) {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(30), self.socket.next())
+                .await
+                .expect("the socket was not closed within 30s");
+            match message {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(Frame::Notification { method, params }) = Frame::parse(&text) {
+                        let params: Value = params
+                            .as_deref()
+                            .and_then(|p| serde_json::from_str(p.get()).ok())
+                            .unwrap_or(Value::Null);
+                        self.ext_notifications.push((method, params));
+                    }
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    fn saw_ext(&self, method: &str) -> bool {
+        self.ext_notifications.iter().any(|(m, _)| m == method)
     }
 
     /// Reads frames until an `_mjx/*` notification with this method shows up.
@@ -372,7 +479,12 @@ async fn the_catalog_is_served_over_http() {
         .json()
         .await
         .unwrap();
-    assert!(workspaces[0]["path"].as_str().unwrap().ends_with("workspace"));
+    assert!(
+        workspaces[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("workspace")
+    );
 
     server.stop().await;
 }
@@ -529,7 +641,10 @@ async fn fs_and_terminal_are_served_by_the_server_not_the_browser() {
     let wrote = client.wait_for_ext(ext::FS_WROTE).await;
     assert!(wrote["path"].as_str().unwrap().ends_with("stats.js"));
     assert!(
-        wrote["oldText"].as_str().unwrap().contains("return sorted[mid];"),
+        wrote["oldText"]
+            .as_str()
+            .unwrap()
+            .contains("return sorted[mid];"),
         "the mirrored diff has no before-text"
     );
 
@@ -603,7 +718,9 @@ async fn the_server_can_replay_the_thread_it_watched() {
     assert_eq!(thread["status"], "idle");
     assert_eq!(thread["stopReason"], "end_turn");
 
-    let entries = thread["entries"].as_array().expect("no entries in the replay");
+    let entries = thread["entries"]
+        .as_array()
+        .expect("no entries in the replay");
     assert!(entries.len() >= 5, "only {} entries", entries.len());
     assert_eq!(entries[0]["type"], "user", "the prompt is missing");
 
@@ -611,11 +728,9 @@ async fn the_server_can_replay_the_thread_it_watched() {
     let tool_calls: Vec<&Value> = entries.iter().filter(|e| e["type"] == "toolCall").collect();
     assert_eq!(tool_calls.len(), 3);
     assert!(
-        tool_calls
-            .iter()
-            .any(|call| call["content"]
-                .as_array()
-                .is_some_and(|c| c.iter().any(|item| item["type"] == "diff"))),
+        tool_calls.iter().any(|call| call["content"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|item| item["type"] == "diff"))),
         "the diff was lost"
     );
 
@@ -628,6 +743,325 @@ async fn the_server_can_replay_the_thread_it_watched() {
         .request(ext::SESSION_REPLAY, json!({ "sessionId": "nope" }))
         .await;
     assert!(missing.is_null());
+
+    server.stop().await;
+}
+
+/// Handshakes, opens a session, and returns `(connection id, session id)`.
+async fn open_session(client: &mut Client) -> (String, String) {
+    let info = handshake(client).await;
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    (
+        info["connectionId"].as_str().unwrap().to_string(),
+        session["sessionId"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn a_reload_mid_turn_rejoins_the_agent_and_its_conversation() {
+    // The whole point. A browser that reloads while the agent is working must
+    // come back to the same agent, the same session and the same conversation —
+    // not to a fresh agent that has never heard of any of it.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session(&mut first).await;
+
+    first
+        .start_request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    // Park the turn: the agent asks permission and blocks until someone
+    // answers, which is exactly the moment a person reaches for reload.
+    first
+        .wait_for_client_request(method::client::SESSION_REQUEST_PERMISSION)
+        .await;
+    drop(first);
+
+    // The reload.
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake(&mut second).await;
+    assert_eq!(info["resumed"], true, "started a new agent instead: {info}");
+    assert_eq!(info["connectionId"], connection_id.as_str());
+
+    // The browser asks for a session because that is what an ACP client does on
+    // a new connection. It must be given the one already running, not another.
+    let session = second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    assert_eq!(
+        session["sessionId"], session_id,
+        "the reload started a second session beside the one still running"
+    );
+
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    assert_eq!(
+        thread["status"], "generating",
+        "the turn was abandoned rather than left running"
+    );
+    let entries = thread["entries"].as_array().expect("no entries");
+    assert_eq!(entries[0]["type"], "user", "the prompt was lost");
+    assert!(
+        entries.len() > 1,
+        "nothing the agent said before the reload survived"
+    );
+
+    // The turn is not merely preserved, it is still running: the question the
+    // first tab never answered is put to this one, and answering it lets the
+    // agent carry on to the end.
+    let ended = second.wait_for_ext(ext::SESSION_TURN_ENDED).await;
+    assert_eq!(ended["sessionId"], session_id.as_str());
+    assert_eq!(ended["stopReason"], "end_turn");
+    assert!(
+        second
+            .client_requests
+            .contains(&method::client::SESSION_REQUEST_PERMISSION.to_string()),
+        "the parked question was never re-asked: {:?}",
+        second.client_requests
+    );
+
+    // And the finished turn is what the thread now says.
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    assert_eq!(thread["status"], "idle");
+    assert_eq!(thread["stopReason"], "end_turn");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_question_answered_before_the_reload_is_not_asked_again() {
+    // Re-asking is for questions still outstanding. Repeating one the previous
+    // browser already answered would ask the user to approve the same edit
+    // twice, and the agent is no longer listening for the answer.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session(&mut first).await;
+    // `request` answers every permission prompt on the way through, so by the
+    // time this returns the whole turn is done and nothing is outstanding.
+    first
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    drop(first);
+
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake(&mut second).await;
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+
+    assert!(
+        second.client_requests.is_empty(),
+        "asked again for something already answered: {:?}",
+        second.client_requests
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_tab_takes_the_connection_over_and_tells_the_first() {
+    // Take-over rather than refusal, deliberately: on a reload the new socket
+    // can arrive before the old one's close has been processed, so refusing the
+    // second attachment would make an ordinary refresh fail.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, _) = open_session(&mut first).await;
+
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake(&mut second).await;
+    assert_eq!(info["resumed"], true);
+
+    first.expect_closed().await;
+    assert!(
+        first.saw_ext(ext::CONNECTION_TAKEN_OVER),
+        "the displaced tab was cut off without being told why: {:?}",
+        first.ext_notifications
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_unknown_resume_id_starts_a_fresh_connection() {
+    // An expired or stale id is an ordinary thing for a reloading browser to
+    // arrive with. Refusing the upgrade would turn a routine event into a page
+    // that will not load.
+    let server = Server::start().await;
+
+    let mut client = Client::connect(&server.ws("agent=mock&resume=not-a-real-id")).await;
+    let info = handshake(&mut client).await;
+
+    assert_eq!(info["resumed"], false);
+    assert_ne!(info["connectionId"], "not-a-real-id");
+    assert!(
+        info["connectionId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_resume_id_is_a_handle_to_one_conversation_not_to_the_pool() {
+    // The id names an agent in a directory. Answering a request for a different
+    // directory with it would hand a browser someone else's workspace.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, _) = open_session(&mut first).await;
+    drop(first);
+
+    let elsewhere = server.dir.path().join("workspace").join("nested");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut second = Client::connect(&server.ws(&format!(
+        "agent=mock&resume={connection_id}&cwd={}",
+        elsewhere.display()
+    )))
+    .await;
+    let info = handshake(&mut second).await;
+
+    assert_eq!(
+        info["resumed"], false,
+        "a resume for another directory was answered by the wrong agent"
+    );
+
+    server.stop().await;
+}
+
+/// Whether a process is still running.
+///
+/// `kill -0` rather than reading `/proc`, so this works on any Unix. The server
+/// waits on the child it spawned, so a reaped agent is not left a zombie for
+/// this to be fooled by.
+fn process_is_alive(pid: u64) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_the_server_takes_its_agents_with_it() {
+    // An agent that outlives its socket is, for a while, a subprocess with
+    // nobody watching it. If the server goes without ending them, they are
+    // reparented to init and keep whatever terminals they started — an orphan
+    // holding a PTY forever, which is worse than the lost session this feature
+    // exists to save.
+    let server = Server::start().await;
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    open_session(&mut client).await;
+
+    let pooled: Vec<Value> = reqwest::get(server.http("/api/connections"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pid = pooled[0]["pid"].as_u64().expect("no pid reported");
+
+    // Leave the socket open: the agent has to be ended because the server is
+    // going, not because anyone disconnected.
+    server.terminate().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while process_is_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server exited but left agent {pid} running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_abandoned_connection_is_reaped_and_its_agent_killed() {
+    // An agent that outlives its socket has to be ended by something. An
+    // orphan holding a subprocess and a PTY forever is worse than losing the
+    // session it was keeping.
+    let server = Server::start_with(ServerOptions { resume_ttl_secs: 3 }).await;
+
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    open_session(&mut client).await;
+
+    let pooled: Vec<Value> = reqwest::get(server.http("/api/connections"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pooled.len(), 1, "{pooled:?}");
+    assert_eq!(pooled[0]["attached"], true);
+    assert!(
+        pooled[0].get("id").is_none(),
+        "a connection id is the capability to talk to a running agent, and this \
+         endpoint has no authentication in front of it: {:?}",
+        pooled[0]
+    );
+    let pid = pooled[0]["pid"].as_u64().expect("no pid reported");
+    assert!(process_is_alive(pid), "the agent never started");
+
+    drop(client);
+
+    // Poll for the outcome rather than sleeping for the TTL and asserting once:
+    // the deadline is generous, so a slow machine makes the test slower rather
+    // than making it fail.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while process_is_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the agent nobody came back to is still running as pid {pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let pooled: Vec<Value> = reqwest::get(server.http("/api/connections"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        pooled.is_empty(),
+        "the registry still lists a dead agent: {pooled:?}"
+    );
 
     server.stop().await;
 }
