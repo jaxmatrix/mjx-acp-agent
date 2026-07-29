@@ -5,13 +5,16 @@
 //! the browser's is checked against (see
 //! `crates/mjx-acp-thread/tests/fixture.rs`).
 //!
-//! **Limitation.** This state lives and dies with the WebSocket, because the
-//! agent subprocess does: closing the socket ends the connection and the agent
-//! with it. So replay currently helps a browser that lost its *in-memory* copy
-//! on a live connection, not one that reloaded the page — a reload starts a
-//! new agent and a new session. Surviving a reload needs the agent to outlive
-//! the socket, which is a connection-pooling change in the server, not a
-//! change here.
+//! This state lives with the *agent*, not with the socket. An agent outlives
+//! the browser that started it (see `relay::Connection`), so a page that
+//! reloads and comes back with its connection id is given this thread rather
+//! than an empty one.
+//!
+//! **What it does not hold.** Terminal scrollback: a terminal belongs to the
+//! workspace rather than to the thread, so a resumed page shows the tool call
+//! that started one without the output it produced. Nor does it hold a
+//! permission prompt — that is a request in flight, and the relay re-asks it
+//! after the replay instead.
 
 use std::collections::HashMap;
 

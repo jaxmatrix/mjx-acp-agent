@@ -26,9 +26,12 @@ ACP *client* role                   relay + capability host        claude-acp / 
   an ordinary ACP client and the agent an ordinary ACP agent. *Forward it* is the default for
   everything — a relay that only passes what it understands breaks the day either peer speaks a
   newer protocol version.
-- **Exactly two interceptions**, both in `mjx-acp-server`: rewriting `initialize` to declare the
-  capabilities the server provides, and answering `fs/*` and `terminal/*` itself because the
-  workspace is server-side. Adding a third needs a reason written down.
+- **Exactly three interceptions**, all in `mjx-acp-server`: rewriting `initialize` to declare the
+  capabilities the server provides; answering `fs/*` and `terminal/*` itself because the workspace
+  is server-side; and answering a *repeat* `initialize` or `session/new` from what the agent said
+  the first time, because both are once-per-agent and an agent now outlives the socket that started
+  it — a browser that reloads asks them again, and a second `session/new` reaching the agent is
+  precisely the bug that resuming exists to fix. Adding a fourth needs a reason written down.
 - **`_mjx/*` is ours, and never reaches an agent.** It carries what ACP has no vocabulary for
   because it only arises when the client is remote. Defined once in `mjx-acp-core::ext`.
 - **Two thread models, held together by a fixture.** `crates/mjx-acp-thread` (Rust, server) and

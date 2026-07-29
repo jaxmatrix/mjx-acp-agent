@@ -24,14 +24,24 @@ read files, write files, and execute commands.
   asked for, with the server process's privileges and environment. The
   filesystem jail does not apply to it.
 - There is no rate limiting, no session isolation between browser tabs beyond
-  one subprocess per socket, and no audit log beyond the in-memory inspector.
+  one subprocess per connection, and no audit log beyond the in-memory
+  inspector.
+- **A connection id is a bearer capability.** An agent outlives the socket that
+  started it so a reload can rejoin it, and the id that does the rejoining is
+  the whole authorisation: anyone who has one can read that conversation,
+  prompt the agent, and through it reach the workspace. Ids are random v4
+  UUIDs, they are never listed by `GET /api/connections`, and an agent nobody
+  comes back to is reaped after `[server] resume_ttl_secs` (five minutes by
+  default; `0` disables resuming entirely). None of that is authentication —
+  it is what keeps the unauthenticated design from being *worse* than it was.
 
 ## Before you expose this
 
 Don't, without putting an authenticating reverse proxy in front of it and
-running the server as a low-privilege user in a container. If you add auth,
-the WebSocket upgrade is the only entry point that matters
-(`crates/mjx-acp-server`).
+running the server as a low-privilege user in a container. If you add auth, the
+WebSocket upgrade is the entry point that matters (`crates/mjx-acp-server`) —
+and it is where `?resume=` arrives, so whatever you put there has to cover
+rejoining an existing agent as well as starting a new one.
 
 ## Reporting
 
