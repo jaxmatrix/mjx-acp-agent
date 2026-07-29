@@ -1,0 +1,18 @@
+/target
+**/node_modules
+/web/dist
+/web/.vite
+/web/*.tsbuildinfo
+.DS_Store
+*.log
+
+# Cached ACP agent registry + downloaded agent binaries
+/.mjx-cache
+
+# Generated from demo/pristine by scripts/demo.sh. The demo agent really edits
+# it, so it is a working copy, not a source file.
+/demo/workspace
+
+# Local-only copy of the Zed crates we port from. Never staged; see
+# reference/README.md for the commit it came from.
+/reference/zed-acp

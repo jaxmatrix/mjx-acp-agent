@@ -1,0 +1,48 @@
+mjx-acp-viewer
+Copyright (C) 2026 the mjx-acp-viewer authors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See LICENSE-GPL.
+
+--------------------------------------------------------------------------------
+Third-party code
+--------------------------------------------------------------------------------
+
+Portions of this project are derived from Zed (https://github.com/zed-industries/zed),
+Copyright (C) Zed Industries, Inc., licensed GPL-3.0-or-later. This is why
+mjx-acp-viewer is itself GPL-3.0-or-later.
+
+Derived from Zed:
+
+  crates/mjx-acp-thread/
+      Port of zed `crates/acp_thread/` (acp_thread.rs, mention.rs, terminal.rs)
+      with the GPUI, MultiBuffer and Project dependencies removed.
+
+  crates/mjx-agent-catalog/
+      Port of zed `crates/project/src/agent_registry_store.rs` and
+      `crates/project/src/agent_server_store.rs` (registry fetch, npx/binary
+      distribution resolution, npm version bounding).
+
+  crates/mjx-acp-core/  (MethodCorrelator)
+      Port of the request-id to method-name correlation in zed
+      `crates/acp_tools/src/acp_tools.rs`.
+
+  web/src/  (UI structure)
+      The component breakdown follows zed `crates/agent_ui/src/conversation_view/
+      thread_view.rs` and `crates/acp_tools/src/acp_tools.rs`.
+
+  reference/zed-acp/
+      Unmodified copies of the above Zed crates, kept for reference. Local-only
+      and git-ignored: not compiled, not shipped, not in this history. See
+      reference/README.md.
+
+--------------------------------------------------------------------------------
+
+This project depends on, but does not include, the Agent Client Protocol SDKs
+(https://github.com/agentclientprotocol), Copyright Zed Industries, Inc.,
+licensed Apache-2.0:
+
+  agent-client-protocol         (Rust,       crates.io)
+  @agentclientprotocol/sdk      (TypeScript, npm)
