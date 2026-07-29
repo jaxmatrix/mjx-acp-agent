@@ -102,7 +102,8 @@ impl SessionStore {
                     }
                 } else if let Some(index) = self.pending_new_sessions.iter().position(|p| p == id) {
                     self.pending_new_sessions.remove(index);
-                    if let Ok(response) = serde_json::from_str::<acp::NewSessionResponse>(result.get())
+                    if let Ok(response) =
+                        serde_json::from_str::<acp::NewSessionResponse>(result.get())
                     {
                         let thread = self
                             .threads
@@ -277,7 +278,9 @@ mod tests {
     fn unrelated_traffic_is_ignored() {
         let mut store = SessionStore::new();
         store.observe_from_client(&request(1, "initialize", json!({ "protocolVersion": 1 })));
-        store.observe_from_agent(&Frame::notification("_mjx/agent/stderr", &json!({ "line": "x" })).unwrap());
+        store.observe_from_agent(
+            &Frame::notification("_mjx/agent/stderr", &json!({ "line": "x" })).unwrap(),
+        );
         assert!(store.is_empty());
     }
 

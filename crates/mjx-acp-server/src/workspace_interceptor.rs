@@ -85,8 +85,9 @@ impl Interceptor for WorkspaceInterceptor {
                 params,
             };
             let reply = match handle(&workspace, &method, &frame).await {
-                Ok(result) => Frame::result(id, &result)
-                    .unwrap_or_else(|err| Frame::error(RequestId::Null, JsonRpcError::internal(err))),
+                Ok(result) => Frame::result(id, &result).unwrap_or_else(|err| {
+                    Frame::error(RequestId::Null, JsonRpcError::internal(err))
+                }),
                 Err(error) => {
                     tracing::debug!(%method, error = %error.message, "refused a client request");
                     Frame::error(id, error)
@@ -132,11 +133,8 @@ async fn handle(
 
         m::TERMINAL_CREATE => {
             let request: acp::CreateTerminalRequest = params(frame)?;
-            let env: Vec<(String, String)> = request
-                .env
-                .into_iter()
-                .map(|v| (v.name, v.value))
-                .collect();
+            let env: Vec<(String, String)> =
+                request.env.into_iter().map(|v| (v.name, v.value)).collect();
             let terminal_id = workspace
                 .create_terminal(
                     &request.command,
@@ -338,7 +336,11 @@ mod tests {
         // -32602, not -32002: the request was wrong, the file is not "missing".
         // An agent told "not found" for a file it can see would keep retrying.
         assert_eq!(err.code, -32602);
-        assert!(err.message.contains("outside the workspace"), "{}", err.message);
+        assert!(
+            err.message.contains("outside the workspace"),
+            "{}",
+            err.message
+        );
     }
 
     #[tokio::test]

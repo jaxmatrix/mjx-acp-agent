@@ -120,11 +120,9 @@ async fn main() -> Result<()> {
 
     if web_dir.is_dir() {
         // `index.html` is the fallback so a client-side route still resolves.
-        app = app.fallback_service(
-            tower_http::services::ServeDir::new(&web_dir).fallback(
-                tower_http::services::ServeFile::new(web_dir.join("index.html")),
-            ),
-        );
+        app = app.fallback_service(tower_http::services::ServeDir::new(&web_dir).fallback(
+            tower_http::services::ServeFile::new(web_dir.join("index.html")),
+        ));
         tracing::info!(dir = %web_dir.display(), "serving the web app");
     } else {
         tracing::warn!(

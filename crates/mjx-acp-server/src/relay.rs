@@ -23,7 +23,10 @@ use crate::sessions::SessionStore;
 /// Only `Forward` is used by the trait defaults; the other two exist for the
 /// filesystem and terminal interceptor, which is the only thing that rewrites
 /// or answers a frame.
-#[allow(dead_code, reason = "Rewrite and Intercept are used by the fs/terminal interceptor")]
+#[allow(
+    dead_code,
+    reason = "Rewrite and Intercept are used by the fs/terminal interceptor"
+)]
 pub enum Disposition {
     /// Pass it on unchanged.
     Forward,
@@ -66,17 +69,92 @@ pub trait Interceptor: Send + Sync + 'static {
     fn stop(&self) {}
 }
 
+/// The browser end of an outbox: whichever socket is attached right now, if any.
+///
+/// An agent outlives the socket that started it, so the thing on the far end of
+/// this changes over a connection's life — a reload detaches one browser and
+/// attaches the next. The indirection lives *inside* the sink rather than around
+/// [`Outbox`], because clones of the outbox are already out in detached tasks by
+/// the time a swap happens (the interceptor's event mirror, and one task per
+/// in-flight `fs/*` or `terminal/*` request) and those clones cannot be
+/// re-pointed after the fact.
+#[derive(Clone, Default)]
+pub struct BrowserSink(Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>);
+
+impl BrowserSink {
+    /// Points the sink at a new socket, returning the receiver its writer task
+    /// should drain.
+    ///
+    /// Any socket already attached is dropped, which closes its receiver and
+    /// ends its writer. That is take-over, and it is deliberate: a browser that
+    /// reloads can open the new socket before the old one's close has been
+    /// processed, so refusing the second attachment would make an ordinary
+    /// refresh fail.
+    pub fn attach(&self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.slot() = Some(tx);
+        rx
+    }
+
+    /// Forgets the current socket. Frames sent from now on go nowhere.
+    #[allow(
+        dead_code,
+        reason = "used once a connection can outlive the socket it started on"
+    )]
+    pub fn detach(&self) {
+        *self.slot() = None;
+    }
+
+    /// Whether a socket is attached.
+    #[allow(
+        dead_code,
+        reason = "used once a connection can outlive the socket it started on"
+    )]
+    pub fn is_attached(&self) -> bool {
+        self.slot().is_some()
+    }
+
+    /// Sends one line to the attached socket, if there is one.
+    ///
+    /// A frame sent while detached is **dropped**, not queued. What the browser
+    /// misses it gets back from `_mjx/session/replay`, which is a truthful
+    /// snapshot; a queue would instead replay the whole detached period after
+    /// the replay had already rebuilt the thread, duplicating it.
+    fn send(&self, line: String) {
+        let mut slot = self.slot();
+        let Some(sender) = slot.as_ref() else {
+            return;
+        };
+        if sender.send(line).is_err() {
+            // The writer task is gone, so the socket is too. Clear the slot
+            // rather than keep reporting ourselves attached to a dead socket.
+            *slot = None;
+        }
+    }
+
+    fn slot(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<tokio::sync::mpsc::UnboundedSender<String>>> {
+        // A panic in one connection's send must not poison every other
+        // connection's outbox: the value behind the lock is a plain `Option`
+        // and cannot be left half-updated.
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// The two sinks a relay writes to.
 #[derive(Clone)]
 pub struct Outbox {
-    to_browser: tokio::sync::mpsc::UnboundedSender<String>,
+    to_browser: BrowserSink,
     to_agent: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
 impl Outbox {
     /// Sends a frame to the browser.
     pub fn to_browser(&self, frame: &Frame) {
-        let _ = self.to_browser.send(frame.to_line());
+        self.to_browser.send(frame.to_line());
     }
 
     /// Sends a frame to the agent. Used by an interceptor to answer a request
@@ -90,15 +168,28 @@ impl Outbox {
     /// exercise an interceptor without a live connection.
     #[cfg(test)]
     pub fn for_test() -> (Self, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        let (to_browser, _) = tokio::sync::mpsc::unbounded_channel();
         let (to_agent, to_agent_rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Self {
-                to_browser,
+                to_browser: BrowserSink::default(),
                 to_agent,
             },
             to_agent_rx,
         )
+    }
+
+    /// Sends an already-serialized line towards one side.
+    ///
+    /// The relay forwards frames verbatim, including ones it could not parse,
+    /// so this takes a line rather than a [`Frame`]. It exists so nothing
+    /// reaches past [`BrowserSink`] into a sender that a reattach would replace.
+    fn send_line(&self, direction: Direction, line: String) {
+        match direction {
+            Direction::ClientToAgent => {
+                let _ = self.to_agent.send(line);
+            }
+            Direction::AgentToClient => self.to_browser.send(line),
+        }
     }
 
     /// Sends an `_mjx/*` notification to the browser.
@@ -147,7 +238,8 @@ pub async fn run<I, Rx, Tx>(
         stderr: mut agent_stderr,
     } = agent;
 
-    let (to_browser, mut to_browser_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let to_browser = BrowserSink::default();
+    let mut to_browser_rx = to_browser.attach();
     let (to_agent, mut to_agent_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let relay = Arc::new(Relay {
@@ -265,8 +357,7 @@ impl<I: Interceptor> Relay<I> {
 
         // `_mjx/*` is between the browser and this server; the agent has never
         // heard of it and must not be sent it.
-        if direction == Direction::ClientToAgent
-            && frame.method().is_some_and(method::is_extension)
+        if direction == Direction::ClientToAgent && frame.method().is_some_and(method::is_extension)
         {
             self.handle_extension(&frame).await;
             return;
@@ -326,11 +417,11 @@ impl<I: Interceptor> Relay<I> {
                         // exists, and an empty thread is the honest answer.
                         None => Frame::result(id.clone(), &serde_json::json!(null)),
                     }
-                    .unwrap_or_else(|err| {
-                        Frame::error(id.clone(), JsonRpcError::internal(err))
-                    })
+                    .unwrap_or_else(|err| Frame::error(id.clone(), JsonRpcError::internal(err)))
                 }
-                Ok(None) => Frame::error(id.clone(), JsonRpcError::invalid_params("missing params")),
+                Ok(None) => {
+                    Frame::error(id.clone(), JsonRpcError::invalid_params("missing params"))
+                }
                 Err(err) => Frame::error(id.clone(), JsonRpcError::invalid_params(err)),
             },
             other => Frame::error(id.clone(), JsonRpcError::method_not_found(other)),
@@ -363,10 +454,7 @@ impl<I: Interceptor> Relay<I> {
     }
 
     fn send(&self, direction: Direction, line: String) {
-        let _ = match direction {
-            Direction::ClientToAgent => self.outbox.to_agent.send(line),
-            Direction::AgentToClient => self.outbox.to_browser.send(line),
-        };
+        self.outbox.send_line(direction, line);
     }
 }
 
@@ -521,5 +609,79 @@ mod tests {
     fn direction_names_match_the_typescript_union() {
         assert_eq!(direction_name(Direction::ClientToAgent), "clientToAgent");
         assert_eq!(direction_name(Direction::AgentToClient), "agentToClient");
+    }
+
+    fn stderr_line(text: &str) -> Frame {
+        Frame::notification(ext::AGENT_STDERR, &ext::AgentStderr { line: text.into() }).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_frame_sent_while_nobody_is_attached_is_dropped() {
+        // Not queued. An agent left running while a browser is away can produce
+        // megabytes of terminal output, and flushing it on reattach would
+        // arrive *after* the replay that already rebuilt the thread — out of
+        // order, and duplicating what the replay just said.
+        let sink = BrowserSink::default();
+        assert!(!sink.is_attached());
+        sink.send(stderr_line("into the void").to_line());
+
+        let mut browser = sink.attach();
+        assert!(sink.is_attached());
+        sink.send(stderr_line("after attaching").to_line());
+
+        let line = browser
+            .recv()
+            .await
+            .expect("the attached socket gets frames");
+        assert!(line.contains("after attaching"), "{line}");
+        assert!(
+            browser.try_recv().is_err(),
+            "the frame sent while detached was queued rather than dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn attaching_again_replaces_the_socket_that_was_there() {
+        // This is take-over: the second tab wins, and the first one's writer
+        // ends because its receiver is dropped.
+        let sink = BrowserSink::default();
+        let mut first = sink.attach();
+        let mut second = sink.attach();
+
+        sink.send(stderr_line("hello").to_line());
+
+        assert!(
+            second.recv().await.is_some(),
+            "the newest socket should receive"
+        );
+        assert!(
+            first.recv().await.is_none(),
+            "the replaced socket's receiver should be closed, ending its writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn detaching_stops_delivery_without_ending_the_outbox() {
+        let sink = BrowserSink::default();
+        let mut browser = sink.attach();
+        sink.detach();
+        assert!(!sink.is_attached());
+
+        // Sending after a detach must not panic and must not deliver.
+        sink.send(stderr_line("nobody home").to_line());
+        assert!(browser.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_went_away_is_forgotten() {
+        // The writer task drops its receiver when the socket errors, and the
+        // sink notices on the next send rather than claiming to be attached
+        // forever.
+        let sink = BrowserSink::default();
+        let browser = sink.attach();
+        drop(browser);
+
+        sink.send(stderr_line("to a closed socket").to_line());
+        assert!(!sink.is_attached(), "a closed sender should clear the slot");
     }
 }

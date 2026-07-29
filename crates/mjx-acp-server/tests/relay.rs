@@ -107,7 +107,11 @@ impl Server {
         // tests never touch the network.
         let cache = base.join(".cache");
         std::fs::create_dir_all(&cache).unwrap();
-        std::fs::copy(repo.join("fixtures/registry.json"), cache.join("registry.json")).unwrap();
+        std::fs::copy(
+            repo.join("fixtures/registry.json"),
+            cache.join("registry.json"),
+        )
+        .unwrap();
 
         std::fs::write(
             base.join("mjx.toml"),
@@ -288,10 +292,7 @@ impl Client {
                         &json!({ "outcome": { "outcome": "selected", "optionId": "allow_once" } }),
                     )
                     .unwrap(),
-                    _ => Frame::error(
-                        id,
-                        mjx_acp_core::JsonRpcError::method_not_found(&method),
-                    ),
+                    _ => Frame::error(id, mjx_acp_core::JsonRpcError::method_not_found(&method)),
                 };
                 self.send(&reply).await;
             }
@@ -372,7 +373,12 @@ async fn the_catalog_is_served_over_http() {
         .json()
         .await
         .unwrap();
-    assert!(workspaces[0]["path"].as_str().unwrap().ends_with("workspace"));
+    assert!(
+        workspaces[0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("workspace")
+    );
 
     server.stop().await;
 }
@@ -529,7 +535,10 @@ async fn fs_and_terminal_are_served_by_the_server_not_the_browser() {
     let wrote = client.wait_for_ext(ext::FS_WROTE).await;
     assert!(wrote["path"].as_str().unwrap().ends_with("stats.js"));
     assert!(
-        wrote["oldText"].as_str().unwrap().contains("return sorted[mid];"),
+        wrote["oldText"]
+            .as_str()
+            .unwrap()
+            .contains("return sorted[mid];"),
         "the mirrored diff has no before-text"
     );
 
@@ -603,7 +612,9 @@ async fn the_server_can_replay_the_thread_it_watched() {
     assert_eq!(thread["status"], "idle");
     assert_eq!(thread["stopReason"], "end_turn");
 
-    let entries = thread["entries"].as_array().expect("no entries in the replay");
+    let entries = thread["entries"]
+        .as_array()
+        .expect("no entries in the replay");
     assert!(entries.len() >= 5, "only {} entries", entries.len());
     assert_eq!(entries[0]["type"], "user", "the prompt is missing");
 
@@ -611,11 +622,9 @@ async fn the_server_can_replay_the_thread_it_watched() {
     let tool_calls: Vec<&Value> = entries.iter().filter(|e| e["type"] == "toolCall").collect();
     assert_eq!(tool_calls.len(), 3);
     assert!(
-        tool_calls
-            .iter()
-            .any(|call| call["content"]
-                .as_array()
-                .is_some_and(|c| c.iter().any(|item| item["type"] == "diff"))),
+        tool_calls.iter().any(|call| call["content"]
+            .as_array()
+            .is_some_and(|c| c.iter().any(|item| item["type"] == "diff"))),
         "the diff was lost"
     );
 

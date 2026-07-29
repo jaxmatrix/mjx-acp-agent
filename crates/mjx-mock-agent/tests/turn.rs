@@ -149,7 +149,11 @@ impl Driver {
     async fn handle(&mut self, frame: Frame) {
         match frame {
             Frame::Notification { method, params } => {
-                assert_eq!(method, method::client::SESSION_UPDATE, "unexpected notification");
+                assert_eq!(
+                    method,
+                    method::client::SESSION_UPDATE,
+                    "unexpected notification"
+                );
                 let params: Value =
                     serde_json::from_str(params.expect("session/update has params").get()).unwrap();
 
@@ -201,7 +205,8 @@ async fn connect(driver: &mut Driver) -> String {
             }),
         )
         .await;
-    serde_json::from_value::<acp::InitializeResponse>(init.clone()).expect("valid InitializeResponse");
+    serde_json::from_value::<acp::InitializeResponse>(init.clone())
+        .expect("valid InitializeResponse");
     assert_eq!(init["protocolVersion"], mjx_acp_core::PROTOCOL_VERSION);
 
     let session = driver
@@ -210,7 +215,8 @@ async fn connect(driver: &mut Driver) -> String {
             json!({ "cwd": env!("CARGO_MANIFEST_DIR"), "mcpServers": [] }),
         )
         .await;
-    serde_json::from_value::<acp::NewSessionResponse>(session.clone()).expect("valid NewSessionResponse");
+    serde_json::from_value::<acp::NewSessionResponse>(session.clone())
+        .expect("valid NewSessionResponse");
     session["sessionId"].as_str().unwrap().to_string()
 }
 
@@ -227,8 +233,14 @@ async fn a_full_turn_exercises_every_ui_surface() {
             method::client::SESSION_REQUEST_PERMISSION,
             json!({ "outcome": { "outcome": "selected", "optionId": "allow_once" } }),
         )
-        .answer(method::client::TERMINAL_CREATE, json!({ "terminalId": "t1" }))
-        .answer(method::client::TERMINAL_WAIT_FOR_EXIT, json!({ "exitCode": 0 }))
+        .answer(
+            method::client::TERMINAL_CREATE,
+            json!({ "terminalId": "t1" }),
+        )
+        .answer(
+            method::client::TERMINAL_WAIT_FOR_EXIT,
+            json!({ "exitCode": 0 }),
+        )
         .answer(method::client::TERMINAL_RELEASE, json!({}));
 
     let session_id = connect(&mut driver).await;
@@ -295,7 +307,12 @@ async fn a_full_turn_exercises_every_ui_surface() {
         .flatten()
         .find(|c| c["type"] == "diff")
         .expect("no diff in the transcript");
-    assert!(diff["oldText"].as_str().unwrap().contains("return sorted[mid];"));
+    assert!(
+        diff["oldText"]
+            .as_str()
+            .unwrap()
+            .contains("return sorted[mid];")
+    );
     assert!(diff["newText"].as_str().unwrap().contains("/ 2"));
 
     // A terminal was attached to a tool call, so the UI renders a live console

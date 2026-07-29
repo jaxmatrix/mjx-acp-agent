@@ -79,7 +79,10 @@ impl AgentProcess {
     /// Ends the process, closing stdin first. Convenience for callers that
     /// still own every part; the relay splits it up and uses
     /// [`AgentHandle::shutdown`] instead.
-    #[allow(dead_code, reason = "used by tests and by callers that never split the process")]
+    #[allow(
+        dead_code,
+        reason = "used by tests and by callers that never split the process"
+    )]
     pub async fn shutdown(self) {
         drop(self.stdin);
         self.handle.shutdown().await;
@@ -147,9 +150,7 @@ mod tests {
     #[tokio::test]
     async fn the_environment_is_passed_through() {
         let mut command = command("sh", &["-c", "echo $MJX_TEST_VAR"]);
-        command
-            .env
-            .insert("MJX_TEST_VAR".into(), "visible".into());
+        command.env.insert("MJX_TEST_VAR".into(), "visible".into());
 
         let mut agent = AgentProcess::spawn(&command, Path::new(".")).unwrap();
         assert_eq!(agent.stdout.next_line().await.unwrap().unwrap(), "visible");
@@ -167,12 +168,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_program_fails_with_the_command_in_the_message() {
-        let result = AgentProcess::spawn(&command("mjx-definitely-not-installed", &[]), Path::new("."));
+        let result = AgentProcess::spawn(
+            &command("mjx-definitely-not-installed", &[]),
+            Path::new("."),
+        );
         let Err(err) = result else {
             panic!("spawning a nonexistent program should fail");
         };
         let message = format!("{err:#}");
-        assert!(message.contains("mjx-definitely-not-installed"), "{message}");
+        assert!(
+            message.contains("mjx-definitely-not-installed"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -184,7 +191,10 @@ mod tests {
         agent.shutdown().await;
         let elapsed = started.elapsed();
 
-        assert!(elapsed >= SHUTDOWN_GRACE, "did not wait out the grace period");
+        assert!(
+            elapsed >= SHUTDOWN_GRACE,
+            "did not wait out the grace period"
+        );
         assert!(
             elapsed < SHUTDOWN_GRACE + Duration::from_secs(5),
             "took {elapsed:?}, so the kill did not land"

@@ -161,7 +161,10 @@ mod tests {
     use super::*;
 
     fn parse(toml_text: &str) -> Result<Config> {
-        Config::from_raw(toml::from_str(toml_text).unwrap(), PathBuf::from("/project"))
+        Config::from_raw(
+            toml::from_str(toml_text).unwrap(),
+            PathBuf::from("/project"),
+        )
     }
 
     #[test]
