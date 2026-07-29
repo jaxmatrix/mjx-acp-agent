@@ -15,7 +15,7 @@ use std::sync::Arc;
 use futures::{SinkExt, StreamExt};
 use mjx_acp_core::{Direction, Frame, JsonRpcError, MethodCorrelator, ext, method};
 
-use crate::agent_process::AgentProcess;
+use crate::agent_process::{AgentHandle, AgentProcess};
 use crate::sessions::SessionStore;
 
 /// How a frame should be handled.
@@ -105,13 +105,20 @@ impl BrowserSink {
         *self.slot() = None;
     }
 
-    /// Whether a socket is attached.
+    /// Whether a live socket is attached.
+    ///
+    /// A writer task that has ended has dropped its receiver, so the sender is
+    /// closed even though the slot still holds it. Checking that here means a
+    /// socket that went away is never reported as attached, without needing the
+    /// code that noticed to reach back into the sink.
     #[allow(
         dead_code,
         reason = "used once a connection can outlive the socket it started on"
     )]
     pub fn is_attached(&self) -> bool {
-        self.slot().is_some()
+        self.slot()
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
     }
 
     /// Sends one line to the attached socket, if there is one.
@@ -214,23 +221,45 @@ pub struct Relay<I: Interceptor> {
     sessions: tokio::sync::Mutex<SessionStore>,
 }
 
-/// Runs one connection until either side hangs up.
+/// Why an attachment ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detached {
+    /// The browser's socket closed. The agent is untouched and can be
+    /// reattached to.
+    BrowserLeft,
+    /// The agent closed its stdout. Nothing can be resumed after this.
+    AgentGone,
+}
+
+/// One agent and everything about it that outlives a browser socket.
 ///
-/// `browser_rx` yields text frames from the WebSocket; `browser_tx` accepts
-/// them. Keeping this generic over the socket rather than taking an
-/// `axum::extract::ws::WebSocket` is what lets the tests drive it over an
-/// in-memory channel.
-pub async fn run<I, Rx, Tx>(
+/// The split is the whole point: closing a tab is not quitting an editor, so
+/// the subprocess, the thread state and the workspace's running terminals stay
+/// here while the socket comes and goes. Only the two tasks that touch the
+/// socket itself are rebuilt per [`Connection::attach`].
+pub struct Connection<I: Interceptor> {
+    relay: Arc<Relay<I>>,
+    /// The tasks that talk to the subprocess: the stdin writer, the stderr
+    /// relay and the stdout reader. They keep running with nobody attached,
+    /// which is what lets a turn continue across a reload.
+    agent_tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    handle: tokio::sync::Mutex<Option<AgentHandle>>,
+    /// False once the agent's stdout closes or we shut it down. A `watch`
+    /// rather than a `Notify` because `wait_for` also reports a value that was
+    /// already set, so an agent that dies before anyone attaches is still seen.
+    agent_alive: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// Starts an agent and everything that outlives a browser socket.
+///
+/// Nothing is attached yet: frames the agent produces before the first
+/// [`Connection::attach`] are dropped, and recovered from the thread the
+/// [`SessionStore`] folds.
+pub fn start<I: Interceptor>(
     interceptor: Arc<I>,
     agent: AgentProcess,
-    mut browser_rx: Rx,
-    mut browser_tx: Tx,
     agent_info: ext::AgentInfo,
-) where
-    I: Interceptor,
-    Rx: futures::Stream<Item = String> + Unpin + Send + 'static,
-    Tx: futures::Sink<String> + Unpin + Send + 'static,
-{
+) -> Arc<Connection<I>> {
     let AgentProcess {
         handle,
         stdin: mut agent_stdin,
@@ -238,15 +267,14 @@ pub async fn run<I, Rx, Tx>(
         stderr: mut agent_stderr,
     } = agent;
 
-    let to_browser = BrowserSink::default();
-    let mut to_browser_rx = to_browser.attach();
     let (to_agent, mut to_agent_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let agent_alive = Arc::new(tokio::sync::watch::channel(true).0);
 
     let relay = Arc::new(Relay {
         interceptor,
         correlator: tokio::sync::Mutex::new(MethodCorrelator::new()),
         outbox: Outbox {
-            to_browser,
+            to_browser: BrowserSink::default(),
             to_agent,
         },
         agent_info: tokio::sync::Mutex::new(Some(agent_info)),
@@ -257,14 +285,6 @@ pub async fn run<I, Rx, Tx>(
 
     // Single writer per destination: handlers run concurrently, and two of them
     // interleaving halves of a frame onto one stream would corrupt both.
-    let browser_writer = tokio::spawn(async move {
-        while let Some(line) = to_browser_rx.recv().await {
-            if browser_tx.send(line).await.is_err() {
-                break;
-            }
-        }
-    });
-
     let agent_writer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         while let Some(mut line) = to_agent_rx.recv().await {
@@ -290,47 +310,118 @@ pub async fn run<I, Rx, Tx>(
         })
     };
 
-    let browser_to_agent = {
-        let relay = relay.clone();
-        tokio::spawn(async move {
-            while let Some(line) = browser_rx.next().await {
-                relay.handle(Direction::ClientToAgent, line).await;
-            }
-            tracing::debug!("browser disconnected");
-        })
-    };
-
     let agent_to_browser = {
         let relay = relay.clone();
+        let agent_alive = agent_alive.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = agent_stdout.next_line().await {
                 relay.handle(Direction::AgentToClient, line).await;
             }
             tracing::debug!("agent closed stdout");
+            let _ = agent_alive.send(false);
         })
     };
 
-    // Either party leaving ends the connection: an agent with no browser has
-    // nobody to ask for permission, and a browser with no agent has nothing to
-    // talk to.
-    tokio::select! {
-        _ = browser_to_agent => {}
-        _ = agent_to_browser => {}
+    Arc::new(Connection {
+        relay,
+        agent_tasks: std::sync::Mutex::new(vec![agent_writer, stderr_relay, agent_to_browser]),
+        handle: tokio::sync::Mutex::new(Some(handle)),
+        agent_alive,
+    })
+}
+
+impl<I: Interceptor> Connection<I> {
+    /// Serves one browser socket, returning when it — or the agent — goes away.
+    ///
+    /// `browser_rx` yields text frames from the WebSocket; `browser_tx` accepts
+    /// them. Keeping this generic over the socket rather than taking an
+    /// `axum::extract::ws::WebSocket` is what lets the tests drive it over an
+    /// in-memory channel.
+    pub async fn attach<Rx, Tx>(&self, mut browser_rx: Rx, mut browser_tx: Tx) -> Detached
+    where
+        Rx: futures::Stream<Item = String> + Unpin + Send + 'static,
+        Tx: futures::Sink<String> + Unpin + Send + 'static,
+    {
+        let mut to_browser_rx = self.relay.outbox.to_browser.attach();
+
+        let browser_writer = tokio::spawn(async move {
+            while let Some(line) = to_browser_rx.recv().await {
+                if browser_tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut reader = {
+            let relay = self.relay.clone();
+            tokio::spawn(async move {
+                while let Some(line) = browser_rx.next().await {
+                    relay.handle(Direction::ClientToAgent, line).await;
+                }
+                tracing::debug!("browser disconnected");
+            })
+        };
+
+        // A dead agent still ends the socket: a browser with nothing to talk to
+        // is better told than left waiting. The converse is no longer true — an
+        // agent with no browser now waits for the next one.
+        let mut alive = self.agent_alive.subscribe();
+        let detached = tokio::select! {
+            _ = &mut reader => Detached::BrowserLeft,
+            _ = alive.wait_for(|alive| !*alive) => Detached::AgentGone,
+        };
+
+        reader.abort();
+        // Dropping the writer's receiver is also what marks the sink detached,
+        // so a socket that has gone is never reported as still attached.
+        browser_writer.abort();
+        detached
     }
 
-    // Resolved before the macro: an `.await` inside `tracing!` holds a
-    // non-Send temporary across it, which makes the whole future non-Send.
-    let session_count = relay.sessions.lock().await.len();
-    tracing::debug!(sessions = session_count, "connection ending");
-    relay.interceptor.stop();
-    stderr_relay.abort();
-    browser_writer.abort();
-    // Aborting the writer drops the agent's stdin, which is the signal most
-    // agents shut down on. It has to happen before we wait for the exit.
-    agent_writer.abort();
-    drop(relay);
+    /// Ends the agent and everything running on its behalf.
+    pub async fn shutdown(&self) {
+        let _ = self.agent_alive.send(false);
 
-    handle.shutdown().await;
+        // Resolved before the macro: an `.await` inside `tracing!` holds a
+        // non-Send temporary across it, which makes the whole future non-Send.
+        let session_count = self.relay.sessions.lock().await.len();
+        tracing::debug!(sessions = session_count, "connection ending");
+        self.relay.interceptor.stop();
+
+        // Aborting the stdin writer drops the agent's stdin, which is the
+        // signal most agents shut down on. It has to happen before we wait for
+        // the exit.
+        for task in self
+            .agent_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            task.abort();
+        }
+
+        if let Some(handle) = self.handle.lock().await.take() {
+            handle.shutdown().await;
+        }
+    }
+}
+
+/// Runs one connection until either side hangs up.
+pub async fn run<I, Rx, Tx>(
+    interceptor: Arc<I>,
+    agent: AgentProcess,
+    browser_rx: Rx,
+    browser_tx: Tx,
+    agent_info: ext::AgentInfo,
+) where
+    I: Interceptor,
+    Rx: futures::Stream<Item = String> + Unpin + Send + 'static,
+    Tx: futures::Sink<String> + Unpin + Send + 'static,
+{
+    let connection = start(interceptor, agent, agent_info);
+    let detached = connection.attach(browser_rx, browser_tx).await;
+    tracing::debug!(?detached, "connection ending");
+    connection.shutdown().await;
 }
 
 impl<I: Interceptor> Relay<I> {
@@ -674,13 +765,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_socket_that_went_away_is_forgotten() {
-        // The writer task drops its receiver when the socket errors, and the
-        // sink notices on the next send rather than claiming to be attached
-        // forever.
+        // A connection reports whether a browser is watching it. The writer task
+        // drops its receiver when the socket goes, and that alone has to be
+        // enough — nothing calls `detach` on the abort path, because by then a
+        // replacement socket may already have attached and clearing the slot
+        // would disconnect the tab that just took over.
         let sink = BrowserSink::default();
         let browser = sink.attach();
         drop(browser);
 
+        assert!(!sink.is_attached(), "a closed sender is not an attachment");
         sink.send(stderr_line("to a closed socket").to_line());
         assert!(!sink.is_attached(), "a closed sender should clear the slot");
     }
