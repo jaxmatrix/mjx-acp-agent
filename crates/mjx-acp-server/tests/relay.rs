@@ -221,6 +221,21 @@ impl Server {
     async fn stop(mut self) {
         let _ = self.child.kill().await;
     }
+
+    /// Stops the server the way a person does, and waits for it to exit.
+    ///
+    /// `stop` sends SIGKILL, which nothing can clean up after. SIGTERM is what
+    /// Ctrl-C and a service manager send, and what the server can act on.
+    #[cfg(unix)]
+    async fn terminate(mut self) {
+        if let Some(pid) = self.child.id() {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(15), self.child.wait()).await;
+        let _ = self.child.kill().await;
+    }
 }
 
 /// An ACP client speaking over the WebSocket, as the browser does.
@@ -960,6 +975,40 @@ fn process_is_alive(pid: u64) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_the_server_takes_its_agents_with_it() {
+    // An agent that outlives its socket is, for a while, a subprocess with
+    // nobody watching it. If the server goes without ending them, they are
+    // reparented to init and keep whatever terminals they started — an orphan
+    // holding a PTY forever, which is worse than the lost session this feature
+    // exists to save.
+    let server = Server::start().await;
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    open_session(&mut client).await;
+
+    let pooled: Vec<Value> = reqwest::get(server.http("/api/connections"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pid = pooled[0]["pid"].as_u64().expect("no pid reported");
+
+    // Leave the socket open: the agent has to be ended because the server is
+    // going, not because anyone disconnected.
+    server.terminate().await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while process_is_alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server exited but left agent {pid} running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test]

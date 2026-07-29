@@ -110,6 +110,23 @@ impl Pooled {
     }
 }
 
+impl AppState {
+    /// Ends every pooled agent. Called on the way out.
+    async fn shutdown_all(&self) {
+        let pooled = self.connections.take_all();
+        if pooled.is_empty() {
+            return;
+        }
+        tracing::info!(
+            agents = pooled.len(),
+            "stopping agents that outlived their sockets"
+        );
+        for pooled in pooled {
+            pooled.connection.shutdown().await;
+        }
+    }
+}
+
 impl Connections {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<Pooled>>> {
         self.0
@@ -133,6 +150,11 @@ impl Connections {
 
     fn remove(&self, id: &str) -> Option<Arc<Pooled>> {
         self.lock().remove(id)
+    }
+
+    /// Takes everything, for shutdown.
+    fn take_all(&self) -> Vec<Arc<Pooled>> {
+        self.lock().drain().map(|(_, pooled)| pooled).collect()
     }
 
     /// Takes every connection nobody came back to within `ttl`.
@@ -213,7 +235,7 @@ async fn main() -> Result<()> {
         .route("/api/workspaces", get(list_workspaces))
         .route("/api/connections", get(list_connections))
         .route("/ws", get(websocket))
-        .with_state(state);
+        .with_state(state.clone());
 
     if web_dir.is_dir() {
         // `index.html` is the fallback so a client-side route still resolves.
@@ -236,8 +258,48 @@ async fn main() -> Result<()> {
     let bound = listener.local_addr().unwrap_or(bind);
     tracing::info!("listening on http://{bound}");
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(interrupted())
+        .await?;
+
+    // Agents outlive their sockets now, so at any moment there may be several
+    // running with nobody watching them. They have to be ended here: a
+    // subprocess whose parent has gone is reparented to init and keeps whatever
+    // terminals it started, which is exactly the orphan this feature is
+    // supposed to avoid rather than create.
+    state.shutdown_all().await;
     Ok(())
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// SIGKILL cannot be caught, so nothing here saves an agent from `kill -9` on
+/// the server. Ctrl-C and `systemctl stop` are what actually happen.
+async fn interrupted() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "could not listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
+    tracing::info!("shutting down");
 }
 
 async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
