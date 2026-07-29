@@ -1006,6 +1006,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mjx-acp-thread"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "mjx-acp-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "mjx-agent-catalog"
 version = "0.1.0"
 dependencies = [

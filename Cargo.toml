@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/mjx-acp-core",
+    "crates/mjx-acp-thread",
     "crates/mjx-agent-catalog",
     "crates/mjx-workspace",
     "crates/mjx-mock-agent",
@@ -17,6 +18,7 @@ publish = false
 
 [workspace.dependencies]
 mjx-acp-core = { path = "crates/mjx-acp-core" }
+mjx-acp-thread = { path = "crates/mjx-acp-thread" }
 mjx-agent-catalog = { path = "crates/mjx-agent-catalog" }
 mjx-workspace = { path = "crates/mjx-workspace" }
 
