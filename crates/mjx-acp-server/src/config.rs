@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mjx_agent_catalog::{AgentOverride, DEFAULT_REGISTRY_URL};
@@ -28,6 +29,9 @@ pub struct Config {
     pub cache_dir: PathBuf,
     /// Locally configured agents, which shadow registry entries.
     pub agents: Vec<AgentOverride>,
+    /// How long an agent keeps running with no browser attached, before it is
+    /// reaped. Zero turns resuming off: an agent then dies with its socket.
+    pub resume_ttl: Duration,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -47,6 +51,7 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawServer {
     bind: Option<String>,
+    resume_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -66,6 +71,13 @@ struct RawRegistry {
 /// The address we bind when nothing says otherwise. Loopback on purpose — see
 /// SECURITY.md.
 pub const DEFAULT_BIND: &str = "127.0.0.1:4321";
+
+/// How long an abandoned agent lives by default.
+///
+/// Long enough to survive a reload, a network blip and a glance at another tab;
+/// short enough that a tab someone closed and forgot does not hold a subprocess
+/// and its terminals for the rest of the day.
+pub const DEFAULT_RESUME_TTL: Duration = Duration::from_secs(300);
 
 impl Config {
     /// Loads `path`, or returns defaults if it doesn't exist.
@@ -122,6 +134,10 @@ impl Config {
                 raw.registry.cache_dir.as_deref().unwrap_or(".mjx-cache"),
             ),
             agents: raw.agents,
+            resume_ttl: raw
+                .server
+                .resume_ttl_secs
+                .map_or(DEFAULT_RESUME_TTL, Duration::from_secs),
             base_dir,
         })
     }
@@ -225,6 +241,20 @@ mod tests {
     }
 
     #[test]
+    fn the_resume_window_defaults_to_five_minutes_and_can_be_turned_off() {
+        assert_eq!(parse("").unwrap().resume_ttl, DEFAULT_RESUME_TTL);
+        assert_eq!(
+            parse("[server]\nresume_ttl_secs = 30").unwrap().resume_ttl,
+            Duration::from_secs(30)
+        );
+        // Zero is the escape hatch back to an agent that dies with its socket.
+        assert_eq!(
+            parse("[server]\nresume_ttl_secs = 0").unwrap().resume_ttl,
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn unknown_keys_are_rejected() {
         // A typo in a config file should say so, not be silently ignored.
         assert!(toml::from_str::<RawConfig>("[server]\nport = 80").is_err());
@@ -254,6 +284,7 @@ mod tests {
             registry_url: String::new(),
             cache_dir: temp.clone(),
             agents: vec![],
+            resume_ttl: DEFAULT_RESUME_TTL,
         };
 
         assert!(config.is_within_roots(&root.join("nested/in.txt")));

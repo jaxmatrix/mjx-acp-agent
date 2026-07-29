@@ -90,6 +90,14 @@ impl AgentProcess {
 }
 
 impl AgentHandle {
+    /// The child's process id, while it has one.
+    ///
+    /// Reported so an operator — and a test — can see that an agent nobody came
+    /// back to was really killed, rather than merely forgotten about.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     /// Waits for the process to exit, then kills it if it overstays.
     ///
     /// The caller must have dropped the child's stdin first — that is the

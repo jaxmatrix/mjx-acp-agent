@@ -7,6 +7,11 @@
 # Loopback only. Binding elsewhere requires --i-know-this-is-unauthenticated.
 bind = "127.0.0.1:4321"
 
+# How long an agent keeps running with no browser attached, so a reload rejoins
+# the session it left rather than starting over. Set it to 0 to turn resuming
+# off, and have an agent die with its socket as it used to.
+# resume_ttl_secs = 300
+
 [workspace]
 # Roots that fs/read_text_file and fs/write_text_file are jailed to, and the
 # choices offered as `cwd` in the agent picker. Relative to this file.

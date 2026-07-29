@@ -34,6 +34,13 @@ pub const FS_WROTE: &str = "_mjx/fs/wrote";
 pub const INSPECTOR_FRAME: &str = "_mjx/inspector/frame";
 /// Browser to server: send me the whole thread again (used after a reload).
 pub const SESSION_REPLAY: &str = "_mjx/session/replay";
+/// Server to browser: another socket has taken this connection over, and this
+/// one is about to close.
+///
+/// Sent with an empty payload: the browser being told already knows which
+/// connection it is on, and telling it anything about the socket that displaced
+/// it would say more than it needs to know.
+pub const CONNECTION_TAKEN_OVER: &str = "_mjx/connection/taken_over";
 
 /// Payload of [`AGENT_INFO`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +54,12 @@ pub struct AgentInfo {
     pub command: Vec<String>,
     /// Working directory the session runs in.
     pub cwd: String,
+    /// Pass this back as `?resume=` to rejoin this agent after a reload.
+    pub connection_id: String,
+    /// True when this socket rejoined an agent that was already running, so the
+    /// handshake was answered from what the agent said the first time round.
+    /// The browser reads it to decide whether to ask for a replay.
+    pub resumed: bool,
 }
 
 /// Payload of [`AGENT_STDERR`].
@@ -156,6 +169,7 @@ mod tests {
             FS_WROTE,
             INSPECTOR_FRAME,
             SESSION_REPLAY,
+            CONNECTION_TAKEN_OVER,
         ] {
             assert!(method::is_extension(m), "{m} must start with _");
             assert!(m.starts_with("_mjx/"), "{m} must be namespaced to _mjx");
@@ -175,5 +189,20 @@ mod tests {
         // camelCase to match ACP's own convention, and `signal` is omitted
         // rather than sent as null.
         assert_eq!(json, r#"{"terminalId":"t1","exitCode":0}"#);
+    }
+
+    #[test]
+    fn agent_info_carries_the_handle_a_browser_resumes_with() {
+        let json = serde_json::to_string(&AgentInfo {
+            agent_id: "mock".into(),
+            name: "Mock Agent".into(),
+            command: vec!["mjx-mock-agent".into()],
+            cwd: "/w".into(),
+            connection_id: "c1".into(),
+            resumed: true,
+        })
+        .unwrap();
+        assert!(json.contains(r#""connectionId":"c1""#), "{json}");
+        assert!(json.contains(r#""resumed":true"#), "{json}");
     }
 }
