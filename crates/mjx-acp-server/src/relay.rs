@@ -16,6 +16,7 @@ use futures::{SinkExt, StreamExt};
 use mjx_acp_core::{Direction, Frame, JsonRpcError, MethodCorrelator, ext, method};
 
 use crate::agent_process::{AgentHandle, AgentProcess};
+use crate::id_bridge::IdBridge;
 use crate::sessions::SessionStore;
 
 /// How a frame should be handled.
@@ -212,6 +213,9 @@ impl Outbox {
 pub struct Relay<I: Interceptor> {
     interceptor: Arc<I>,
     correlator: tokio::sync::Mutex<MethodCorrelator>,
+    /// Browser request ids, mapped onto one id space the agent sees. See
+    /// [`IdBridge`] for why an agent that outlives a socket needs one.
+    ids: tokio::sync::Mutex<IdBridge>,
     outbox: Outbox,
     /// Held until the `initialize` handshake completes.
     /// See [`Relay::announce_after_handshake`].
@@ -273,6 +277,7 @@ pub fn start<I: Interceptor>(
     let relay = Arc::new(Relay {
         interceptor,
         correlator: tokio::sync::Mutex::new(MethodCorrelator::new()),
+        ids: tokio::sync::Mutex::new(IdBridge::new()),
         outbox: Outbox {
             to_browser: BrowserSink::default(),
             to_agent,
@@ -342,6 +347,11 @@ impl<I: Interceptor> Connection<I> {
         Rx: futures::Stream<Item = String> + Unpin + Send + 'static,
         Tx: futures::Sink<String> + Unpin + Send + 'static,
     {
+        // Whatever the previous browser left in flight is owed to a browser
+        // that is no longer here, and the one arriving now numbers its own
+        // requests from 1.
+        self.relay.ids.lock().await.reattach();
+
         let mut to_browser_rx = self.relay.outbox.to_browser.attach();
 
         let browser_writer = tokio::spawn(async move {
@@ -440,19 +450,34 @@ impl<I: Interceptor> Relay<I> {
             }
         };
 
-        let method = self.correlator.lock().await.observe(direction, &frame);
-        let label = frame
-            .method()
-            .map(str::to_owned)
-            .or_else(|| method.map(|m| m.to_string()));
-
         // `_mjx/*` is between the browser and this server; the agent has never
-        // heard of it and must not be sent it.
+        // heard of it and must not be sent it. Checked before anything else
+        // observes the frame, because an extension request is answered with the
+        // browser's own id and so must not be rebound below.
         if direction == Direction::ClientToAgent && frame.method().is_some_and(method::is_extension)
         {
             self.handle_extension(&frame).await;
             return;
         }
+
+        // Rebind before the correlator and the session store see it, so both
+        // are keyed on the ids the agent will actually answer with. Everything
+        // from here on lives in the agent's id space; the browser's own ids
+        // reappear only in `forward`.
+        let frame = match (direction, &frame) {
+            (Direction::ClientToAgent, Frame::Request { id, method, params }) => Frame::Request {
+                id: self.ids.lock().await.for_agent(id.clone()),
+                method: method.clone(),
+                params: params.clone(),
+            },
+            _ => frame,
+        };
+
+        let method = self.correlator.lock().await.observe(direction, &frame);
+        let label = frame
+            .method()
+            .map(str::to_owned)
+            .or_else(|| method.map(|m| m.to_string()));
 
         {
             let mut sessions = self.sessions.lock().await;
@@ -469,11 +494,11 @@ impl<I: Interceptor> Relay<I> {
 
         match disposition {
             Disposition::Forward => {
-                self.send(direction, frame.to_line());
+                self.forward(direction, &frame).await;
                 self.announce_after_handshake(direction, &frame, label.as_deref())
                     .await;
             }
-            Disposition::Rewrite(rewritten) => self.send(direction, rewritten.to_line()),
+            Disposition::Rewrite(rewritten) => self.forward(direction, &rewritten).await,
             Disposition::Intercept => {
                 // The browser never sees this frame, so mirror it to the
                 // inspector; otherwise a tool whose job is showing the protocol
@@ -542,6 +567,32 @@ impl<I: Interceptor> Relay<I> {
         if let Some(info) = self.agent_info.lock().await.take() {
             self.outbox.notify_browser(ext::AGENT_INFO, &info);
         }
+    }
+
+    /// Passes a frame on, putting a response back into the browser's id space.
+    ///
+    /// The agent answers the ids the relay minted; the browser is waiting on
+    /// its own. Translating here rather than at every call site means the one
+    /// place that can drop a frame is the one place that knows why.
+    async fn forward(&self, direction: Direction, frame: &Frame) {
+        if direction == Direction::AgentToClient
+            && let Frame::Response { id, payload } = frame
+        {
+            let Some(id) = self.ids.lock().await.for_browser(id) else {
+                // The browser that asked has gone. Delivering this to the one
+                // now attached would answer a question it never asked, and
+                // could be read as the answer to a question it did.
+                tracing::debug!(%id, "dropped a response owed to a browser that left");
+                return;
+            };
+            let frame = Frame::Response {
+                id,
+                payload: payload.clone(),
+            };
+            self.send(direction, frame.to_line());
+            return;
+        }
+        self.send(direction, frame.to_line());
     }
 
     fn send(&self, direction: Direction, line: String) {

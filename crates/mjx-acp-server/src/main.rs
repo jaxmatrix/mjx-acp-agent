@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 mod agent_process;
 mod config;
+mod id_bridge;
 mod relay;
 mod sessions;
 mod workspace_interceptor;
