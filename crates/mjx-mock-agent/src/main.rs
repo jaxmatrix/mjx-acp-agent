@@ -1,0 +1,277 @@
+//! A scripted ACP agent that needs no credentials and no network.
+//!
+//! It exists so `./scripts/demo.sh` works on a machine with nothing installed,
+//! and so the integration tests have a deterministic peer. One turn walks
+//! through every client UI surface in order: a thought block, streaming text, a
+//! read tool call, a plan, an edit tool call carrying a diff, a permission
+//! request, and a live terminal.
+//!
+//! It speaks the wire format directly via `serde_json::json!` rather than
+//! through the schema types. That is deliberate: the mock is a *fixture*, and
+//! writing the JSON by hand means the tests check our understanding of the
+//! protocol rather than checking a serializer against itself. The tests in
+//! `script.rs` re-parse everything it emits with the real schema types, so a
+//! typo fails the build rather than the demo.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::Duration;
+
+use anyhow::Result;
+use mjx_acp_core::{Frame, JsonRpcError, RequestId, ResponsePayload, method};
+use serde_json::{Value, json, value::RawValue};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, mpsc, oneshot};
+
+mod script;
+
+/// Wall-clock pacing. Tests set `MJX_MOCK_SPEED=0` to run the script instantly;
+/// the demo leaves it at 1 so streaming is visible.
+fn speed() -> f32 {
+    std::env::var("MJX_MOCK_SPEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0)
+}
+
+/// Sleeps for `ms` scaled by [`speed`].
+pub async fn beat(ms: u64) {
+    let scaled = (ms as f32 * speed()) as u64;
+    if scaled > 0 {
+        tokio::time::sleep(Duration::from_millis(scaled)).await;
+    }
+}
+
+/// What a client request came back with.
+pub type Reply = Result<Box<RawValue>, JsonRpcError>;
+
+/// The agent's shared state: an outbox, and the bookkeeping for requests we
+/// have sent the client and are waiting on.
+pub struct Agent {
+    outbox: mpsc::UnboundedSender<Frame>,
+    next_request_id: AtomicI64,
+    pending: Mutex<HashMap<RequestId, oneshot::Sender<Reply>>>,
+    /// One flag per session, raised by `session/cancel`. The script checks it
+    /// between steps.
+    cancelled: Mutex<HashMap<String, Arc<AtomicBool>>>,
+}
+
+impl Agent {
+    /// Sends a notification to the client.
+    pub fn notify(&self, method: &str, params: Value) {
+        let frame = Frame::notification(method, &params).expect("json! values always serialize");
+        let _ = self.outbox.send(frame);
+    }
+
+    /// Sends a `session/update` notification.
+    pub fn update(&self, session_id: &str, update: Value) {
+        self.notify(
+            method::client::SESSION_UPDATE,
+            json!({ "sessionId": session_id, "update": update }),
+        );
+    }
+
+    /// Calls a client method and waits for the response.
+    pub async fn request(&self, method: &str, params: Value) -> Reply {
+        let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().await.insert(id.clone(), tx);
+
+        let frame = Frame::Request {
+            id: id.clone(),
+            method: method.into(),
+            params: Some(serde_json::value::to_raw_value(&params).expect("json! serializes")),
+        };
+        if self.outbox.send(frame).is_err() {
+            self.pending.lock().await.remove(&id);
+            return Err(JsonRpcError::internal("connection closed"));
+        }
+
+        rx.await
+            .unwrap_or_else(|_| Err(JsonRpcError::internal("connection closed")))
+    }
+
+    /// Whether the given session's turn has been cancelled.
+    pub async fn is_cancelled(&self, session_id: &str) -> bool {
+        self.cancelled
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    async fn begin_turn(&self, session_id: &str) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.cancelled
+            .lock()
+            .await
+            .insert(session_id.to_string(), flag.clone());
+        flag
+    }
+
+    async fn resolve(&self, id: &RequestId, reply: Reply) {
+        if let Some(tx) = self.pending.lock().await.remove(id) {
+            let _ = tx.send(reply);
+        } else {
+            tracing::warn!(%id, "response to a request we never sent");
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Logs go to stderr; stdout is the protocol channel and must stay clean.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("MJX_MOCK_LOG")
+                .unwrap_or_else(|_| "warn".into()),
+        )
+        .init();
+
+    let (outbox, mut outbox_rx) = mpsc::unbounded_channel::<Frame>();
+    let agent = Arc::new(Agent {
+        outbox,
+        next_request_id: AtomicI64::new(1),
+        pending: Mutex::new(HashMap::new()),
+        cancelled: Mutex::new(HashMap::new()),
+    });
+
+    // A single writer task owns stdout, so concurrent handlers can't interleave
+    // halves of two frames onto the same line.
+    let writer = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(frame) = outbox_rx.recv().await {
+            let mut line = frame.to_line();
+            line.push('\n');
+            if stdout.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+            let _ = stdout.flush().await;
+        }
+    });
+
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match Frame::parse(&line) {
+            Ok(frame) => dispatch(agent.clone(), frame).await,
+            Err(err) => tracing::warn!(%err, line, "unparseable frame"),
+        }
+    }
+
+    drop(agent);
+    let _ = writer.await;
+    Ok(())
+}
+
+async fn dispatch(agent: Arc<Agent>, frame: Frame) {
+    match frame {
+        Frame::Response { id, payload } => {
+            let reply = match payload {
+                ResponsePayload::Result(result) => Ok(result),
+                ResponsePayload::Error(error) => Err(error),
+            };
+            agent.resolve(&id, reply).await;
+        }
+        Frame::Notification { method, params } => {
+            if method == method::agent::SESSION_CANCEL {
+                let session_id = params
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<Value>(p.get()).ok())
+                    .and_then(|p| p["sessionId"].as_str().map(str::to_owned));
+                if let Some(session_id) = session_id
+                    && let Some(flag) = agent.cancelled.lock().await.get(&session_id)
+                {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        // Requests are spawned rather than awaited inline: a `session/prompt`
+        // runs for seconds, and `session/cancel` has to be read off stdin while
+        // it does.
+        Frame::Request { id, method, params } => {
+            tokio::spawn(async move {
+                let params: Value = params
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str(p.get()).ok())
+                    .unwrap_or(Value::Null);
+                let reply = handle(&agent, &method, params).await;
+                let frame = match reply {
+                    Ok(result) => Frame::result(id, &result).expect("results serialize"),
+                    Err(error) => Frame::error(id, error),
+                };
+                let _ = agent.outbox.send(frame);
+            });
+        }
+    }
+}
+
+async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value, JsonRpcError> {
+    use mjx_acp_core::method::agent as m;
+    match method {
+        m::INITIALIZE => Ok(json!({
+            "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
+            "agentInfo": { "name": "mjx-mock-agent", "version": env!("CARGO_PKG_VERSION") },
+            "agentCapabilities": {
+                "loadSession": false,
+                "promptCapabilities": { "image": false, "audio": false, "embeddedContext": true }
+            },
+            // No auth methods: this agent is the whole point of "works out of
+            // the box".
+            "authMethods": []
+        })),
+
+        m::SESSION_NEW => Ok(json!({
+            "sessionId": format!("mock-{}", short_id()),
+            "modes": {
+                "currentModeId": "code",
+                "availableModes": [
+                    { "id": "ask",  "name": "Ask",  "description": "Answer questions, change nothing." },
+                    { "id": "code", "name": "Code", "description": "Read and edit files." },
+                ]
+            }
+        })),
+
+        m::SESSION_PROMPT => {
+            let session_id = params["sessionId"]
+                .as_str()
+                .ok_or_else(|| JsonRpcError::invalid_params("sessionId is required"))?
+                .to_string();
+            let flag = agent.begin_turn(&session_id).await;
+            let stop_reason = script::run_turn(agent, &session_id, &params).await;
+            flag.store(false, Ordering::Relaxed);
+            Ok(json!({ "stopReason": stop_reason }))
+        }
+
+        m::SESSION_SET_MODE => {
+            let mode = params["modeId"].as_str().unwrap_or("code").to_string();
+            if let Some(session_id) = params["sessionId"].as_str() {
+                agent.update(
+                    session_id,
+                    json!({ "sessionUpdate": "current_mode_update", "currentModeId": mode }),
+                );
+            }
+            Ok(json!({}))
+        }
+        m::AUTHENTICATE | m::SESSION_CLOSE => Ok(json!({})),
+
+        other => Err(JsonRpcError::method_not_found(other)),
+    }
+}
+
+/// A short id, unique enough within one process run. Saves a uuid dependency
+/// for something that never leaves this binary.
+fn short_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicI64 = AtomicI64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}{n:x}")
+}
