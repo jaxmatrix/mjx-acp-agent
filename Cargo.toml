@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mjx-acp-core",
+]
+exclude = ["reference"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+mjx-acp-core = { path = "crates/mjx-acp-core" }
+
+# Same pin Zed uses (../zed/Cargo.toml:519). We consume this crate for its
+# schema types; the JSON-RPC relay itself works on raw frames.
+agent-client-protocol = { version = "=2.0.0", features = ["unstable"] }
+
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+futures = "0.3"
+portable-pty = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+# The ACP schema crate is large; keep incremental rebuilds snappy.
+opt-level = 0
+debug = 1
