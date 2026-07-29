@@ -5,6 +5,7 @@ members = [
     "crates/mjx-acp-thread",
     "crates/mjx-agent-catalog",
     "crates/mjx-workspace",
+    "crates/mjx-acp-server",
     "crates/mjx-mock-agent",
 ]
 exclude = ["reference"]

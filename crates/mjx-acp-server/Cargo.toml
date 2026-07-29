@@ -1,0 +1,37 @@
+[package]
+name = "mjx-acp-server"
+description = "WebSocket transport for ACP: relays browser clients to agent subprocesses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mjx-acp-server"
+path = "src/main.rs"
+
+[dependencies]
+mjx-acp-core.workspace = true
+mjx-acp-thread.workspace = true
+mjx-agent-catalog.workspace = true
+mjx-workspace.workspace = true
+agent-client-protocol.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+# Match the version axum 0.8 uses so tests and the server share one copy.
+tokio-tungstenite = "0.29"
+tempfile = "3"
+reqwest = { workspace = true }
