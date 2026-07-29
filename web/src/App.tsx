@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 
+import { choiceStore, resumeStore } from "./acp/resume";
 import { AgentPicker } from "./components/AgentPicker";
 import { Composer } from "./components/Composer";
 import { Inspector } from "./components/Inspector";
@@ -9,18 +10,37 @@ import { Sidebar } from "./components/Sidebar";
 import { ThreadView } from "./components/ThreadView";
 import { useSession } from "./useSession";
 
+const choice = choiceStore();
+const resume = resumeStore();
+
 export function App() {
-  const [connection, setConnection] = useState<{ agentId: string; cwd: string }>();
+  // Restored, not empty: the server keeps the agent alive across a reload, and
+  // a page that came back to the picker would leave that conversation running
+  // where nobody could see it.
+  const [connection, setConnection] = useState(choice.get);
 
   if (!connection) {
-    return <AgentPicker onConnect={(agentId, cwd) => setConnection({ agentId, cwd })} />;
+    return (
+      <AgentPicker
+        onConnect={(agentId, cwd) => {
+          choice.set({ agentId, cwd });
+          setConnection({ agentId, cwd });
+        }}
+      />
+    );
   }
 
   return (
     <Conversation
       agentId={connection.agentId}
       cwd={connection.cwd}
-      onDisconnect={() => setConnection(undefined)}
+      onDisconnect={() => {
+        // Leaving on purpose is not a reload. Forget the agent so the next
+        // visit starts clean rather than rejoining something abandoned.
+        resume.clear(connection.agentId, connection.cwd);
+        choice.clear();
+        setConnection(undefined);
+      }}
     />
   );
 }
@@ -61,6 +81,16 @@ function Conversation({
           Connection failed: {session.status.message}
         </p>
       )}
+      {session.status.state === "takenOver" && (
+        // The agent is still running; it is just answering to another tab now.
+        // Taking it back is the same move that tab made to get it.
+        <p className="callout">
+          This session was opened in another tab.{" "}
+          <button type="button" className="link-button" onClick={session.reconnect}>
+            Take it back
+          </button>
+        </p>
+      )}
 
       <div className="app__body">
         <main className="app__main">
@@ -91,6 +121,7 @@ function StatusPill({ session }: { session: ReturnType<typeof useSession> }) {
   const { status, thread } = session;
   if (status.state === "connecting") return <span className="pill">connecting…</span>;
   if (status.state === "failed") return <span className="pill pill--failed">disconnected</span>;
+  if (status.state === "takenOver") return <span className="pill pill--failed">other tab</span>;
   if (status.state === "closed") return <span className="pill pill--failed">closed</span>;
   return (
     <span className={`pill pill--${thread.status === "generating" ? "in_progress" : "completed"}`}>

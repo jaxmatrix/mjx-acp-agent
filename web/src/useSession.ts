@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { resumeStore } from "./acp/resume";
 import { Session, type SessionStatus } from "./acp/session";
 import { emptyThread, type AgentInfo, type InspectorEntry, type Thread } from "./acp/types";
 
@@ -15,11 +16,15 @@ export interface SessionState {
   cancel(): void;
   setMode(modeId: string): void;
   answerPermission(toolCallId: string, optionId: string | null): void;
+  /** Opens a new socket to the same agent, taking it back from another tab. */
+  reconnect(): void;
   error?: string;
 }
 
 /** The inspector keeps a bounded log; Zed's ACP tools ring-buffer at 2000. */
 const MAX_FRAMES = 2000;
+
+const resume = resumeStore();
 
 /** Opens a session against `agentId` in `cwd`, and keeps React in step. */
 export function useSession(agentId: string | null, cwd: string | null): SessionState {
@@ -28,6 +33,8 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
   const [agentInfo, setAgentInfo] = useState<AgentInfo>();
   const [frames, setFrames] = useState<InspectorEntry[]>([]);
   const [error, setError] = useState<string>();
+  /** Bumped to reopen the socket; see `reconnect`. */
+  const [attempt, setAttempt] = useState(0);
 
   const session = useRef<Session>(null);
   const nextSeq = useRef(0);
@@ -44,7 +51,13 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
     const active = new Session(emptyThread(), {
       thread: setThread,
-      agentInfo: setAgentInfo,
+      agentInfo: (info) => {
+        // Keep the handle to come back with. The server mints a new id when it
+        // could not honour the one we sent, so writing back whatever it says
+        // is also how a stale id gets replaced.
+        resume.set(agentId, cwd ?? "", info.connectionId);
+        setAgentInfo(info);
+      },
       status: setStatus,
       frame: (entry) => {
         setFrames((current) => {
@@ -58,15 +71,24 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     });
     session.current = active;
 
-    active.connect({ agentId, cwd: cwd ?? undefined }).catch((cause: unknown) => {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    });
+    active
+      .connect({
+        agentId,
+        cwd: cwd ?? undefined,
+        // If this tab was here before, rejoin the agent it left rather than
+        // start another. The reset above is not wasted: the replay replaces the
+        // thread a moment later, and until it does an empty page is honest.
+        resume: resume.get(agentId, cwd ?? ""),
+      })
+      .catch((cause: unknown) => {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      });
 
     return () => {
       active.close();
       session.current = null;
     };
-  }, [agentId, cwd]);
+  }, [agentId, cwd, attempt]);
 
   const prompt = useCallback((text: string) => {
     session.current?.prompt(text).catch((cause: unknown) => {
@@ -86,5 +108,18 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     session.current?.answerPermission(toolCallId, optionId);
   }, []);
 
-  return { thread, status, agentInfo, frames, prompt, cancel, setMode, answerPermission, error };
+  const reconnect = useCallback(() => setAttempt((n) => n + 1), []);
+
+  return {
+    thread,
+    status,
+    agentInfo,
+    frames,
+    prompt,
+    cancel,
+    setMode,
+    answerPermission,
+    reconnect,
+    error,
+  };
 }
