@@ -234,9 +234,7 @@ impl Frame {
 
     /// Deserializes the payload of a request or notification into a typed
     /// message. Returns `Ok(None)` when there is no payload at all.
-    pub fn params_as<T: serde::de::DeserializeOwned>(
-        &self,
-    ) -> Result<Option<T>, serde_json::Error> {
+    pub fn params_as<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
         self.params()
             .map(|raw| serde_json::from_str(raw.get()))
             .transpose()
@@ -334,10 +332,8 @@ mod tests {
 
     #[test]
     fn parses_a_request() {
-        let frame = Frame::parse(
-            r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1"}}"#,
-        )
-        .unwrap();
+        let frame = Frame::parse(r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1"}}"#)
+            .unwrap();
         assert_eq!(frame.method(), Some("session/prompt"));
         assert_eq!(frame.id(), Some(&RequestId::Number(1)));
         assert!(matches!(frame, Frame::Request { .. }));
@@ -345,8 +341,8 @@ mod tests {
 
     #[test]
     fn parses_a_notification() {
-        let frame = Frame::parse(r#"{"jsonrpc":"2.0","method":"session/update","params":{"a":1}}"#)
-            .unwrap();
+        let frame =
+            Frame::parse(r#"{"jsonrpc":"2.0","method":"session/update","params":{"a":1}}"#).unwrap();
         assert!(matches!(frame, Frame::Notification { .. }));
         assert_eq!(frame.id(), None);
     }
@@ -434,10 +430,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"result":{"ok":true}}"#
         );
 
-        let frame = Frame::error(
-            RequestId::String("a".into()),
-            JsonRpcError::method_not_found("x"),
-        );
+        let frame = Frame::error(RequestId::String("a".into()), JsonRpcError::method_not_found("x"));
         assert!(frame.to_line().contains(r#""code":-32601"#));
     }
 

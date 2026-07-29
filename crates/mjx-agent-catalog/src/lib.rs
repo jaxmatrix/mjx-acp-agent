@@ -20,9 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod registry;
 
-pub use registry::{
-    BinaryDistribution, Distribution, NpxDistribution, RegistryAgent, RegistryDocument,
-};
+pub use registry::{BinaryDistribution, Distribution, NpxDistribution, RegistryAgent, RegistryDocument};
 
 /// The default ACP agent registry.
 pub const DEFAULT_REGISTRY_URL: &str =
@@ -334,9 +332,7 @@ mod tests {
                 {"id":"kilo","name":"Kilo","distribution":{"npx":{"package":"@kilocode/cli@7.4.16","args":["acp"]}}}
             ]}"#,
         );
-        catalog
-            .overrides
-            .push(an_override("kilo", "kilo", &["acp"]));
+        catalog.overrides.push(an_override("kilo", "kilo", &["acp"]));
 
         let entries = catalog.entries();
         let kilo: Vec<_> = entries.iter().filter(|e| e.id == "kilo").collect();

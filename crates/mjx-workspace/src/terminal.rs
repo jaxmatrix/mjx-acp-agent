@@ -208,18 +208,15 @@ impl Terminals {
             });
         }
 
-        self.terminals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                id.clone(),
-                Arc::new(Terminal {
-                    output,
-                    exit: exit_rx,
-                    killer: Mutex::new(Some(killer)),
-                    _master: Mutex::new(pty.master),
-                }),
-            );
+        self.terminals.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.clone(),
+            Arc::new(Terminal {
+                output,
+                exit: exit_rx,
+                killer: Mutex::new(Some(killer)),
+                _master: Mutex::new(pty.master),
+            }),
+        );
 
         Ok(id)
     }
@@ -407,10 +404,7 @@ mod tests {
         let id = terminals
             .create("sh", &["-c".into(), "exit 3".into()], &[], cwd(), None, tx)
             .unwrap();
-        assert_eq!(
-            terminals.wait_for_exit(&id).await.unwrap().exit_code,
-            Some(3)
-        );
+        assert_eq!(terminals.wait_for_exit(&id).await.unwrap().exit_code, Some(3));
     }
 
     #[tokio::test]
@@ -441,10 +435,7 @@ mod tests {
         let id = terminals
             .create(
                 "sh",
-                &[
-                    "-c".into(),
-                    "for i in $(seq 1 500); do echo line$i; done".into(),
-                ],
+                &["-c".into(), "for i in $(seq 1 500); do echo line$i; done".into()],
                 &[],
                 cwd(),
                 Some(64),
@@ -458,11 +449,7 @@ mod tests {
 
         let (output, truncated, _) = terminals.output(&id).unwrap();
         assert!(truncated, "the truncation flag was never set");
-        assert!(
-            output.len() <= 64,
-            "kept {} bytes of a 64 budget",
-            output.len()
-        );
+        assert!(output.len() <= 64, "kept {} bytes of a 64 budget", output.len());
         // The *end* is what survives: recent output is the useful part.
         assert!(output.contains("line500"), "{output:?}");
         assert!(!output.contains("line1\n"), "{output:?}");
@@ -481,11 +468,7 @@ mod tests {
             .await
             .expect("kill did not take effect")
             .unwrap();
-        assert_ne!(
-            status.exit_code,
-            Some(0),
-            "a killed process exited cleanly?"
-        );
+        assert_ne!(status.exit_code, Some(0), "a killed process exited cleanly?");
 
         // Killing twice is not an error.
         assert!(terminals.kill(&id).is_ok());

@@ -17,11 +17,7 @@ use crate::WorkspaceError;
 ///
 /// `must_exist` is false for writes, where the file is allowed not to exist
 /// yet; in that case the parent directory is what gets checked.
-pub fn resolve_within(
-    roots: &[PathBuf],
-    path: &Path,
-    must_exist: bool,
-) -> Result<PathBuf, WorkspaceError> {
+pub fn resolve_within(roots: &[PathBuf], path: &Path, must_exist: bool) -> Result<PathBuf, WorkspaceError> {
     if !path.is_absolute() {
         return Err(WorkspaceError::NotAbsolute(path.to_path_buf()));
     }
@@ -83,9 +79,7 @@ pub fn read_text_file(
     let mut out = selected.join("\n");
     // Keep the trailing newline when the slice runs to the end of a file that
     // had one, so a read/write round trip doesn't quietly strip it.
-    if contents.ends_with('\n')
-        && !out.is_empty()
-        && limit.is_none_or(|l| selected.len() < l as usize)
+    if contents.ends_with('\n') && !out.is_empty() && limit.is_none_or(|l| selected.len() < l as usize)
     {
         out.push('\n');
     }
@@ -143,13 +137,7 @@ mod tests {
     #[test]
     fn reads_a_whole_file() {
         let f = fixture();
-        let contents = read_text_file(
-            std::slice::from_ref(&f.root),
-            &f.root.join("a.txt"),
-            None,
-            None,
-        )
-        .unwrap();
+        let contents = read_text_file(std::slice::from_ref(&f.root), &f.root.join("a.txt"), None, None).unwrap();
         assert_eq!(contents, "one\ntwo\nthree\nfour\n");
     }
 
@@ -182,13 +170,8 @@ mod tests {
     #[test]
     fn a_path_outside_every_root_is_refused() {
         let f = fixture();
-        let err = read_text_file(
-            std::slice::from_ref(&f.root),
-            &f.outside.join("secret.txt"),
-            None,
-            None,
-        )
-        .unwrap_err();
+        let err = read_text_file(std::slice::from_ref(&f.root), &f.outside.join("secret.txt"), None, None)
+            .unwrap_err();
         assert!(matches!(err, WorkspaceError::OutsideWorkspace(_)), "{err}");
     }
 
@@ -223,12 +206,7 @@ mod tests {
         let link_dir = f.root.join("escape-dir");
         std::os::unix::fs::symlink(&f.outside, &link_dir).unwrap();
 
-        let err = write_text_file(
-            std::slice::from_ref(&f.root),
-            &link_dir.join("new.txt"),
-            "x",
-        )
-        .unwrap_err();
+        let err = write_text_file(std::slice::from_ref(&f.root), &link_dir.join("new.txt"), "x").unwrap_err();
         assert!(matches!(err, WorkspaceError::OutsideWorkspace(_)), "{err}");
         assert!(
             !f.outside.join("new.txt").exists(),
@@ -239,13 +217,7 @@ mod tests {
     #[test]
     fn relative_paths_are_refused() {
         let f = fixture();
-        let err = read_text_file(
-            std::slice::from_ref(&f.root),
-            Path::new("a.txt"),
-            None,
-            None,
-        )
-        .unwrap_err();
+        let err = read_text_file(std::slice::from_ref(&f.root), Path::new("a.txt"), None, None).unwrap_err();
         assert!(matches!(err, WorkspaceError::NotAbsolute(_)), "{err}");
     }
 
@@ -264,10 +236,7 @@ mod tests {
     fn creating_a_new_file_reports_no_previous_contents() {
         let f = fixture();
         let path = f.root.join("nested/new.txt");
-        assert_eq!(
-            write_text_file(std::slice::from_ref(&f.root), &path, "fresh").unwrap(),
-            None
-        );
+        assert_eq!(write_text_file(std::slice::from_ref(&f.root), &path, "fresh").unwrap(), None);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh");
     }
 
@@ -276,12 +245,8 @@ mod tests {
         // The parent has to exist for the jail check to mean anything, so this
         // is a not-found rather than a silent mkdir outside the root.
         let f = fixture();
-        let err = write_text_file(
-            std::slice::from_ref(&f.root),
-            &f.root.join("no/such/dir/x.txt"),
-            "x",
-        )
-        .unwrap_err();
+        let err =
+            write_text_file(std::slice::from_ref(&f.root), &f.root.join("no/such/dir/x.txt"), "x").unwrap_err();
         assert!(matches!(err, WorkspaceError::NotFound(_)), "{err}");
     }
 

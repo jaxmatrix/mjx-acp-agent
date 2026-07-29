@@ -489,10 +489,7 @@ mod tests {
             "sessionUpdate": "tool_call_update", "toolCallId": "orphan", "status": "in_progress"
         })]);
 
-        assert_eq!(
-            thread.tool_call("orphan").unwrap().status,
-            acp::ToolCallStatus::InProgress
-        );
+        assert_eq!(thread.tool_call("orphan").unwrap().status, acp::ToolCallStatus::InProgress);
     }
 
     #[test]

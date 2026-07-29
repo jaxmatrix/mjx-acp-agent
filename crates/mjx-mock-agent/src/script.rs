@@ -447,7 +447,8 @@ fn patched(contents: &str) -> (String, String) {
     const OLD_LINE: &str = "  return sorted[mid];";
     const NEW_LINE: &str = "  return sorted.length % 2 === 0\n    ? (sorted[mid - 1] + sorted[mid]) / 2\n    : sorted[mid];";
     /// The comment describing the bug, which the fix makes untrue.
-    const STALE_COMMENT: &str = "  // BUG: for even-length input this returns the upper of the two middle\n  // values instead of their average.\n";
+    const STALE_COMMENT: &str =
+        "  // BUG: for even-length input this returns the upper of the two middle\n  // values instead of their average.\n";
 
     if contents.contains(OLD_LINE) {
         let fixed = contents
