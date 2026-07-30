@@ -40,7 +40,7 @@ function folded(): Thread {
 
 describe("the recorded turn", () => {
   test("every update is present", () => {
-    expect(updates).toHaveLength(68);
+    expect(updates).toHaveLength(69);
   });
 
   test("folds to the same shape the Rust model produces", () => {
@@ -87,6 +87,11 @@ describe("the recorded turn", () => {
     expect(thread.usage?.used).toBe(4812);
     expect(thread.usage?.size).toBe(200000);
     expect(thread.availableCommands).toHaveLength(2);
+
+    // The agent moved itself onto a more capable model partway through, and the
+    // fold followed it.
+    expect(thread.configOptions).toHaveLength(3);
+    expect(thread.configOptions[0]).toMatchObject({ id: "model", currentValue: "mock-opus" });
   });
 
   test("the prompt appears once, not twice", () => {
