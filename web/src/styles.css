@@ -1008,6 +1008,33 @@ button {
   background: var(--panel-2);
 }
 
+.mention {
+  display: inline;
+  padding: 0.05em 0.35em;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  font-size: 0.95em;
+  white-space: nowrap;
+}
+
+.mention--unknown {
+  border-color: var(--border);
+  background: var(--panel-2);
+}
+
+.message__body {
+  margin: 0;
+  /* Text blocks keep the newlines the user typed; chips sit inline in them. */
+  white-space: pre-wrap;
+}
+
+.tool-call__resource {
+  margin: 0.2rem 0;
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  font-size: 0.9em;
+}
+
 .composer__hint {
   margin: 0 0 0.4rem;
   padding: 0.25rem 0.5rem;

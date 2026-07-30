@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { ElicitationPrompt } from "./ElicitationPrompt";
+import { MentionChip } from "./Mention";
 import { ToolCallCard } from "./ToolCallCard";
 import { chunkText, type AssistantChunk, type ElicitationAnswer, type Thread } from "../acp/types";
 
@@ -48,9 +49,17 @@ export function ThreadView({
           case "user":
             return (
               <article key={entry.id} className="message message--user">
-                {entry.content.map((block, i) => (
-                  <p key={i}>{block.type === "text" ? block.text : `[${block.type}]`}</p>
-                ))}
+                {/* One paragraph holding an inline run, not one per block: a
+                    mention sits inside the sentence it belongs to. */}
+                <p className="message__body">
+                  {entry.content.map((block, i) => {
+                    if (block.type === "text") return <span key={i}>{block.text}</span>;
+                    if (block.type === "resource_link") {
+                      return <MentionChip key={i} uri={block.uri} name={block.name} />;
+                    }
+                    return <NonTextBlock key={i} type={block.type} />;
+                  })}
+                </p>
               </article>
             );
 
@@ -119,11 +128,16 @@ function ChunkView({ chunk }: { chunk: AssistantChunk }) {
   // still parses; anything else keeps its own place in the run.
   return (
     <>
-      {chunk.content.map((block, i) =>
-        block.type === "text" ? null : (
-          <NonTextBlock key={i} type={block.type} />
-        ),
-      )}
+      {/* A link the agent sent alongside its prose keeps its own place above
+          the markdown. Inlining it into the document would need a component
+          override and a link-to-mention pass over the rendered tree. */}
+      {chunk.content.map((block, i) => {
+        if (block.type === "text") return null;
+        if (block.type === "resource_link") {
+          return <MentionChip key={i} uri={block.uri} name={block.name} />;
+        }
+        return <NonTextBlock key={i} type={block.type} />;
+      })}
       <div className="markdown">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{chunkText(chunk)}</ReactMarkdown>
       </div>
