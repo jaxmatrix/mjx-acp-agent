@@ -125,7 +125,7 @@ impl Thread {
     ) -> Vec<ThreadEvent> {
         if let Some(Entry::User(message)) = self.entries.last_mut()
             && message.is_optimistic
-            && message.content.contains(&content)
+            && message.content.iter().any(|block| same_block(block, &content))
             && can_merge_message_chunks(message.protocol_id.as_deref(), message_id.as_deref())
         {
             if message.protocol_id.is_none() {
@@ -289,6 +289,40 @@ impl Thread {
     }
 }
 
+/// Whether two blocks are the same block, for spotting an echoed prompt.
+///
+/// Compared by what identifies each kind, not by `PartialEq` over every field.
+/// An agent is free to add a `mime_type`, a `title` or a `size` when it echoes
+/// a link back — `ResourceLink` requires only `name` and `uri` and carries
+/// seven optional fields — and a prompt shown twice is worse than one shown
+/// with the agent's extra fields. Mirrored by `sameBlock` in
+/// `web/src/acp/thread.ts`.
+fn same_block(a: &acp::ContentBlock, b: &acp::ContentBlock) -> bool {
+    use acp::ContentBlock as Block;
+    match (a, b) {
+        (Block::Text(a), Block::Text(b)) => a.text == b.text,
+        // What it points at is what it is.
+        (Block::ResourceLink(a), Block::ResourceLink(b)) => a.uri == b.uri,
+        (Block::Image(a), Block::Image(b)) => a.data == b.data && a.mime_type == b.mime_type,
+        (Block::Audio(a), Block::Audio(b)) => a.data == b.data && a.mime_type == b.mime_type,
+        (Block::Resource(a), Block::Resource(b)) => match (resource_uri(a), resource_uri(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => a == b,
+        },
+        _ => a == b,
+    }
+}
+
+fn resource_uri(resource: &acp::EmbeddedResource) -> Option<&str> {
+    match &resource.resource {
+        acp::EmbeddedResourceResource::TextResourceContents(text) => Some(&text.uri),
+        acp::EmbeddedResourceResource::BlobResourceContents(blob) => Some(&blob.uri),
+        // The schema is `non_exhaustive`; a kind we have never seen has no uri
+        // we can compare, so it is only ever equal to itself field for field.
+        _ => None,
+    }
+}
+
 /// Appends a block, merging it into the previous one when both are text.
 ///
 /// Agents emit a chunk per token; without this a sentence becomes hundreds of
@@ -440,6 +474,59 @@ mod tests {
 
         assert_eq!(thread.entries.len(), 1, "the prompt was duplicated");
         assert!(events.is_empty(), "an absorbed echo changes nothing");
+    }
+
+    #[test]
+    fn an_echoed_resource_link_the_agent_annotated_is_still_absorbed() {
+        // A ResourceLink needs only a name and a uri, and carries seven
+        // optional fields an agent is free to fill in on the way back. What it
+        // points at is what identifies it; comparing every field would show
+        // the user's own prompt twice.
+        let mut thread = Thread::new();
+        thread.push_user_prompt(
+            serde_json::from_value(serde_json::json!([
+                { "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" }
+            ]))
+            .unwrap(),
+        );
+
+        let echo: acp::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+                "type": "resource_link",
+                "uri": "file:///w/stats.js",
+                "name": "stats.js",
+                "mimeType": "text/javascript",
+                "size": 420
+            }
+        }))
+        .unwrap();
+        let events = thread.apply(&echo);
+
+        assert_eq!(thread.entries.len(), 1, "the prompt was duplicated");
+        assert!(events.is_empty(), "an absorbed echo changes nothing");
+    }
+
+    #[test]
+    fn a_link_to_somewhere_else_is_not_an_echo() {
+        let mut thread = Thread::new();
+        thread.push_user_prompt(
+            serde_json::from_value(serde_json::json!([
+                { "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" }
+            ]))
+            .unwrap(),
+        );
+
+        let other: acp::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+                "type": "resource_link", "uri": "file:///w/other.js", "name": "stats.js"
+            }
+        }))
+        .unwrap();
+        thread.apply(&other);
+
+        assert_eq!(thread.entries.len(), 2);
     }
 
     #[test]
