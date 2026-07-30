@@ -33,11 +33,17 @@ export interface SessionState {
   refreshSessions(): void;
   /** Fetches the next page and appends it. */
   moreSessionsPlease(): void;
-  loadSession(sessionId: string): void;
-  resumeSession(sessionId: string): void;
-  forkSession(sessionId: string): void;
-  deleteSession(sessionId: string): void;
-  closeSession(sessionId: string): void;
+  /**
+   * These take the whole listing rather than an id: a session belongs to the
+   * directory it was started in, and an agent's history spans every project it
+   * has been used in. Sending this connection's directory for one of those is
+   * what ACP refuses.
+   */
+  loadSession(session: SessionInfo): void;
+  resumeSession(session: SessionInfo): void;
+  forkSession(session: SessionInfo): void;
+  deleteSession(session: SessionInfo): void;
+  closeSession(session: SessionInfo): void;
   newSession(): void;
   frames: InspectorEntry[];
   prompt(text: string): void;
@@ -173,10 +179,10 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
   /** Runs one lifecycle call, and refreshes the list it just changed. */
   const lifecycle = useCallback(
-    (run: (session: Session, cwd: string) => Promise<unknown>, listAgain = true) => {
+    (run: (session: Session) => Promise<unknown>, listAgain = true) => {
       const active = session.current;
       if (!active) return;
-      run(active, cwd ?? "")
+      run(active)
         .then(async () => {
           if (!listAgain) return;
           // The list is the agent's, not ours: a fork adds an entry, a delete
@@ -190,7 +196,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
           setError(cause instanceof Error ? cause.message : String(cause));
         });
     },
-    [cwd],
+    [],
   );
 
   const refreshSessions = useCallback(() => lifecycle(async () => {}), [lifecycle]);
@@ -210,29 +216,26 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
   }, [nextCursor]);
 
   const loadSession = useCallback(
-    (id: string) => lifecycle((s, at) => s.loadSession(id, at), false),
+    (info: SessionInfo) => lifecycle((s) => s.loadSession(info), false),
     [lifecycle],
   );
   const resumeSession = useCallback(
-    (id: string) => lifecycle((s, at) => s.resumeSession(id, at), false),
+    (info: SessionInfo) => lifecycle((s) => s.resumeSession(info), false),
     [lifecycle],
   );
   const forkSession = useCallback(
-    (id: string) => lifecycle((s, at) => s.forkSession(id, at)),
+    (info: SessionInfo) => lifecycle((s) => s.forkSession(info)),
     [lifecycle],
   );
   const deleteSession = useCallback(
-    (id: string) => lifecycle((s, at) => s.deleteSession(id, at)),
+    (info: SessionInfo) => lifecycle((s) => s.deleteSession(info)),
     [lifecycle],
   );
   const closeSession = useCallback(
-    (id: string) => lifecycle((s, at) => s.closeSession(id, at)),
+    (info: SessionInfo) => lifecycle((s) => s.closeSession(info)),
     [lifecycle],
   );
-  const newSession = useCallback(
-    () => lifecycle((s, at) => s.newSession(at)),
-    [lifecycle],
-  );
+  const newSession = useCallback(() => lifecycle((s) => s.newSession()), [lifecycle]);
 
   return {
     thread,

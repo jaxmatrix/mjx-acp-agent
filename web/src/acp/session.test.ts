@@ -40,6 +40,21 @@ function connectedAgent(
   threads: Set<string> = new Set(["yesterday", "fresh"]),
 ): { stream: acp.Stream; log: AgentLog } {
   const log: AgentLog = { methods: [], loaded: [], replayed: [] };
+  /** Where each session lives, as an agent's history really does span projects. */
+  const homes: Record<string, string> = {
+    yesterday: "/w",
+    fresh: "/w",
+    forked: "/w",
+    elsewhere: "/other",
+  };
+  const mustMatchCwd = (sessionId: string, cwd: string | undefined) => {
+    const home = homes[sessionId];
+    if (home && cwd !== home) {
+      // -32002, the way a real agent refuses it: the session exists, but not
+      // in the directory that was asked for.
+      throw new acp.RequestError(-32002, `${sessionId} belongs to ${home}, not ${cwd}`);
+    }
+  };
   const toAgent = new TransformStream<acp.AnyMessage, acp.AnyMessage>();
   const toClient = new TransformStream<acp.AnyMessage, acp.AnyMessage>();
 
@@ -69,13 +84,17 @@ function connectedAgent(
       return {
         sessions: [
           { sessionId: "yesterday", cwd: "/w", title: "Rename the helper" },
+          { sessionId: "elsewhere", cwd: "/other", title: "Another project" },
           { sessionId: "fresh", cwd: "/w" },
         ],
       };
     })
     .onRequest(acp.methods.agent.session.load, async (ctx) => {
       log.methods.push("session/load");
-      log.loaded.push(ctx.params.sessionId);
+      log.loaded.push(`${ctx.params.sessionId}@${ctx.params.cwd}`);
+      // ACP's rule, and the one a client gets wrong: a session belongs to the
+      // directory it was started in, and a load naming any other is refused.
+      mustMatchCwd(ctx.params.sessionId, ctx.params.cwd);
       // Streamed *before* the response, which is the ordering the client has to
       // survive: the response is the end of the replay, not the start.
       for (const update of YESTERDAY) {
@@ -86,8 +105,9 @@ function connectedAgent(
       }
       return { configOptions: [] };
     })
-    .onRequest(acp.methods.agent.session.fork, () => {
+    .onRequest(acp.methods.agent.session.fork, (ctx) => {
       log.methods.push("session/fork");
+      mustMatchCwd(ctx.params.sessionId, ctx.params.cwd);
       return { sessionId: "forked" };
     })
     .onRequest(acp.methods.agent.session.delete, () => {
@@ -173,17 +193,17 @@ describe("a session that can reach its agent's history", () => {
   test("lists what the agent has", async () => {
     const { session } = await connected();
     const { sessions } = await session.listSessions();
-    expect(sessions.map((s) => s.sessionId)).toEqual(["yesterday", "fresh"]);
+    expect(sessions.map((s) => s.sessionId)).toEqual(["yesterday", "elsewhere", "fresh"]);
     expect(sessions[0]?.title).toBe("Rename the helper");
   });
 
   test("a load rebuilds the thread from the replay alone", async () => {
-    const { session, seen } = await connected();
+    const { session, seen, log } = await connected();
 
     // Something on screen first, so an empty thread afterwards would be an
     // accident rather than the point.
     await session.prompt("hello").catch(() => {});
-    await session.loadSession("yesterday", "/w");
+    await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
 
     // Exactly the replayed conversation: the prompt that was on screen belonged
     // to the session we left.
@@ -191,13 +211,14 @@ describe("a session that can reach its agent's history", () => {
     expect(seen.thread().entries[0]?.type).toBe("user");
     expect(session.sessionId).toBe("yesterday");
     expect(seen.replaying()).toEqual(["yesterday", "—"]);
+    expect(log.loaded).toEqual(["yesterday@/w"]);
   });
 
   test("a second load is not a longer conversation", async () => {
     const { session, seen } = await connected();
-    await session.loadSession("yesterday", "/w");
+    await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
     const first = seen.thread().entries.length;
-    await session.loadSession("yesterday", "/w");
+    await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
     expect(seen.thread().entries).toHaveLength(first);
   });
 
@@ -206,22 +227,43 @@ describe("a session that can reach its agent's history", () => {
     // into the thread on screen they would be one conversation's messages
     // appearing in another.
     const { session, seen } = await connected();
-    await session.loadSession("yesterday", "/w");
+    await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
     const before = seen.thread().entries.length;
 
-    await session.forkSession("yesterday", "/w");
+    await session.forkSession({ sessionId: "yesterday", cwd: "/w" });
     expect(session.sessionId).toBe("forked");
     expect(seen.thread().entries).toHaveLength(0);
 
     // The old session is still being talked about; none of it lands here.
-    await session.loadSession("yesterday", "/w");
+    await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
     expect(seen.thread().entries).toHaveLength(before);
+  });
+
+  test("opens a conversation from another directory with its own cwd", async () => {
+    // The bug this guards: an agent's history spans every project it has been
+    // used in, and sending *this* connection's directory for one of them is
+    // refused — `resource_not_found`, which reads as if the conversation were
+    // missing when it is only somewhere else.
+    const { session, log } = await connected();
+    const { sessions } = await session.listSessions();
+    const elsewhere = sessions.find((s) => s.sessionId === "elsewhere");
+
+    await session.loadSession(elsewhere!);
+
+    expect(log.loaded).toEqual(["elsewhere@/other"]);
+    expect(session.sessionId).toBe("elsewhere");
+  });
+
+  test("a bare id still means the conversation this connection started", async () => {
+    const { session, log } = await connected();
+    await session.loadSession("yesterday");
+    expect(log.loaded).toEqual(["yesterday@/w"]);
   });
 
   test("remembers the conversation on screen, so a reload comes back to it", async () => {
     const { session, memory: held } = await connected();
     expect(held.value()).toBe("fresh");
-    await session.loadSession("yesterday", "/w");
+    await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
     expect(held.value()).toBe("yesterday");
   });
 
@@ -257,7 +299,7 @@ describe("a session that can reach its agent's history", () => {
     // Otherwise the composer is pointed at a session the agent has forgotten,
     // and the next prompt fails with nothing to explain it.
     const { session, memory: held } = await connected();
-    await session.deleteSession("fresh", "/w");
+    await session.deleteSession({ sessionId: "fresh", cwd: "/w" });
 
     expect(session.sessionId).toBe("fresh"); // the fake agent hands out one id
     expect(held.value()).toBe("fresh");

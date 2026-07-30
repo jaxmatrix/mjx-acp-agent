@@ -125,6 +125,38 @@ await agent.request(acp.methods.agent.session.load, {
 const again = await agent.request("_mjx/session/replay", { sessionId: past.sessionId });
 check(again.entries.length === entries, `a second load left ${again.entries.length} entries, not ${entries * 2}`);
 
+// A session from another project: it belongs to the directory it was started
+// in, and the request has to say so. Sending this connection's directory is
+// refused, which is what a client gets wrong.
+// Unfiltered, because the drawer is: an agent's history spans every project it
+// has been used in, and hiding the rest would hide the case this guards.
+const everywhere = await agent.request(acp.methods.agent.session.list, {});
+const other = everywhere.sessions.find((s) => s.cwd !== tab.info.cwd);
+check(Boolean(other), "the agent's history spans more than this directory");
+let refused;
+try {
+  await agent.request(acp.methods.agent.session.load, {
+    sessionId: other.sessionId,
+    cwd: tab.info.cwd,
+    mcpServers: [],
+  });
+} catch (error) {
+  refused = error;
+}
+check(refused !== undefined, "loading it with the wrong directory is refused");
+check(
+  String(refused?.code ?? refused).includes("-32002"),
+  `refused as not-found (${refused?.code ?? refused})`,
+);
+
+const beforeOther = tab.updates.length;
+await agent.request(acp.methods.agent.session.load, {
+  sessionId: other.sessionId,
+  cwd: other.cwd,
+  mcpServers: [],
+});
+check(tab.updates.length > beforeOther, "and it loads with its own directory");
+
 // A fork is a second conversation, and the one it came from is untouched.
 const forked = await agent.request(acp.methods.agent.session.fork, {
   sessionId: past.sessionId,

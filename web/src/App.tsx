@@ -126,6 +126,7 @@ function Conversation({
           <SessionHistory
             sessions={session.sessions}
             currentSessionId={session.sessionId}
+            workspaceCwd={cwd}
             capabilities={session.capabilities}
             replayingSessionId={session.replayingSessionId}
             moreSessions={session.moreSessions}

@@ -930,6 +930,12 @@ button {
   overflow-wrap: anywhere;
 }
 
+/* A conversation from another project: it opens, but the workspace this
+   connection serves files from is not its own. */
+.history__cwd--elsewhere {
+  color: var(--warn);
+}
+
 .history__buttons {
   display: flex;
   flex-wrap: wrap;

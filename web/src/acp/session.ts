@@ -74,6 +74,18 @@ export interface SessionMemory {
   clear(): void;
 }
 
+/**
+ * A session to act on: the listing it came from, or a bare id.
+ *
+ * Taking the whole listing is what keeps a load from being sent with the wrong
+ * directory. An agent's history spans every project it has been used in, and
+ * ACP refuses a load, resume or fork whose `cwd` is not the session's own — so
+ * the directory has to travel with the id rather than be assumed from the
+ * connection. A bare string means "the conversation this connection started",
+ * which is the only one whose directory is ours to assume.
+ */
+export type TargetSession = string | { sessionId: string; cwd?: string };
+
 /** Where the session is in its lifecycle. */
 export type SessionStatus =
   | { state: "connecting" }
@@ -112,6 +124,15 @@ export class Session {
   #capabilities: AgentCapabilities = noCapabilities();
   /** Where the session on screen is remembered across a reload. */
   #memory?: SessionMemory;
+  /**
+   * The directory this connection was opened for.
+   *
+   * Only a fallback. A session belongs to the directory it was *started* in,
+   * which for anything out of `session/list` is that session's own `cwd` — an
+   * agent's history spans every project it has been used in, and the protocol
+   * refuses a load whose `cwd` is not the session's.
+   */
+  #cwd = "";
 
   constructor(initial: Thread, events: SessionEvents, memory?: SessionMemory) {
     this.#thread = initial;
@@ -146,6 +167,7 @@ export class Session {
       createWebSocketStream(websocketUrl(o)),
   ): Promise<void> {
     this.#events.status({ state: "connecting" });
+    this.#cwd = options.cwd ?? "";
 
     const stream = openStream(options);
     const app = acp
@@ -339,8 +361,9 @@ export class Session {
    *
    * A load that fails costs nothing: the thread it replaced comes back.
    */
-  async loadSession(sessionId: string, cwd: string): Promise<void> {
+  async loadSession(session: TargetSession): Promise<void> {
     if (!this.#agent) return;
+    const { sessionId, cwd } = this.#target(session);
     const previous = { thread: this.#thread, sessionId: this.#sessionId };
 
     this.#setSessionId(sessionId);
@@ -370,8 +393,9 @@ export class Session {
    * thread comes from the server's fold — which is the same thing a reload
    * does — rather than from the agent.
    */
-  async resumeSession(sessionId: string, cwd: string): Promise<void> {
+  async resumeSession(session: TargetSession): Promise<void> {
     if (!this.#agent) return;
+    const { sessionId, cwd } = this.#target(session);
     const resumed = await this.#agent.request(acp.methods.agent.session.resume, {
       sessionId,
       cwd,
@@ -389,8 +413,9 @@ export class Session {
    * history as updates — the agent replays nothing — so the thread starts
    * empty. The original is untouched and still in the list.
    */
-  async forkSession(sessionId: string, cwd: string): Promise<string | undefined> {
+  async forkSession(session: TargetSession): Promise<string | undefined> {
     if (!this.#agent) return undefined;
+    const { sessionId, cwd } = this.#target(session);
     const forked = await this.#agent.request(acp.methods.agent.session.fork, {
       sessionId,
       cwd,
@@ -402,17 +427,19 @@ export class Session {
   }
 
   /** Removes a conversation from the agent for good. */
-  async deleteSession(sessionId: string, cwd: string): Promise<void> {
+  async deleteSession(session: TargetSession): Promise<void> {
     if (!this.#agent) return;
+    const { sessionId } = this.#target(session);
     await this.#agent.request(acp.methods.agent.session.delete, { sessionId });
-    await this.#leaveIfCurrent(sessionId, cwd);
+    await this.#leaveIfCurrent(sessionId);
   }
 
   /** Frees a conversation's resources, leaving it in the list. */
-  async closeSession(sessionId: string, cwd: string): Promise<void> {
+  async closeSession(session: TargetSession): Promise<void> {
     if (!this.#agent) return;
+    const { sessionId } = this.#target(session);
     await this.#agent.request(acp.methods.agent.session.close, { sessionId });
-    await this.#leaveIfCurrent(sessionId, cwd);
+    await this.#leaveIfCurrent(sessionId);
   }
 
   /**
@@ -421,10 +448,12 @@ export class Session {
    * The relay answers the *first* `session/new` of an attachment from its
    * recording; this is a later one, so it reaches the agent and really is new.
    */
-  async newSession(cwd: string): Promise<string | undefined> {
+  async newSession(): Promise<string | undefined> {
     if (!this.#agent) return undefined;
     const session = await this.#agent.request(acp.methods.agent.session.new, {
-      cwd,
+      // A new conversation belongs here, in the directory this connection was
+      // opened for — unlike a listed one, which brings its own.
+      cwd: this.#cwd,
       mcpServers: [],
     });
     this.#setSessionId(session.sessionId);
@@ -439,10 +468,21 @@ export class Session {
    * Leaving the composer pointed at one would send a prompt to a session that
    * no longer accepts them, and the failure would arrive with no explanation.
    */
-  async #leaveIfCurrent(sessionId: string, cwd: string): Promise<void> {
+  async #leaveIfCurrent(sessionId: string): Promise<void> {
     if (this.#sessionId !== sessionId) return;
     this.#memory?.clear();
-    await this.newSession(cwd);
+    await this.newSession();
+  }
+
+  /**
+   * The id and directory to send for a session.
+   *
+   * A bare id is taken to mean the conversation this connection started, which
+   * is the only one whose directory is ours to assume.
+   */
+  #target(session: TargetSession): { sessionId: string; cwd: string } {
+    if (typeof session === "string") return { sessionId: session, cwd: this.#cwd };
+    return { sessionId: session.sessionId, cwd: session.cwd || this.#cwd };
   }
 
   /**

@@ -14,6 +14,7 @@ import type { SessionInfo } from "../acp/types";
 export function SessionHistory({
   sessions,
   currentSessionId,
+  workspaceCwd,
   capabilities,
   replayingSessionId,
   moreSessions,
@@ -28,14 +29,16 @@ export function SessionHistory({
 }: {
   sessions: SessionInfo[];
   currentSessionId?: string;
+  /** The directory this connection was opened for. */
+  workspaceCwd?: string;
   capabilities: AgentCapabilities;
   replayingSessionId?: string;
   moreSessions: boolean;
-  onLoad(sessionId: string): void;
-  onResume(sessionId: string): void;
-  onFork(sessionId: string): void;
-  onDelete(sessionId: string): void;
-  onClose(sessionId: string): void;
+  onLoad(session: SessionInfo): void;
+  onResume(session: SessionInfo): void;
+  onFork(session: SessionInfo): void;
+  onDelete(session: SessionInfo): void;
+  onClose(session: SessionInfo): void;
   onNew(): void;
   onRefresh(): void;
   onMore(): void;
@@ -59,6 +62,12 @@ export function SessionHistory({
       <ol className="history__list">
         {sessions.map((session) => {
           const current = session.sessionId === currentSessionId;
+          // A session from another project can still be opened and read: the
+          // request carries its own directory. But the *workspace* is this
+          // connection's, so files it wants outside these roots will be
+          // refused — worth saying before a prompt fails for reasons that look
+          // like nothing to do with the directory.
+          const elsewhere = Boolean(workspaceCwd) && session.cwd !== workspaceCwd;
           return (
             <li
               key={session.sessionId}
@@ -71,8 +80,16 @@ export function SessionHistory({
                 {current && <span className="pill pill--completed">open</span>}{" "}
                 {session.updatedAt ? ago(session.updatedAt) : "—"}
               </p>
-              <p className="dim history__cwd" title={session.cwd}>
+              <p
+                className={`dim history__cwd ${elsewhere ? "history__cwd--elsewhere" : ""}`}
+                title={
+                  elsewhere
+                    ? `Started in another directory. It opens, but files outside ${workspaceCwd} will be refused.`
+                    : session.cwd
+                }
+              >
                 {session.cwd}
+                {elsewhere && " ·  another directory"}
               </p>
 
               <div className="history__buttons">
@@ -83,7 +100,7 @@ export function SessionHistory({
                     type="button"
                     className="link-button"
                     disabled={busy}
-                    onClick={() => onLoad(session.sessionId)}
+                    onClick={() => onLoad(session)}
                   >
                     {replayingSessionId === session.sessionId ? "Opening…" : "Open"}
                   </button>
@@ -94,7 +111,7 @@ export function SessionHistory({
                     className="link-button"
                     disabled={busy}
                     title="Pick the conversation back up without replaying it"
-                    onClick={() => onResume(session.sessionId)}
+                    onClick={() => onResume(session)}
                   >
                     Resume
                   </button>
@@ -105,7 +122,7 @@ export function SessionHistory({
                     className="link-button"
                     disabled={busy}
                     title="Branch this conversation into a new one"
-                    onClick={() => onFork(session.sessionId)}
+                    onClick={() => onFork(session)}
                   >
                     Fork
                   </button>
@@ -116,7 +133,7 @@ export function SessionHistory({
                     className="link-button"
                     disabled={busy}
                     title="Free what this conversation is holding, and keep it"
-                    onClick={() => onClose(session.sessionId)}
+                    onClick={() => onClose(session)}
                   >
                     Close
                   </button>
@@ -130,7 +147,7 @@ export function SessionHistory({
                       // Irreversible, and one row away from Open. Asking is
                       // cheap next to losing a conversation.
                       if (confirm(`Delete “${session.title ?? session.sessionId}” for good?`)) {
-                        onDelete(session.sessionId);
+                        onDelete(session);
                       }
                     }}
                   >
