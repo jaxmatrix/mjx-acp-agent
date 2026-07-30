@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use mjx_acp_core::{Frame, JsonRpcError, RequestId, ResponsePayload, method};
+use mjx_acp_core::{Frame, JsonRpcError, RequestId, ResponsePayload, acp, method};
 use serde_json::{Value, json, value::RawValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -440,7 +440,12 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                     // would quietly offer none of this.
                     "sessionCapabilities": {
                         "list": {}, "delete": {}, "fork": {}, "resume": {}, "close": {}
-                    }
+                    },
+                    // Plain booleans, unlike `sessionCapabilities` above: in this
+                    // version of the schema `McpCapabilities` is three `bool`s.
+                    // `sse` is false on purpose, so a client that ignores what
+                    // was declared here can be caught doing it.
+                    "mcpCapabilities": { "http": true, "sse": false, "acp": true }
                 },
                 // No auth methods: this agent is the whole point of "works out
                 // of the box".
@@ -459,7 +464,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             Ok(json!({
                 "sessionId": session_id,
                 "modes": modes(),
-                "configOptions": config_options(&default_config_values())
+                "configOptions": config_options(&default_config_values()),
+                "_meta": mcp_servers_meta(&params)?
             }))
         }
 
@@ -494,7 +500,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
 
             Ok(json!({
                 "modes": modes(),
-                "configOptions": agent.config_options(&session_id).await
+                "configOptions": agent.config_options(&session_id).await,
+                "_meta": mcp_servers_meta(&params)?
             }))
         }
 
@@ -510,7 +517,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             // from a load.
             Ok(json!({
                 "modes": modes(),
-                "configOptions": agent.config_options(&session_id).await
+                "configOptions": agent.config_options(&session_id).await,
+                "_meta": mcp_servers_meta(&params)?
             }))
         }
 
@@ -558,7 +566,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             Ok(json!({
                 "sessionId": fork_id,
                 "modes": modes(),
-                "configOptions": config_options(&values)
+                "configOptions": config_options(&values),
+                "_meta": mcp_servers_meta(&params)?
             }))
         }
 
@@ -628,6 +637,64 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
 }
 
 /// The `sessionId` a lifecycle request names.
+/// What this agent was told it can reach, echoed back for the tests.
+///
+/// A real agent would connect to these. This one reports them, in `_meta` rather
+/// than in a `session/update`, so proving the passthrough works costs no change
+/// to the recorded thread fixture.
+///
+/// Deserialized as `Vec<acp::McpServer>` rather than through
+/// `NewSessionRequest`: the request type deserializes `mcpServers` with
+/// `VecSkipError`, so an entry whose shape we got wrong would silently vanish
+/// and a test that only checked the parse succeeded would pass on nothing. The
+/// count is checked too, for the same reason.
+fn mcp_servers_meta(params: &Value) -> Result<Value, JsonRpcError> {
+    let entries = match &params["mcpServers"] {
+        // Absent is legal on a fork and a resume, and means no servers.
+        Value::Null => Vec::new(),
+        Value::Array(entries) => entries.clone(),
+        other => {
+            return Err(JsonRpcError::invalid_params(format!(
+                "`mcpServers` must be an array, not {other}"
+            )));
+        }
+    };
+
+    let parsed: Vec<acp::McpServer> = serde_json::from_value(Value::Array(entries.clone()))
+        .map_err(|err| {
+            JsonRpcError::invalid_params(format!("`mcpServers` is not the schema's shape: {err}"))
+        })?;
+    if parsed.len() != entries.len() {
+        return Err(JsonRpcError::invalid_params(format!(
+            "{} of {} MCP servers were dropped while parsing",
+            entries.len() - parsed.len(),
+            entries.len()
+        )));
+    }
+
+    let described: Vec<Value> = parsed
+        .iter()
+        .map(|server| match server {
+            acp::McpServer::Stdio(stdio) => json!({ "name": stdio.name, "transport": "stdio" }),
+            acp::McpServer::Http(http) => json!({ "name": http.name, "transport": "http" }),
+            acp::McpServer::Sse(sse) => json!({ "name": sse.name, "transport": "sse" }),
+            acp::McpServer::Acp(over_acp) => json!({
+                "name": over_acp.name,
+                "transport": "acp",
+                "serverId": over_acp.server_id.0.as_ref(),
+            }),
+            // The enum is `#[non_exhaustive]`, and a transport we have never
+            // heard of is still worth reporting rather than hiding.
+            _ => json!({ "transport": "unknown" }),
+        })
+        .collect();
+
+    // Names and transports only. A value out of `env` or `headers` echoed here
+    // would travel back to the browser, which is exactly what an `acp`-transport
+    // server exists to prevent.
+    Ok(json!({ "mjx.mcpServers": described }))
+}
+
 fn session_id_of(params: &Value) -> Result<String, JsonRpcError> {
     params["sessionId"]
         .as_str()
@@ -963,6 +1030,40 @@ fn short_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mcp_transport_is_understood_and_reported() {
+        let meta = mcp_servers_meta(&json!({
+            "mcpServers": [
+                { "name": "git", "command": "/usr/bin/npx", "args": ["-y", "s"], "env": [] },
+                { "type": "http", "name": "docs", "url": "https://h/mcp", "headers": [] },
+                { "type": "sse", "name": "feed", "url": "https://h/sse", "headers": [] },
+                { "type": "acp", "name": "private", "serverId": "private" },
+            ]
+        }))
+        .unwrap();
+
+        let servers = meta["mjx.mcpServers"].as_array().unwrap();
+        let transports: Vec<&str> = servers
+            .iter()
+            .map(|server| server["transport"].as_str().unwrap())
+            .collect();
+        assert_eq!(transports, ["stdio", "http", "sse", "acp"]);
+        assert_eq!(servers[0]["name"], "git");
+        assert_eq!(servers[3]["serverId"], "private");
+
+        // Absent is legal on a fork or a resume; anything that is not an array
+        // is a client bug worth reporting rather than ignoring.
+        assert!(
+            mcp_servers_meta(&json!({})).unwrap()["mjx.mcpServers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(mcp_servers_meta(&json!({ "mcpServers": "all" })).is_err());
+        // A stdio entry with no command matches no variant, tagged or untagged.
+        assert!(mcp_servers_meta(&json!({ "mcpServers": [{ "name": "x" }] })).is_err());
+    }
 
     #[test]
     fn timestamps_are_iso_8601_in_utc() {
