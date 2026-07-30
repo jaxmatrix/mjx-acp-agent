@@ -30,6 +30,7 @@ mod agent_process;
 mod config;
 mod id_bridge;
 mod mcp;
+mod mcp_host;
 mod relay;
 mod sessions;
 mod workspace_interceptor;
@@ -548,6 +549,7 @@ async fn websocket(
             let interceptor = Arc::new(WorkspaceInterceptor::new(
                 state.config.workspace_roots.clone(),
                 cwd.clone(),
+                &state.config.mcp_servers,
             ));
 
             tracing::info!(connection = %id, agent = %info.agent_id, cwd = %info.cwd, "agent started");

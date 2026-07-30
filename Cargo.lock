@@ -1276,6 +1276,7 @@ dependencies = [
  "mjx-acp-core",
  "mjx-acp-thread",
  "mjx-agent-catalog",
+ "mjx-mcp",
  "mjx-workspace",
  "reqwest",
  "serde",
