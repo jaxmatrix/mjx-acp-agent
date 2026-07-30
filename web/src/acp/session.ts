@@ -8,6 +8,11 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { createWebSocketStream } from "@agentclientprotocol/sdk/experimental/ws-client";
 
+import {
+  agentCapabilitiesOf,
+  noCapabilities,
+  type AgentCapabilities,
+} from "./capabilities";
 import { decodeChunk, ext, websocketUrl, type ConnectOptions } from "./connection";
 import { threadFromReplay } from "./replay";
 import {
@@ -23,15 +28,18 @@ import {
   setTerminalExit,
   settleElicitation,
 } from "./thread";
-import type {
-  AgentInfo,
-  ElicitationAnswer,
-  ElicitationMode,
-  ElicitationState,
-  InspectorEntry,
-  SessionConfigOption,
-  StopReason,
-  Thread,
+import {
+  emptyThread,
+  type AgentInfo,
+  type ElicitationAnswer,
+  type ElicitationMode,
+  type ElicitationState,
+  type InspectorEntry,
+  type SessionConfigOption,
+  type SessionInfo,
+  type SessionMode,
+  type StopReason,
+  type Thread,
 } from "./types";
 
 /** What the UI subscribes to. */
@@ -40,10 +48,30 @@ export interface SessionEvents {
   thread(next: Thread): void;
   /** Which agent the server connected us to. */
   agentInfo(info: AgentInfo): void;
+  /** What the agent said it can do, once the handshake has answered. */
+  capabilities(capabilities: AgentCapabilities): void;
+  /** Which session is being replayed by `session/load`, if one is. */
+  replaying(sessionId?: string): void;
+  /** The session on screen changed — it was loaded, forked, or started fresh. */
+  sessionChanged(sessionId: string): void;
   /** A frame for the inspector. */
   frame(entry: Omit<InspectorEntry, "seq" | "at">): void;
   /** Connection lifecycle. */
   status(status: SessionStatus): void;
+}
+
+/**
+ * Which conversation this tab is looking at, across a reload.
+ *
+ * An interface rather than the storage itself, because nothing under `acp/`
+ * should know about `sessionStorage` — and because a session that is never
+ * remembered still works, it just comes back to the connection's original
+ * conversation.
+ */
+export interface SessionMemory {
+  get(): string | undefined;
+  set(sessionId: string): void;
+  clear(): void;
 }
 
 /** Where the session is in its lifecycle. */
@@ -80,10 +108,15 @@ export class Session {
    * overwrite the explanation with a bare "closed".
    */
   #takenOver = false;
+  /** What the agent said it can do, from the `initialize` response. */
+  #capabilities: AgentCapabilities = noCapabilities();
+  /** Where the session on screen is remembered across a reload. */
+  #memory?: SessionMemory;
 
-  constructor(initial: Thread, events: SessionEvents) {
+  constructor(initial: Thread, events: SessionEvents, memory?: SessionMemory) {
     this.#thread = initial;
     this.#events = events;
+    this.#memory = memory;
   }
 
   /** The current thread. */
@@ -91,15 +124,39 @@ export class Session {
     return this.#thread;
   }
 
-  /** Opens the connection, handshakes, and creates a session. */
-  async connect(options: ConnectOptions): Promise<void> {
+  /** What the connected agent supports. */
+  get capabilities(): AgentCapabilities {
+    return this.#capabilities;
+  }
+
+  /** The conversation on screen. */
+  get sessionId(): string | undefined {
+    return this.#sessionId;
+  }
+
+  /**
+   * Opens the connection, handshakes, and creates a session.
+   *
+   * `openStream` exists so the tests can put a real ACP agent on the other end
+   * without a socket. The default is the only one the app uses.
+   */
+  async connect(
+    options: ConnectOptions,
+    openStream: (options: ConnectOptions) => acp.Stream = (o) =>
+      createWebSocketStream(websocketUrl(o)),
+  ): Promise<void> {
     this.#events.status({ state: "connecting" });
 
-    const stream = createWebSocketStream(websocketUrl(options));
+    const stream = openStream(options);
     const app = acp
       .client({ name: "mjx-acp-viewer" })
       .onNotification(acp.methods.client.session.update, (ctx) => {
         this.#record(ctx.params, acp.methods.client.session.update);
+        // One connection can have more than one session on it — a fork leaves
+        // the original running, and an agent may keep talking about a session
+        // this tab has moved on from. Folding those into the thread on screen
+        // would put one conversation's messages in another.
+        if (ctx.params.sessionId !== this.#sessionId) return;
         this.#update((thread) => applyUpdate(thread, ctx.params));
       })
       .onRequest(acp.methods.client.session.requestPermission, (ctx) =>
@@ -166,34 +223,34 @@ export class Session {
         clientInfo: { name: "mjx-acp-viewer", version: "0.1.0" },
       });
 
+      // Which session methods the UI may offer. Read here rather than thrown
+      // away, because it varies enormously between agents and a client that
+      // guesses calls methods the agent never claimed.
+      this.#capabilities = agentCapabilitiesOf(initialized);
+      this.#events.capabilities(this.#capabilities);
+
+      // Read before anything writes it: `#setSessionId` below records the
+      // session this connection came back with, which would overwrite the one
+      // the tab was actually looking at.
+      const remembered = this.#memory?.get();
+
       const session = await connection.agent.request(acp.methods.agent.session.new, {
         cwd: options.cwd ?? "",
         mcpServers: [],
       });
 
-      this.#sessionId = session.sessionId;
-      if (session.configOptions) {
-        const configOptions = session.configOptions as SessionConfigOption[];
-        this.#update((thread) => ({ ...thread, configOptions }));
-      }
-      if (session.modes) {
-        this.#update((thread) => ({
-          ...thread,
-          modes: {
-            currentModeId: session.modes!.currentModeId,
-            availableModes: session.modes!.availableModes,
-          },
-        }));
-      }
+      this.#setSessionId(session.sessionId);
+      this.#applySessionState(session);
 
       // On a resumed connection neither of those requests reached the agent:
       // the server answered both from what the agent said the first time, so
       // this is the same session it was already running. What it has been doing
       // since is in the thread the server folded.
-      if (this.#resumed) await this.#replay(connection.agent, session.sessionId);
+      if (this.#resumed) {
+        await this.#resumeThread(connection.agent, session.sessionId, remembered);
+      }
 
-      void initialized;
-      this.#events.status({ state: "ready", sessionId: session.sessionId });
+      this.#events.status({ state: "ready", sessionId: this.#sessionId ?? session.sessionId });
     } catch (error) {
       this.#events.status({ state: "failed", message: describe(error) });
       throw error;
@@ -211,11 +268,12 @@ export class Session {
    * so an empty timeline is a worse page rather than a broken one, and saying
    * so beats refusing to connect.
    */
-  async #replay(agent: acp.ClientContext, sessionId: string): Promise<void> {
+  async #replay(agent: acp.ClientContext, sessionId: string): Promise<boolean> {
     try {
       const replayed: unknown = await agent.request(ext.sessionReplay, { sessionId });
       const thread = threadFromReplay(replayed);
       if (thread) this.#update(() => thread);
+      return thread !== null;
     } catch (error) {
       this.#events.frame({
         direction: "agentToClient",
@@ -223,6 +281,207 @@ export class Session {
         intercepted: true,
         line: `could not replay the thread: ${describe(error)}`,
       });
+      return false;
+    }
+  }
+
+  /**
+   * Takes back the conversation this tab was looking at before the reload.
+   *
+   * Usually that is the session the connection started with, and `recorded` —
+   * the id the relay answered `session/new` with from its recording — is it.
+   * But once a session has been opened from the history they are different
+   * conversations, and the relay has no way to know which one was on screen: it
+   * answers the handshake the same either way. So the tab remembers, and what
+   * it remembers is tried first.
+   *
+   * A remembered session the server has no thread for is one that has been
+   * deleted, or belongs to a connection that has since been reaped. Falling
+   * back to the recorded one is better than an empty page with a composer
+   * pointed at a session that is gone.
+   */
+  async #resumeThread(
+    agent: acp.ClientContext,
+    recorded: string,
+    remembered: string | undefined,
+  ): Promise<void> {
+    if (remembered && remembered !== recorded) {
+      this.#setSessionId(remembered);
+      if (await this.#replay(agent, remembered)) return;
+
+      this.#memory?.clear();
+      this.#setSessionId(recorded);
+    }
+    await this.#replay(agent, recorded);
+  }
+
+  /** Lists the conversations the agent knows about. */
+  async listSessions(cursor?: string): Promise<{ sessions: SessionInfo[]; nextCursor?: string }> {
+    if (!this.#agent) return { sessions: [] };
+    const response = await this.#agent.request(acp.methods.agent.session.list, {
+      ...(cursor ? { cursor } : {}),
+    });
+    return {
+      sessions: (response.sessions ?? []) as SessionInfo[],
+      ...(response.nextCursor ? { nextCursor: response.nextCursor } : {}),
+    };
+  }
+
+  /**
+   * Opens a past conversation, replacing the one on screen.
+   *
+   * `session/load` streams the whole history back as `session/update`
+   * notifications, and those arrive *during* this call — the response is not
+   * the start of the replay, it is the end of it. So the thread is emptied and
+   * the session switched *before* the request goes out; anything else would
+   * fold the first few updates into the conversation being replaced, or drop
+   * them for naming a session this client had not moved to yet.
+   *
+   * A load that fails costs nothing: the thread it replaced comes back.
+   */
+  async loadSession(sessionId: string, cwd: string): Promise<void> {
+    if (!this.#agent) return;
+    const previous = { thread: this.#thread, sessionId: this.#sessionId };
+
+    this.#setSessionId(sessionId);
+    this.#update(() => emptyThread());
+    this.#events.replaying(sessionId);
+    try {
+      const loaded = await this.#agent.request(acp.methods.agent.session.load, {
+        sessionId,
+        cwd,
+        mcpServers: [],
+      });
+      this.#applySessionState(loaded);
+    } catch (error) {
+      this.#update(() => previous.thread);
+      if (previous.sessionId) this.#setSessionId(previous.sessionId);
+      throw error;
+    } finally {
+      this.#events.replaying(undefined);
+    }
+  }
+
+  /**
+   * Reactivates a session without replaying it.
+   *
+   * The difference from a load, and the only reason both exist: the agent picks
+   * the conversation back up, but says nothing about what is in it. So the
+   * thread comes from the server's fold — which is the same thing a reload
+   * does — rather than from the agent.
+   */
+  async resumeSession(sessionId: string, cwd: string): Promise<void> {
+    if (!this.#agent) return;
+    const resumed = await this.#agent.request(acp.methods.agent.session.resume, {
+      sessionId,
+      cwd,
+    });
+    this.#setSessionId(sessionId);
+    this.#update(() => emptyThread());
+    this.#applySessionState(resumed);
+    await this.#replay(this.#agent, sessionId);
+  }
+
+  /**
+   * Branches a conversation, and moves to the branch.
+   *
+   * The fork carries the context of the session it came from, but not its
+   * history as updates — the agent replays nothing — so the thread starts
+   * empty. The original is untouched and still in the list.
+   */
+  async forkSession(sessionId: string, cwd: string): Promise<string | undefined> {
+    if (!this.#agent) return undefined;
+    const forked = await this.#agent.request(acp.methods.agent.session.fork, {
+      sessionId,
+      cwd,
+    });
+    this.#setSessionId(forked.sessionId);
+    this.#update(() => emptyThread());
+    this.#applySessionState(forked);
+    return forked.sessionId;
+  }
+
+  /** Removes a conversation from the agent for good. */
+  async deleteSession(sessionId: string, cwd: string): Promise<void> {
+    if (!this.#agent) return;
+    await this.#agent.request(acp.methods.agent.session.delete, { sessionId });
+    await this.#leaveIfCurrent(sessionId, cwd);
+  }
+
+  /** Frees a conversation's resources, leaving it in the list. */
+  async closeSession(sessionId: string, cwd: string): Promise<void> {
+    if (!this.#agent) return;
+    await this.#agent.request(acp.methods.agent.session.close, { sessionId });
+    await this.#leaveIfCurrent(sessionId, cwd);
+  }
+
+  /**
+   * Starts a fresh conversation on the connection we already have.
+   *
+   * The relay answers the *first* `session/new` of an attachment from its
+   * recording; this is a later one, so it reaches the agent and really is new.
+   */
+  async newSession(cwd: string): Promise<string | undefined> {
+    if (!this.#agent) return undefined;
+    const session = await this.#agent.request(acp.methods.agent.session.new, {
+      cwd,
+      mcpServers: [],
+    });
+    this.#setSessionId(session.sessionId);
+    this.#update(() => emptyThread());
+    this.#applySessionState(session);
+    return session.sessionId;
+  }
+
+  /**
+   * Moves off a session the agent has just deleted or closed.
+   *
+   * Leaving the composer pointed at one would send a prompt to a session that
+   * no longer accepts them, and the failure would arrive with no explanation.
+   */
+  async #leaveIfCurrent(sessionId: string, cwd: string): Promise<void> {
+    if (this.#sessionId !== sessionId) return;
+    this.#memory?.clear();
+    await this.newSession(cwd);
+  }
+
+  /**
+   * Records which conversation is on screen, here and across a reload.
+   *
+   * The memory is written every time, even when the id has not changed: an
+   * agent may hand back the same session — reopening the one already on screen
+   * — and that must still leave it remembered.
+   */
+  #setSessionId(sessionId: string): void {
+    const changed = this.#sessionId !== sessionId;
+    this.#sessionId = sessionId;
+    this.#memory?.set(sessionId);
+    if (changed) this.#events.sessionChanged(sessionId);
+  }
+
+  /**
+   * Folds in the modes and config options a session answered with.
+   *
+   * `session/new`, `session/load`, `session/resume` and `session/fork` all
+   * carry the same two, which is why this is not written out four times.
+   */
+  #applySessionState(response: {
+    modes?: { currentModeId: string; availableModes: SessionMode[] } | null;
+    configOptions?: unknown[] | null;
+  }): void {
+    if (response.configOptions) {
+      const configOptions = response.configOptions as SessionConfigOption[];
+      this.#update((thread) => ({ ...thread, configOptions }));
+    }
+    if (response.modes) {
+      const modes = response.modes;
+      this.#update((thread) => ({
+        ...thread,
+        modes: {
+          currentModeId: modes.currentModeId,
+          availableModes: modes.availableModes,
+        },
+      }));
     }
   }
 

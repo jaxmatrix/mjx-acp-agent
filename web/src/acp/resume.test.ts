@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { choiceStore, resumeStore } from "./resume";
+import { choiceStore, resumeStore, sessionStore } from "./resume";
 
 /** Enough of `Storage` to stand in for one, since there is no DOM here. */
 function fakeStorage(): Storage {
@@ -82,5 +82,27 @@ describe("the remembered choice", () => {
 
     storage.setItem("mjx.connection", JSON.stringify({ agentId: 7 }));
     expect(choiceStore(storage).get()).toBeUndefined();
+  });
+});
+
+describe("the remembered session", () => {
+  test("is the conversation on screen, not the one the connection started", () => {
+    // They come apart as soon as one is opened from the history: the relay
+    // still answers a repeat `session/new` with the connection's original
+    // session, so this is the only record of which one is being looked at.
+    const store = sessionStore(fakeStorage());
+    store.set("mock", "/w", "s2");
+    expect(store.get("mock", "/w")).toBe("s2");
+    store.clear("mock", "/w");
+    expect(store.get("mock", "/w")).toBeUndefined();
+  });
+
+  test("is kept apart from the connection id", () => {
+    const storage = fakeStorage();
+    resumeStore(storage).set("mock", "/w", "c1");
+    sessionStore(storage).set("mock", "/w", "s2");
+
+    expect(resumeStore(storage).get("mock", "/w")).toBe("c1");
+    expect(sessionStore(storage).get("mock", "/w")).toBe("s2");
   });
 });
