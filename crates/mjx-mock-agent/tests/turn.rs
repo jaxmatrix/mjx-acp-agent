@@ -63,6 +63,9 @@ struct Driver {
     answers: HashMap<String, Value>,
     /// If set, sent as a `session/cancel` the first time an update arrives.
     cancel_on_first_update: Option<String>,
+    /// If set, the named request is left unanswered and a `session/cancel` for
+    /// this session is sent instead — a user walking away from a question.
+    cancel_when_asked: Option<(String, String)>,
 }
 
 impl Driver {
@@ -89,6 +92,7 @@ impl Driver {
             transcript: Transcript::default(),
             answers: HashMap::new(),
             cancel_on_first_update: None,
+            cancel_when_asked: None,
         }
     }
 
@@ -195,6 +199,24 @@ impl Driver {
                     .entry(method.clone())
                     .or_default()
                     .push(asked);
+
+                // The user walking away from a question: nothing is answered,
+                // and the turn is cancelled instead.
+                if self
+                    .cancel_when_asked
+                    .as_ref()
+                    .is_some_and(|(asked, _)| *asked == method)
+                {
+                    let (_, session_id) = self.cancel_when_asked.take().expect("just matched");
+                    let cancel = Frame::notification(
+                        method::agent::SESSION_CANCEL,
+                        &json!({ "sessionId": session_id }),
+                    )
+                    .unwrap();
+                    self.send(&cancel).await;
+                    return;
+                }
+
                 let result = self.answers.get(&method).cloned().unwrap_or_else(|| {
                     panic!("agent called {method}, which the driver has no answer for")
                 });
@@ -560,6 +582,42 @@ async fn a_client_that_can_be_elicited_is_asked_in_both_modes() {
     // What the user filled in is read, not ignored.
     let text = driver.transcript.assistant_text();
     assert!(text.contains("upstream/fix/median"), "{text:?}");
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_while_a_form_is_open_gives_up_on_it() {
+    // Without this the turn would sit on the question forever, and
+    // `session/cancel` would only take effect once somebody answered a form
+    // they had already walked away from.
+    let mut driver = driver_answering_everything();
+    let session_id = connect_declaring(&mut driver, elicitable()).await;
+    driver.cancel_when_asked = Some((
+        method::client::ELICITATION_CREATE.to_string(),
+        session_id.clone(),
+    ));
+
+    let response = driver
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+
+    assert_eq!(response["stopReason"], "cancelled");
+    // It stopped at the form rather than carrying on to the URL exchange.
+    assert_eq!(
+        driver
+            .transcript
+            .request_params
+            .get(method::client::ELICITATION_CREATE)
+            .map(Vec::len),
+        Some(1)
+    );
 
     driver.shutdown().await;
 }

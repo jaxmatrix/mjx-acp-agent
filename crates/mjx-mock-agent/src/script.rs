@@ -342,7 +342,8 @@ async fn ask_how_to_record(agent: &Agent, session_id: &str) {
 
     beat(300).await;
     let reply = agent
-        .request(
+        .request_until_cancelled(
+            session_id,
             method::client::ELICITATION_CREATE,
             json!({
                 "mode": "form",
@@ -355,6 +356,10 @@ async fn ask_how_to_record(agent: &Agent, session_id: &str) {
             }),
         )
         .await;
+
+    // Cancelled with the form still open. Say nothing further: the turn is over
+    // and the caller reports it as cancelled.
+    let Some(reply) = reply else { return };
 
     let answered = reply
         .ok()

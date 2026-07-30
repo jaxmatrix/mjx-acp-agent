@@ -87,6 +87,22 @@ impl SessionStore {
         self.threads.is_empty()
     }
 
+    /// Gives up on every question a session is still waiting on an answer to.
+    ///
+    /// Called when a turn ends: whatever it asked and never got an answer to
+    /// will not be answered now, and a replayed thread showing a live form for
+    /// a finished turn would invite an answer with nowhere to go.
+    ///
+    /// Returns how many were still pending.
+    pub fn cancel_pending_elicitations(&mut self, session_id: &str) -> usize {
+        self.pending_elicitations
+            .retain(|_, pending| pending != session_id);
+        self.threads
+            .get_mut(session_id)
+            .map(Thread::cancel_pending_elicitations)
+            .unwrap_or(0)
+    }
+
     /// Folds in a frame on its way from the browser to the agent.
     pub fn observe_from_client(&mut self, frame: &Frame) {
         match frame {
@@ -647,6 +663,34 @@ mod tests {
         ));
 
         assert!(store.pending_elicitations.is_empty());
+    }
+
+    #[test]
+    fn a_finished_turn_gives_up_on_what_it_asked() {
+        let mut store = started();
+        store.observe_from_agent(&ask(serde_json::json!({ "sessionId": "s1" })));
+
+        assert_eq!(store.cancel_pending_elicitations("s1"), 1);
+        assert_eq!(
+            only_elicitation(&store).state,
+            mjx_acp_thread::ElicitationState::Cancelled
+        );
+        assert!(store.pending_elicitations.is_empty());
+    }
+
+    #[test]
+    fn giving_up_does_not_undo_an_answer_already_given() {
+        let mut store = started();
+        store.observe_from_agent(&ask(serde_json::json!({ "sessionId": "s1" })));
+        store.observe_from_client(
+            &Frame::result(RequestId::Number(20), &json!({ "action": "decline" })).unwrap(),
+        );
+
+        assert_eq!(store.cancel_pending_elicitations("s1"), 0);
+        assert_eq!(
+            only_elicitation(&store).state,
+            mjx_acp_thread::ElicitationState::Declined
+        );
     }
 
     #[test]

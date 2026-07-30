@@ -104,6 +104,38 @@ impl Agent {
             .unwrap_or_else(|_| Err(JsonRpcError::internal("connection closed")))
     }
 
+    /// Calls a client method, giving up if the turn is cancelled first.
+    ///
+    /// `None` means it gave up. A real agent stops waiting on a question the
+    /// user has walked away from; without this a `session/cancel` would have no
+    /// effect until somebody answered a form nobody cares about any more.
+    ///
+    /// The abandoned entry stays in `pending` until the process exits. That is a
+    /// leak, and a deliberate one: this is a fixture with a lifetime measured in
+    /// seconds, and reaping it would need the request future to own its own
+    /// cleanup for no benefit anyone can observe.
+    pub async fn request_until_cancelled(
+        &self,
+        session_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Option<Reply> {
+        tokio::select! {
+            reply = self.request(method, params) => Some(reply),
+            () = self.until_cancelled(session_id) => None,
+        }
+    }
+
+    /// Resolves once this session's turn has been cancelled.
+    ///
+    /// Polled rather than signalled: cancellation is already an `AtomicBool` the
+    /// script checks between steps, and one waiter does not earn a channel.
+    async fn until_cancelled(&self, session_id: &str) {
+        while !self.is_cancelled(session_id).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Whether the client can render a form we ask it to.
     pub fn can_elicit_form(&self) -> bool {
         self.elicitation_form.load(Ordering::Relaxed)

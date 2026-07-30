@@ -646,6 +646,14 @@ impl<I: Interceptor> Relay<I> {
             }
         }
 
+        // A turn that has ended will never answer what it asked. Left on the
+        // list, those questions would be put to every browser that ever
+        // attaches; a permission prompt is hidden by its tool call settling, but
+        // an elicitation need not have a tool call, so nothing would hide it.
+        if let Some(session_id) = &ends_turn {
+            self.forget_questions(session_id).await;
+        }
+
         // The browser has answered something the agent asked, so stop offering
         // it to the next browser.
         if direction == Direction::ClientToAgent
@@ -742,6 +750,34 @@ impl<I: Interceptor> Relay<I> {
         // then replace that thread wholesale and wipe it.
         if method == ext::SESSION_REPLAY {
             self.reask_unanswered().await;
+        }
+    }
+
+    /// Drops the questions a finished turn asked and never had answered.
+    ///
+    /// Two halves, because the two places a pending question lives both have to
+    /// let go of it: the re-ask list, so the next browser is not asked; and the
+    /// thread, so a replay does not show a live form for a turn that is over.
+    async fn forget_questions(&self, session_id: &str) {
+        let dropped = {
+            let mut unanswered = self.unanswered.lock().await;
+            let before = unanswered.len();
+            unanswered.retain(|asked| session_of(asked).as_deref() != Some(session_id));
+            before - unanswered.len()
+        };
+        let cancelled = self
+            .sessions
+            .lock()
+            .await
+            .cancel_pending_elicitations(session_id);
+
+        if dropped > 0 || cancelled > 0 {
+            tracing::debug!(
+                session_id,
+                dropped,
+                cancelled,
+                "the turn ended with questions outstanding"
+            );
         }
     }
 
@@ -874,6 +910,17 @@ fn stop_reason_of(payload: &ResponsePayload) -> String {
         .ok()
         .and_then(|value| value.get("stopReason")?.as_str().map(str::to_owned))
         .unwrap_or_else(|| "cancelled".into())
+}
+
+/// The session a frame's params name, if they name one.
+///
+/// Read from the JSON rather than from a typed request, because this has to work
+/// for every method a turn can ask about — including ones we do not model.
+/// A frame that names no session belongs to no turn, which is the honest answer
+/// for a request-scoped elicitation.
+fn session_of(frame: &Frame) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(frame.params()?.get()).ok()?;
+    value.get("sessionId")?.as_str().map(str::to_owned)
 }
 
 /// Whether a replayed thread already brings this question back.
@@ -1051,6 +1098,39 @@ mod tests {
             "url": "https://example.test/",
             "message": "authorize"
         }))));
+    }
+
+    #[test]
+    fn a_question_is_matched_to_its_turn_by_the_session_it_names() {
+        let permission = Frame::Request {
+            id: mjx_acp_core::RequestId::Number(3),
+            method: method::client::SESSION_REQUEST_PERMISSION.into(),
+            params: Some(
+                serde_json::value::to_raw_value(&json!({ "sessionId": "s1", "options": [] }))
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(session_of(&permission).as_deref(), Some("s1"));
+
+        // A request-scoped elicitation belongs to no turn, so no turn ending
+        // should drop it.
+        assert!(
+            session_of(&elicitation(json!({
+                "mode": "url",
+                "requestId": 4,
+                "elicitationId": "el-1",
+                "url": "https://example.test/",
+                "message": "authorize"
+            })))
+            .is_none()
+        );
+
+        let no_params = Frame::Request {
+            id: mjx_acp_core::RequestId::Number(5),
+            method: method::client::SESSION_REQUEST_PERMISSION.into(),
+            params: None,
+        };
+        assert!(session_of(&no_params).is_none());
     }
 
     #[test]
