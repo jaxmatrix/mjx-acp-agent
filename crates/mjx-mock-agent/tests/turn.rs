@@ -664,3 +664,200 @@ impl Driver {
         }
     }
 }
+
+/// The sessions the agent lists, newest first.
+async fn list_sessions(driver: &mut Driver, params: Value) -> Vec<Value> {
+    let listed = driver.request(method::agent::SESSION_LIST, params).await;
+    serde_json::from_value::<acp::ListSessionsResponse>(listed.clone())
+        .unwrap_or_else(|e| panic!("invalid ListSessionsResponse: {e}\n{listed:#}"));
+    listed["sessions"].as_array().cloned().unwrap_or_default()
+}
+
+/// The one listed session with this id, if it is still listed.
+fn listed<'a>(sessions: &'a [Value], session_id: &str) -> Option<&'a Value> {
+    sessions.iter().find(|s| s["sessionId"] == session_id)
+}
+
+#[tokio::test]
+async fn the_agent_offers_the_session_lifecycle_it_implements() {
+    // A client renders what the agent advertises and nothing else, so what is
+    // claimed here has to match what the handlers below actually answer.
+    let mut driver = Driver::spawn("0");
+    let init = driver
+        .request(
+            method::agent::INITIALIZE,
+            json!({ "protocolVersion": mjx_acp_core::PROTOCOL_VERSION, "clientCapabilities": {} }),
+        )
+        .await;
+
+    let capabilities = &init["agentCapabilities"];
+    assert_eq!(capabilities["loadSession"], true);
+    for offered in ["list", "delete", "fork", "resume", "close"] {
+        assert!(
+            capabilities["sessionCapabilities"][offered].is_object(),
+            "{offered} must be advertised as an object, not {:?}",
+            capabilities["sessionCapabilities"][offered]
+        );
+    }
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_conversation_from_before_this_run_is_listed_and_titled() {
+    // The seeded session is what makes the history worth opening the first time
+    // the demo is run: without it the list holds only what you just started.
+    let mut driver = Driver::spawn("0");
+    let session_id = connect(&mut driver).await;
+
+    let sessions = list_sessions(&mut driver, json!({})).await;
+    let seeded = sessions
+        .iter()
+        .find(|s| s["sessionId"] != session_id)
+        .expect("a session from before this run");
+    serde_json::from_value::<acp::SessionInfo>(seeded.clone()).expect("valid SessionInfo");
+
+    assert!(seeded["title"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(seeded["updatedAt"].as_str().is_some());
+    // Newest first, and the one just created is the newest.
+    assert_eq!(sessions[0]["sessionId"], session_id);
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_loaded_session_replays_its_history_before_it_answers() {
+    // The ordering the client has to survive: `session/load` streams the whole
+    // conversation back as notifications, and they arrive *during* the call.
+    let mut driver = Driver::spawn("0");
+    let session_id = connect(&mut driver).await;
+    let sessions = list_sessions(&mut driver, json!({})).await;
+    let seeded = sessions
+        .iter()
+        .find(|s| s["sessionId"] != session_id)
+        .expect("a session from before this run")["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let before = driver.transcript.updates.len();
+    let loaded = driver
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": seeded, "cwd": env!("CARGO_MANIFEST_DIR"), "mcpServers": [] }),
+        )
+        .await;
+    serde_json::from_value::<acp::LoadSessionResponse>(loaded.clone())
+        .unwrap_or_else(|e| panic!("invalid LoadSessionResponse: {e}\n{loaded:#}"));
+
+    let replayed = driver.transcript.updates[before..].to_vec();
+    assert!(
+        !replayed.is_empty(),
+        "a load that replays nothing is a load that lost the conversation"
+    );
+    assert_eq!(replayed[0]["sessionUpdate"], "user_message_chunk");
+    assert!(loaded["configOptions"].is_array());
+
+    // And again: a second load replays the same history, not twice as much.
+    let before = driver.transcript.updates.len();
+    driver
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": seeded, "cwd": env!("CARGO_MANIFEST_DIR"), "mcpServers": [] }),
+        )
+        .await;
+    assert_eq!(driver.transcript.updates.len() - before, replayed.len());
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resumed_session_answers_without_replaying() {
+    // The difference from `session/load`, and the only reason both exist.
+    let mut driver = Driver::spawn("0");
+    let session_id = connect(&mut driver).await;
+
+    let before = driver.transcript.updates.len();
+    let resumed = driver
+        .request(
+            method::agent::SESSION_RESUME,
+            json!({ "sessionId": session_id, "cwd": env!("CARGO_MANIFEST_DIR") }),
+        )
+        .await;
+
+    assert_eq!(driver.transcript.updates.len(), before, "a resume replayed");
+    assert!(resumed["configOptions"].is_array());
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_fork_is_a_second_session_carrying_the_first_ones_history() {
+    let mut driver = Driver::spawn("0");
+    let session_id = connect(&mut driver).await;
+
+    let forked = driver
+        .request(
+            method::agent::SESSION_FORK,
+            json!({ "sessionId": session_id, "cwd": env!("CARGO_MANIFEST_DIR") }),
+        )
+        .await;
+    serde_json::from_value::<acp::ForkSessionResponse>(forked.clone())
+        .unwrap_or_else(|e| panic!("invalid ForkSessionResponse: {e}\n{forked:#}"));
+
+    let fork_id = forked["sessionId"].as_str().expect("a forked session id");
+    assert_ne!(fork_id, session_id, "a fork is a new session, not the old one");
+
+    let sessions = list_sessions(&mut driver, json!({})).await;
+    assert!(listed(&sessions, fork_id).is_some(), "the fork is not listed");
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn deleting_forgets_a_session_and_closing_only_frees_it() {
+    // The protocol keeps these apart: `session/close` frees the resources a
+    // session is holding, `session/delete` is what removes it from the list.
+    let mut driver = Driver::spawn("0");
+    let session_id = connect(&mut driver).await;
+    let doomed = driver
+        .request(
+            method::agent::SESSION_FORK,
+            json!({ "sessionId": session_id, "cwd": env!("CARGO_MANIFEST_DIR") }),
+        )
+        .await["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    driver
+        .request(method::agent::SESSION_CLOSE, json!({ "sessionId": session_id }))
+        .await;
+    let sessions = list_sessions(&mut driver, json!({})).await;
+    assert!(
+        listed(&sessions, &session_id).is_some(),
+        "a closed session is still a session that happened"
+    );
+
+    driver
+        .request(method::agent::SESSION_DELETE, json!({ "sessionId": &doomed }))
+        .await;
+    let sessions = list_sessions(&mut driver, json!({})).await;
+    assert!(listed(&sessions, &doomed).is_none(), "a deleted session is still listed");
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn sessions_can_be_listed_by_the_directory_they_belong_to() {
+    let mut driver = Driver::spawn("0");
+    let session_id = connect(&mut driver).await;
+
+    let mine = list_sessions(&mut driver, json!({ "cwd": env!("CARGO_MANIFEST_DIR") })).await;
+    assert!(listed(&mine, &session_id).is_some());
+
+    let elsewhere = list_sessions(&mut driver, json!({ "cwd": "/nowhere/in/particular" })).await;
+    assert!(elsewhere.is_empty(), "{elsewhere:#?}");
+
+    driver.shutdown().await;
+}
