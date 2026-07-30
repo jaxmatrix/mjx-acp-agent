@@ -1003,8 +1003,15 @@ button {
   cursor: pointer;
 }
 
-.composer__suggestions button:hover {
+.composer__suggestions button:hover,
+.composer__suggestions button.is-active {
   background: var(--panel-2);
+}
+
+.composer__hint {
+  margin: 0 0 0.4rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.85em;
 }
 
 .button {
