@@ -15,11 +15,19 @@
 //! that started one without the output it produced. Nor does it hold a
 //! permission prompt — that is a request in flight, and the relay re-asks it
 //! after the replay instead.
+//!
+//! **The one exception is an elicitation**, which is here despite also being a
+//! request in flight. A form the user is halfway through is worth carrying
+//! across a reload rather than being thrown away and asked again, and a
+//! permission prompt can be re-asked cheaply because its tool call's status
+//! hides a stale one — an elicitation need not belong to any tool call, so
+//! nothing would. Because this holds it, the relay must *not* also re-ask it;
+//! see `relay::Relay::unanswered`.
 
 use std::collections::HashMap;
 
-use mjx_acp_core::{Frame, RequestId, acp, method};
-use mjx_acp_thread::Thread;
+use mjx_acp_core::{Frame, RequestId, ResponsePayload, acp, method};
+use mjx_acp_thread::{ElicitationState, Thread};
 
 /// Every session on one connection.
 #[derive(Debug, Default)]
@@ -39,6 +47,13 @@ pub struct SessionStore {
     /// session started (see `relay::Handshake`), so the thread here is the only
     /// place the current value can come from.
     pending_config_options: HashMap<RequestId, String>,
+    /// `elicitation/create` requests in flight, so the browser's answer can be
+    /// attributed to the question it settles.
+    ///
+    /// Keyed by the *agent's* request id, which is what reaches the browser: an
+    /// agent-originated request is not rebound by the id bridge, so the answer
+    /// comes back carrying the same id.
+    pending_elicitations: HashMap<RequestId, String>,
 }
 
 impl SessionStore {
@@ -74,11 +89,19 @@ impl SessionStore {
 
     /// Folds in a frame on its way from the browser to the agent.
     pub fn observe_from_client(&mut self, frame: &Frame) {
-        let Frame::Request { id, method, .. } = frame else {
-            return;
-        };
+        match frame {
+            Frame::Request { id, method, .. } => self.observe_client_request(frame, id, method),
+            // The one response the browser sends that is thread state: the
+            // answer to an elicitation. Everything else it replies to — `fs/*`,
+            // `terminal/*` — never reaches here, because the server answers
+            // those itself.
+            Frame::Response { id, payload } => self.observe_elicitation_answer(id, payload),
+            Frame::Notification { .. } => {}
+        }
+    }
 
-        match method.as_str() {
+    fn observe_client_request(&mut self, frame: &Frame, id: &RequestId, method: &str) {
+        match method {
             method::agent::SESSION_NEW => self.pending_new_sessions.push(id.clone()),
             method::agent::SESSION_SET_CONFIG_OPTION => {
                 if let Ok(Some(request)) = frame.params_as::<acp::SetSessionConfigOptionRequest>() {
@@ -103,9 +126,76 @@ impl SessionStore {
         }
     }
 
+    /// Settles the elicitation a browser's response answers.
+    fn observe_elicitation_answer(&mut self, id: &RequestId, payload: &ResponsePayload) {
+        let Some(session_id) = self.pending_elicitations.remove(id) else {
+            return;
+        };
+        let Some(thread) = self.threads.get_mut(&session_id) else {
+            return;
+        };
+
+        let (state, content) = match payload {
+            ResponsePayload::Result(result) => {
+                match serde_json::from_str::<acp::CreateElicitationResponse>(result.get()) {
+                    Ok(response) => read_action(response.action),
+                    // A well-formed response we cannot read is not the user
+                    // saying yes or no, so it is neither accepted nor declined.
+                    Err(_) => (ElicitationState::Cancelled, None),
+                }
+            }
+            // The browser refused the request outright — an unrenderable mode,
+            // or a client that has no handler for one at all.
+            ResponsePayload::Error(_) => (ElicitationState::Declined, None),
+        };
+
+        thread.settle_elicitation(id, state, content);
+    }
+
     /// Folds in a frame on its way from the agent to the browser.
     pub fn observe_from_agent(&mut self, frame: &Frame) {
         match frame {
+            Frame::Request { id, method, .. } if method == method::client::ELICITATION_CREATE => {
+                let Ok(Some(request)) = frame.params_as::<acp::CreateElicitationRequest>() else {
+                    return;
+                };
+                let session_id = match request.scope() {
+                    acp::ElicitationScope::Session(scope) => scope.session_id.0.to_string(),
+                    // Request-scoped: tied to a JSON-RPC request rather than to
+                    // a session, which is how an agent asks something before any
+                    // session exists. There is no thread to put it in, so the
+                    // relay's re-ask path carries it instead.
+                    _ => return,
+                };
+
+                if self
+                    .threads
+                    .entry(session_id.clone())
+                    .or_default()
+                    .push_elicitation(id.clone(), &request)
+                {
+                    self.pending_elicitations.insert(id.clone(), session_id);
+                }
+            }
+
+            Frame::Notification { method, .. }
+                if method == method::client::ELICITATION_COMPLETE =>
+            {
+                let Ok(Some(notification)) =
+                    frame.params_as::<acp::CompleteElicitationNotification>()
+                else {
+                    return;
+                };
+                // The notification names the elicitation, not the session, so
+                // the thread holding it has to be looked for. The id is the
+                // agent's own and unique across the sessions it is running.
+                for thread in self.threads.values_mut() {
+                    if thread.complete_elicitation(&notification.elicitation_id.0) {
+                        break;
+                    }
+                }
+            }
+
             Frame::Notification { method, .. } if method == method::client::SESSION_UPDATE => {
                 let Ok(Some(notification)) = frame.params_as::<acp::SessionNotification>() else {
                     return;
@@ -168,6 +258,22 @@ impl SessionStore {
 
             _ => {}
         }
+    }
+}
+
+/// Reads what the user did into the state the thread records.
+type Settled = (
+    ElicitationState,
+    Option<std::collections::BTreeMap<String, acp::ElicitationContentValue>>,
+);
+
+fn read_action(action: acp::ElicitationAction) -> Settled {
+    match action {
+        acp::ElicitationAction::Accept(accepted) => (ElicitationState::Accepted, accepted.content),
+        acp::ElicitationAction::Decline => (ElicitationState::Declined, None),
+        // Cancelled, or an action from a future protocol version we cannot
+        // read. Either way we cannot claim the user accepted or refused.
+        _ => (ElicitationState::Cancelled, None),
     }
 }
 
@@ -397,6 +503,162 @@ mod tests {
             ThreadStatus::Generating,
             "the wrong session's turn was ended"
         );
+    }
+
+    /// The elicitation the tests below ask, as an agent would write it.
+    fn ask(scope: serde_json::Value) -> Frame {
+        let mut params = serde_json::json!({
+            "mode": "form",
+            "message": "Which branch?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "branch": { "type": "string" } }
+            }
+        });
+        let serde_json::Value::Object(scope) = scope else {
+            panic!("a scope is an object");
+        };
+        for (key, value) in scope {
+            params[key] = value;
+        }
+        request(20, method::client::ELICITATION_CREATE, params)
+    }
+
+    fn only_elicitation(store: &SessionStore) -> &mjx_acp_thread::Elicitation {
+        store
+            .thread("s1")
+            .expect("no thread")
+            .entries
+            .iter()
+            .filter_map(mjx_acp_thread::Entry::as_elicitation)
+            .next()
+            .expect("no elicitation entry")
+    }
+
+    #[test]
+    fn an_elicitation_becomes_part_of_the_thread() {
+        // The point of holding it here: this is what a reloaded browser is
+        // given back, so a form it was halfway through comes back with it.
+        let mut store = started();
+        store.observe_from_agent(&ask(serde_json::json!({ "sessionId": "s1" })));
+
+        assert_eq!(only_elicitation(&store).message, "Which branch?");
+        assert_eq!(
+            only_elicitation(&store).state,
+            mjx_acp_thread::ElicitationState::Pending
+        );
+    }
+
+    #[test]
+    fn the_browsers_answer_settles_it() {
+        let mut store = started();
+        store.observe_from_agent(&ask(serde_json::json!({ "sessionId": "s1" })));
+        store.observe_from_client(
+            &Frame::result(
+                RequestId::Number(20),
+                &json!({ "action": "accept", "content": { "branch": "main" } }),
+            )
+            .unwrap(),
+        );
+
+        let asked = only_elicitation(&store);
+        assert_eq!(asked.state, mjx_acp_thread::ElicitationState::Accepted);
+        assert!(
+            asked
+                .content
+                .as_ref()
+                .is_some_and(|c| c.contains_key("branch"))
+        );
+        assert!(store.pending_elicitations.is_empty());
+    }
+
+    #[test]
+    fn declining_is_recorded_as_declining() {
+        // Not the same as cancelling: the user was asked and said no, which is
+        // an answer the agent is entitled to see reflected in the history.
+        let mut store = started();
+        store.observe_from_agent(&ask(serde_json::json!({ "sessionId": "s1" })));
+        store.observe_from_client(
+            &Frame::result(RequestId::Number(20), &json!({ "action": "decline" })).unwrap(),
+        );
+
+        assert_eq!(
+            only_elicitation(&store).state,
+            mjx_acp_thread::ElicitationState::Declined
+        );
+    }
+
+    #[test]
+    fn a_url_elicitation_is_finished_by_the_notification() {
+        let mut store = started();
+        store.observe_from_agent(&request(
+            20,
+            method::client::ELICITATION_CREATE,
+            json!({
+                "mode": "url",
+                "sessionId": "s1",
+                "elicitationId": "el-1",
+                "url": "https://example.test/authorize",
+                "message": "Authorize, then come back."
+            }),
+        ));
+        store.observe_from_agent(
+            &Frame::notification(
+                method::client::ELICITATION_COMPLETE,
+                &json!({ "elicitationId": "el-1" }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            only_elicitation(&store).state,
+            mjx_acp_thread::ElicitationState::Accepted
+        );
+    }
+
+    #[test]
+    fn a_request_scoped_elicitation_is_left_to_the_relay() {
+        // It is tied to a JSON-RPC request rather than a session — how an agent
+        // asks something before any session exists — so there is no thread for
+        // it and the relay's re-ask path carries it instead.
+        let mut store = started();
+        store.observe_from_agent(&ask(serde_json::json!({ "requestId": 4 })));
+
+        assert!(
+            store
+                .thread("s1")
+                .unwrap()
+                .entries
+                .iter()
+                .all(|entry| mjx_acp_thread::Entry::as_elicitation(entry).is_none())
+        );
+        assert!(store.pending_elicitations.is_empty());
+    }
+
+    #[test]
+    fn a_mode_we_cannot_render_is_not_recorded_as_pending() {
+        // The browser will decline it, and that response must not be mistaken
+        // for the answer to a question we are tracking.
+        let mut store = started();
+        store.observe_from_agent(&request(
+            20,
+            method::client::ELICITATION_CREATE,
+            json!({ "mode": "_vendor/hologram", "sessionId": "s1", "message": "step in" }),
+        ));
+
+        assert!(store.pending_elicitations.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_elicitation_does_not_panic() {
+        let mut store = started();
+        store.observe_from_agent(&request(
+            20,
+            method::client::ELICITATION_CREATE,
+            json!({ "nonsense": true }),
+        ));
+
+        assert!(store.pending_elicitations.is_empty());
     }
 
     #[test]
