@@ -94,7 +94,11 @@ function Conversation({
 
       <div className="app__body">
         <main className="app__main">
-          <ThreadView thread={session.thread} onPermission={session.answerPermission} />
+          <ThreadView
+            thread={session.thread}
+            onPermission={session.answerPermission}
+            onElicitation={session.answerElicitation}
+          />
           <Composer
             busy={busy}
             ready={session.status.state === "ready"}

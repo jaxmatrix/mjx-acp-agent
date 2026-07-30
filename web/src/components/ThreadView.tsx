@@ -4,15 +4,18 @@ import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { ElicitationPrompt } from "./ElicitationPrompt";
 import { ToolCallCard } from "./ToolCallCard";
-import { chunkText, type AssistantChunk, type Thread } from "../acp/types";
+import { chunkText, type AssistantChunk, type ElicitationAnswer, type Thread } from "../acp/types";
 
 export function ThreadView({
   thread,
   onPermission,
+  onElicitation,
 }: {
   thread: Thread;
   onPermission(toolCallId: string, optionId: string | null): void;
+  onElicitation(requestId: string | number, answer: ElicitationAnswer): void;
 }) {
   const bottom = useRef<HTMLDivElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
@@ -67,6 +70,15 @@ export function ThreadView({
                 toolCall={entry.toolCall}
                 terminals={thread.terminals}
                 onPermission={onPermission}
+              />
+            );
+
+          case "elicitation":
+            return (
+              <ElicitationPrompt
+                key={entry.id}
+                elicitation={entry.elicitation}
+                onAnswer={onElicitation}
               />
             );
 

@@ -124,6 +124,18 @@ export type ElicitationState = "pending" | "accepted" | "declined" | "cancelled"
 /** What a form field can come back as. */
 export type ElicitationValue = string | number | boolean | string[];
 
+/**
+ * What the user did with a question.
+ *
+ * The three `CreateElicitationResponse` actions. Declining and cancelling are
+ * kept apart because the protocol keeps them apart: declining is an answer,
+ * cancelling is refusing to give one.
+ */
+export type ElicitationAnswer =
+  | { action: "accept"; content?: Record<string, ElicitationValue> }
+  | { action: "decline" }
+  | { action: "cancel" };
+
 /** One item in the timeline. */
 export type Entry =
   | {

@@ -503,6 +503,141 @@ button {
   background: var(--border);
 }
 
+/* ---------------------------------------------------------- elicitation */
+
+/* A card of its own in the timeline rather than part of a tool call: an
+   elicitation need not belong to one. Bordered all round, unlike the permission
+   prompt, which sits inside the card it belongs to. */
+.elicitation {
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+  padding: 0.7rem 0.8rem;
+  margin: 0.6rem 0;
+  /* The message and the field labels are the agent's own text. */
+  overflow-wrap: anywhere;
+}
+
+.elicitation__message {
+  margin: 0;
+  font-weight: 600;
+}
+
+.elicitation__origin {
+  margin: 0.1rem 0 0;
+  font-size: 0.8rem;
+}
+
+.elicitation__form {
+  margin-top: 0.6rem;
+}
+
+.elicitation__field + .elicitation__field {
+  margin-top: 0.6rem;
+}
+
+.elicitation__field label {
+  display: block;
+  font-size: 0.8rem;
+  margin-bottom: 0.15rem;
+}
+
+.elicitation__field p {
+  margin: 0.15rem 0 0;
+  font-size: 0.8rem;
+}
+
+.elicitation__field input[type="text"],
+.elicitation__field input[type="email"],
+.elicitation__field input[type="url"],
+.elicitation__field input[type="date"],
+.elicitation__field input[type="datetime-local"],
+.elicitation__field input[type="number"],
+.elicitation__field select {
+  width: 100%;
+  padding: 0.3rem 0.4rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+}
+
+/* A toggle inside a form must not stretch the way a text box does. */
+.elicitation__field .config-option--toggle input[type="checkbox"],
+.elicitation__checkboxes input[type="checkbox"] {
+  width: auto;
+}
+
+.elicitation__checkboxes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.9rem;
+}
+
+.elicitation__actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 0.7rem;
+}
+
+.elicitation__actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.elicitation__link {
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+.elicitation__url {
+  margin-top: 0.5rem;
+}
+
+/* Answered, declined and cancelled all stay on screen — the exchange is part of
+   the conversation — so the border says which without a second glance. */
+.elicitation__settled {
+  margin-top: 0.4rem;
+  border-left: 2px solid var(--border);
+  padding-left: 0.6rem;
+}
+
+.elicitation__settled--accepted {
+  border-left-color: var(--added);
+}
+
+.elicitation__settled--declined {
+  border-left-color: var(--removed);
+}
+
+.elicitation__settled--cancelled {
+  border-left-color: var(--warn);
+}
+
+.elicitation__answers {
+  margin: 0.3rem 0 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.1rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.elicitation__answers > div {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+}
+
+.elicitation__answers dt {
+  color: var(--dim);
+}
+
+.elicitation__answers dd {
+  margin: 0;
+}
+
 /* --------------------------------------------------------------- sidebar */
 
 .sidebar,

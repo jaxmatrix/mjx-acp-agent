@@ -25,9 +25,9 @@ import {
 } from "./thread";
 import type {
   AgentInfo,
+  ElicitationAnswer,
   ElicitationMode,
   ElicitationState,
-  ElicitationValue,
   InspectorEntry,
   SessionConfigOption,
   StopReason,
@@ -522,12 +522,6 @@ export class Session {
     });
   }
 }
-
-/** What the user did with a form, in the shape the UI hands back. */
-export type ElicitationAnswer =
-  | { action: "accept"; content?: Record<string, ElicitationValue> }
-  | { action: "decline" }
-  | { action: "cancel" };
 
 /** The protocol's action, as the thread spells the state it leaves behind. */
 const SETTLED: Record<ElicitationAnswer["action"], ElicitationState> = {
