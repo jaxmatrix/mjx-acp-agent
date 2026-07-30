@@ -24,6 +24,7 @@ use serde_json::{Value, json, value::RawValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+mod mcp;
 mod script;
 
 /// Wall-clock pacing. Tests set `MJX_MOCK_SPEED=0` to run the script instantly;
@@ -323,6 +324,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "warn".into()),
         )
         .init();
+
+    // The same binary answers two protocols, so the tests need only one thing
+    // built: `--mcp` makes it an MCP server rather than an ACP agent.
+    if std::env::args().any(|arg| arg == "--mcp") {
+        return mcp::serve().await;
+    }
 
     let (outbox, mut outbox_rx) = mpsc::unbounded_channel::<Frame>();
     let agent = Arc::new(Agent {
