@@ -121,6 +121,8 @@ const result = await client.connectWith(stream, async (agent) => {
   // ACP client discards anything that precedes the handshake.
   const info = await waitForExt("_mjx/agent/info");
 
+  // Empty, exactly as the browser sends it: what the agent is offered comes
+  // from `mjx.toml`, added by the server on the way past.
   const session = await agent.request(acp.methods.agent.session.new, {
     cwd: info.cwd,
     mcpServers: [],
@@ -183,6 +185,20 @@ check(
   "the announced model was not the one the agent switched to",
 );
 check(seen.permissionAsked, "the agent never asked for permission");
+
+// The configured MCP servers, as the sidebar reads them. Chromium renders from
+// exactly this payload, and a credential appearing in it would be the one leak
+// that matters — the whole reason the server injects `mcpServers` itself.
+const mcpServers = (seen.ext.get("_mjx/agent/info") ?? [])[0]?.mcpServers ?? [];
+check(mcpServers.length > 0, "the sidebar was told of no MCP servers; is mjx.toml's entry gone?");
+for (const server of mcpServers) {
+  check(typeof server.name === "string" && server.name.length > 0, "an MCP server has no name");
+  check(typeof server.transport === "string", `${server.name} has no transport`);
+  check(
+    !JSON.stringify(server).includes("not-a-real-token"),
+    `${server.name} carried its credential to the browser`,
+  );
+}
 
 // Elicitation: both modes, since the two are separate rendering paths.
 check(

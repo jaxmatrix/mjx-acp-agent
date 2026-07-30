@@ -15,6 +15,8 @@ import type {
   ToolKind,
 } from "@agentclientprotocol/sdk";
 
+import type { McpServer } from "./mcp";
+
 /** How a turn ended. */
 export type StopReason =
   | "end_turn"
@@ -295,6 +297,14 @@ export interface AgentInfo {
   connectionId: string;
   /** True when this socket rejoined an agent that was already running. */
   resumed: boolean;
+  /**
+   * The MCP servers configured for this agent, and whether it got them.
+   *
+   * Normalized through `mcpServersOf` before it is read: this whole payload is
+   * an unchecked cast off the socket. Never carries a credential — only the
+   * *names* of the ones a server uses.
+   */
+  mcpServers?: McpServer[];
 }
 
 /**

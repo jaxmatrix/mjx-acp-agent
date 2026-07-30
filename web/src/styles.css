@@ -737,6 +737,43 @@ button {
   gap: 0.3rem;
 }
 
+.sidebar__mcp {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.sidebar__mcp-item {
+  display: grid;
+  gap: 0.1rem;
+  font-size: 0.8rem;
+}
+
+/* A server the agent did not get is dimmed rather than hidden: it is configured,
+   and the reason underneath is the useful part. */
+.sidebar__mcp-item.is-unavailable .sidebar__mcp-name {
+  color: var(--warn);
+}
+
+.sidebar__mcp-name {
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.sidebar__mcp-transport {
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+}
+
+.sidebar__mcp-target {
+  color: var(--dim);
+  word-break: break-all;
+}
+
 .plan__entry {
   display: grid;
   grid-template-columns: 1.2rem 1fr;

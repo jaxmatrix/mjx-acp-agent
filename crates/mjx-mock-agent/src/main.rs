@@ -799,18 +799,18 @@ fn mcp_servers_meta(params: &Value) -> Result<Value, JsonRpcError> {
 
     let described: Vec<Value> = parsed
         .iter()
-        .map(|server| match server {
-            acp::McpServer::Stdio(stdio) => json!({ "name": stdio.name, "transport": "stdio" }),
-            acp::McpServer::Http(http) => json!({ "name": http.name, "transport": "http" }),
-            acp::McpServer::Sse(sse) => json!({ "name": sse.name, "transport": "sse" }),
-            acp::McpServer::Acp(over_acp) => json!({
-                "name": over_acp.name,
-                "transport": "acp",
-                "serverId": over_acp.server_id.0.as_ref(),
-            }),
-            // The enum is `#[non_exhaustive]`, and a transport we have never
-            // heard of is still worth reporting rather than hiding.
-            _ => json!({ "transport": "unknown" }),
+        .zip(entries.iter())
+        .map(|(server, raw)| {
+            let mut described = describe(server);
+            // Which keys this agent was actually handed. The point of the `acp`
+            // transport is that a command and its environment are *not* among
+            // them, and only the receiving end can say so.
+            if let Some(object) = raw.as_object() {
+                let mut fields: Vec<String> = object.keys().cloned().collect();
+                fields.sort();
+                described["fields"] = json!(fields);
+            }
+            described
         })
         .collect();
 
@@ -818,6 +818,23 @@ fn mcp_servers_meta(params: &Value) -> Result<Value, JsonRpcError> {
     // would travel back to the browser, which is exactly what an `acp`-transport
     // server exists to prevent.
     Ok(json!({ "mjx.mcpServers": described }))
+}
+
+/// One offered server, as this agent understood it.
+fn describe(server: &acp::McpServer) -> Value {
+    match server {
+        acp::McpServer::Stdio(stdio) => json!({ "name": stdio.name, "transport": "stdio" }),
+        acp::McpServer::Http(http) => json!({ "name": http.name, "transport": "http" }),
+        acp::McpServer::Sse(sse) => json!({ "name": sse.name, "transport": "sse" }),
+        acp::McpServer::Acp(over_acp) => json!({
+            "name": over_acp.name,
+            "transport": "acp",
+            "serverId": over_acp.server_id.0.as_ref(),
+        }),
+        // The enum is `#[non_exhaustive]`, and a transport we have never heard
+        // of is still worth reporting rather than hiding.
+        _ => json!({ "transport": "unknown" }),
+    }
 }
 
 fn session_id_of(params: &Value) -> Result<String, JsonRpcError> {

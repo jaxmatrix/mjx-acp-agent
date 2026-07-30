@@ -538,9 +538,11 @@ async fn websocket(
                 command: command.display(),
                 cwd: cwd.display().to_string(),
                 connection_id: id.clone(),
-                // Set per attachment by the relay, which is what knows whether
-                // it answered the handshake from a recording.
+                // Both set per attachment by the relay: it is what knows whether
+                // it answered the handshake from a recording, and what the agent
+                // said it could reach.
                 resumed: false,
+                mcp_servers: Vec::new(),
             };
 
             // The jail is the session's cwd plus every configured root, so an

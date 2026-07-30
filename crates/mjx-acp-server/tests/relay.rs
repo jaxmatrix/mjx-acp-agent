@@ -1926,15 +1926,29 @@ async fn a_tool_from_a_server_this_process_holds_reaches_the_agent() {
     // connection.
     assert_eq!(report["disconnected"], true, "{report:#}");
 
-    // And the browser saw neither the credential nor the command behind it.
+    // What the *agent* was handed: a name and an id, and nothing it could run.
+    // The whole purpose of the transport is that the command and its environment
+    // stay here, and the receiving end is the only place that can say they did.
+    let fields = session["_meta"]["mjx.mcpServers"][0]["fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the agent did not report what it was handed: {session:#}"));
+    let fields: Vec<&str> = fields.iter().filter_map(|f| f.as_str()).collect();
+    assert_eq!(
+        fields,
+        ["name", "serverId", "type"],
+        "the agent was handed more than an id"
+    );
+
+    // The browser is shown the command — that is what the sidebar is for — but
+    // never the credential, which is the one value that must not travel.
     let leaked: Vec<&String> = client
         .received
         .iter()
-        .filter(|line| line.contains(HOSTED_MCP_TOKEN) || line.contains("--mcp"))
+        .filter(|line| line.contains(HOSTED_MCP_TOKEN))
         .collect();
     assert!(
         leaked.is_empty(),
-        "the browser was shown too much: {leaked:#?}"
+        "a credential reached the browser: {leaked:#?}"
     );
 
     // What the server said unprompted got through too: `mcp/message` carries a

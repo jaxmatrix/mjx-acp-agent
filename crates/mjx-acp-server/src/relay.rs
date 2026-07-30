@@ -860,7 +860,7 @@ impl<I: Interceptor> Relay<I> {
             id: id.clone(),
             payload: ResponsePayload::Result(result),
         });
-        self.announce(method, true);
+        self.announce(method, true).await;
         true
     }
 
@@ -884,17 +884,34 @@ impl<I: Interceptor> Relay<I> {
             return;
         }
         if let Some(method) = method {
-            self.announce(method, false);
+            self.announce(method, false).await;
         }
     }
 
     /// Announces the agent, if `method` is the handshake that had to come first.
-    fn announce(&self, method: &str, resumed: bool) {
+    ///
+    /// The MCP list is built here rather than once at startup because whether a
+    /// server was *offered* depends on what this agent declared, and because a
+    /// reattaching browser is announced to from `answer_from_recording` — where
+    /// no interceptor runs and nothing else would fill it in.
+    async fn announce(&self, method: &str, resumed: bool) {
         if method != method::agent::INITIALIZE {
             return;
         }
+        let transports = self.handshake.lock().await.transports();
         let info = ext::AgentInfo {
             resumed,
+            mcp_servers: self
+                .mcp_servers
+                .iter()
+                .map(|server| ext::McpServerInfo {
+                    name: server.name.clone(),
+                    transport: server.transport().to_string(),
+                    target: server.target(),
+                    secrets: server.secret_names(),
+                    unavailable: mcp::skip_reason(server, &transports),
+                })
+                .collect(),
             ..self.agent_info.clone()
         };
         self.outbox.notify_browser(ext::AGENT_INFO, &info);
