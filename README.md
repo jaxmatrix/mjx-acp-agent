@@ -151,6 +151,14 @@ Two smaller consequences:
   connection, and folding all of them into the thread on screen would put one
   conversation's messages in another.
 
+A session belongs to the directory it was started in, and an agent's history
+spans every project it has been used in — so a load, resume or fork carries
+*that session's* `cwd`, not this connection's. Sending the wrong one is refused
+with `-32002`, which reads as if the conversation were missing when it is only
+somewhere else. Opening one from another directory works; the drawer marks it,
+because the workspace the server reads and writes through is still this
+connection's, so files outside it will be refused.
+
 `session/delete` removes a conversation; `session/close` only frees what it is
 holding and leaves it listed. `session/resume` picks one back up *without*
 replaying it, so the thread comes from the server's fold rather than the agent.
