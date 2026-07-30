@@ -93,7 +93,7 @@ and `session/new` from what the agent said the first time — so the reload gets
 the session it already had rather than a second one beside it — and the browser
 replaces its thread from `_mjx/session/replay`.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - **A turn that was running keeps running.** A question the agent asked and the
   departed browser never answered is put to the browser that replaces it, which
@@ -102,6 +102,11 @@ Two consequences worth knowing:
   socket can arrive before the old one's close has been processed, so refusing
   would make an ordinary refresh fail. The displaced tab is told, and offers to
   take it back.
+- **Anything the handshake announced is announced as of when it started.**
+  Session modes and config options — the model selector among them — arrive on
+  the `session/new` response, and after a reload that response is a recording.
+  So the server folds them into the thread as well, and the sidebar reads the
+  model actually in effect from the replay rather than from the handshake.
 
 An agent nobody comes back to is reaped after `[server] resume_ttl_secs`, five
 minutes by default; `0` turns the whole thing off. `GET /api/connections` shows
@@ -165,9 +170,9 @@ Configured agents lead the picker, in the order you wrote them.
 ## Development
 
 ```bash
-cargo test   --workspace          # 148 tests
+cargo test   --workspace          # 183 tests
 cargo clippy --workspace --all-targets
-npm --prefix web test             # 37 tests
+npm --prefix web test             # 60 tests
 npm --prefix web run typecheck
 
 npm --prefix web run dev          # hot reload against a `cargo run` server
