@@ -668,27 +668,65 @@ fn modes() -> Value {
 /// it, so echoing it back live would say it twice. It has to be in the
 /// transcript all the same, or a loaded conversation is only the agent's half of
 /// it.
+/// The text a prompt block contributes to a title or a summary.
+///
+/// A prompt can be nothing but mentions — an `@stats.js` and no prose — and a
+/// turn with no text is still a turn. Falling back to what the link names keeps
+/// such a prompt titled and recorded instead of silently dropped.
+fn block_text(block: &Value) -> Option<String> {
+    if let Some(text) = block["text"].as_str() {
+        return Some(text.to_string());
+    }
+    match block["type"].as_str()? {
+        "resource_link" => block["name"]
+            .as_str()
+            .or_else(|| block["uri"].as_str())
+            .map(|named| format!("@{named}")),
+        "resource" => block["resource"]["uri"]
+            .as_str()
+            .map(|uri| format!("@{uri}")),
+        _ => None,
+    }
+}
+
+/// A plausible mime type for a link the agent is echoing back.
+fn guess_mime(uri: &str) -> &'static str {
+    match uri.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("js" | "mjs" | "cjs") => "text/javascript",
+        Some("ts" | "tsx") => "text/typescript",
+        Some("rs") => "text/rust",
+        Some("json") => "application/json",
+        Some("md") => "text/markdown",
+        _ => "text/plain",
+    }
+}
+
 fn title_and_record_prompt(agent: &Agent, session_id: &str, params: &Value) {
-    let text: String = params["prompt"]
-        .as_array()
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|block| block["text"].as_str())
-                .collect()
-        })
-        .unwrap_or_default();
+    let blocks = params["prompt"].as_array().cloned().unwrap_or_default();
+    let text: String = blocks.iter().filter_map(block_text).collect();
     if text.is_empty() {
         return;
     }
 
-    agent.record(
-        session_id,
-        json!({
-            "sessionUpdate": "user_message_chunk",
-            "content": { "type": "text", "text": text }
-        }),
-    );
+    // Recorded block by block, and a link is recorded as a link: a replayed
+    // conversation should show the mention the user pointed at, not a
+    // flattened summary of it. The mimeType is invented on the way back —
+    // a real agent annotates what it echoes, and a client that decided
+    // "already on screen" by comparing every field would show the prompt twice.
+    for block in &blocks {
+        let content = match block["type"].as_str() {
+            Some("resource_link") => {
+                let mut link = block.clone();
+                link["mimeType"] = json!(guess_mime(block["uri"].as_str().unwrap_or_default()));
+                link
+            }
+            _ => block.clone(),
+        };
+        agent.record(
+            session_id,
+            json!({ "sessionUpdate": "user_message_chunk", "content": content }),
+        );
+    }
 
     let mut sessions = agent.sessions();
     if let Some(session) = sessions.get_mut(session_id)
@@ -938,6 +976,31 @@ mod tests {
     fn timestamps_sort_the_way_the_instants_do() {
         // `session/list` orders by this string, so the two orders have to agree.
         assert!(iso8601(1_709_164_800) < iso8601(1_767_225_599));
+    }
+
+    #[test]
+    fn a_prompt_of_only_mentions_still_produces_a_title() {
+        // Reading only `text` would leave such a turn untitled and unrecorded,
+        // and the whole point of a mention is that it can be the whole prompt.
+        let link = json!({ "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" });
+        assert_eq!(block_text(&link).as_deref(), Some("@stats.js"));
+        assert_eq!(summarise(&block_text(&link).unwrap()), "@stats.js");
+
+        // A link with no name falls back to what it points at.
+        let bare = json!({ "type": "resource_link", "uri": "file:///w/stats.js" });
+        assert_eq!(block_text(&bare).as_deref(), Some("@file:///w/stats.js"));
+
+        // And an embedded resource is named by its uri too.
+        let embedded = json!({ "type": "resource", "resource": { "uri": "file:///w/a.md" } });
+        assert_eq!(block_text(&embedded).as_deref(), Some("@file:///w/a.md"));
+    }
+
+    #[test]
+    fn an_echoed_link_is_annotated_the_way_a_real_agent_annotates_one() {
+        // The client has to absorb this as its own prompt despite the extra
+        // field, which is what the structural comparison in the fold is for.
+        assert_eq!(guess_mime("file:///w/stats.js"), "text/javascript");
+        assert_eq!(guess_mime("file:///w/notes"), "text/plain");
     }
 
     #[test]
