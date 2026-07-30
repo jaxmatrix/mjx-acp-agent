@@ -22,6 +22,19 @@
 //! part of the conversation. So this holds the whole lifecycle, and a reload
 //! shows an accepted form as accepted rather than losing it.
 //!
+//! **More than one session per connection.** An agent that supports
+//! `session/list` lets the browser open a conversation from before this
+//! connection existed, so this store holds a thread per session and a load
+//! *resets* the one it names — a load replays the whole conversation, and
+//! folding that on top of what was there would double it.
+//!
+//! Which of those sessions the browser is looking at is the browser's own
+//! business, not this store's. The relay still answers a repeat `session/new`
+//! from the recording it made when the connection started (see
+//! `relay::Handshake`), because that is what makes a reload transparent to an
+//! ordinary ACP client; a browser that has since loaded a different session
+//! remembers that itself and asks `_mjx/session/replay` for it by name.
+//!
 //! It is *also* re-asked over the socket (`relay::Relay::unanswered`), and that
 //! is not redundant: a browser cannot answer a request the connection it is
 //! holding never received, so the replay alone would put an unanswerable form on
@@ -39,9 +52,20 @@ pub struct SessionStore {
     /// `session/prompt` requests in flight, so their responses can be
     /// attributed to the right session.
     pending_prompts: HashMap<RequestId, String>,
-    /// `session/new` requests in flight, so the id in the response can be
-    /// matched with the mode state that comes with it.
-    pending_new_sessions: Vec<RequestId>,
+    /// `session/new` and `session/fork` requests in flight, so the id in the
+    /// response can be matched with the mode state that comes with it. Both
+    /// answer with a session id this store has not seen before.
+    pending_session_creations: Vec<RequestId>,
+    /// `session/load` and `session/resume` requests in flight, keyed to the
+    /// session they name, so the modes and config options in the response land
+    /// on a session that already exists.
+    pending_session_states: HashMap<RequestId, String>,
+    /// `session/delete` and `session/close` requests in flight.
+    ///
+    /// Kept until the response, because a refused delete must not lose the
+    /// history: the session still exists on the agent, and a browser that
+    /// reloads is still owed it.
+    pending_forgets: HashMap<RequestId, String>,
     /// `session/set_config_option` requests in flight, so the refreshed set in
     /// the response can be attributed to the right session.
     ///
@@ -106,6 +130,20 @@ impl SessionStore {
             .unwrap_or(0)
     }
 
+    /// Drops everything held for a session the agent no longer has.
+    ///
+    /// The thread goes with it: `_mjx/session/replay` for a deleted session
+    /// should answer "nothing", not hand back a conversation that has been
+    /// removed from the agent it belonged to.
+    fn forget(&mut self, session_id: &str) {
+        self.threads.remove(session_id);
+        self.pending_prompts.retain(|_, pending| pending != session_id);
+        self.pending_config_options
+            .retain(|_, pending| pending != session_id);
+        self.pending_elicitations
+            .retain(|_, pending| pending != session_id);
+    }
+
     /// Folds in a frame on its way from the browser to the agent.
     pub fn observe_from_client(&mut self, frame: &Frame) {
         match frame {
@@ -121,7 +159,51 @@ impl SessionStore {
 
     fn observe_client_request(&mut self, frame: &Frame, id: &RequestId, method: &str) {
         match method {
-            method::agent::SESSION_NEW => self.pending_new_sessions.push(id.clone()),
+            method::agent::SESSION_NEW | method::agent::SESSION_FORK => {
+                self.pending_session_creations.push(id.clone());
+            }
+
+            // A load streams the whole conversation back as `session/update`
+            // notifications, so the thread it lands in has to start empty:
+            // folding a replay on top of what was already here would show every
+            // message twice, and three times after the next load. The browser
+            // does the same to its own copy for the same reason.
+            method::agent::SESSION_LOAD => {
+                let Ok(Some(request)) = frame.params_as::<acp::LoadSessionRequest>() else {
+                    return;
+                };
+                let session_id = request.session_id.0.to_string();
+                self.threads.insert(session_id.clone(), Thread::default());
+                // The replayed conversation is the whole conversation, and it
+                // does not contain the question the old one was still asking.
+                self.pending_elicitations
+                    .retain(|_, pending| pending != &session_id);
+                self.pending_session_states.insert(id.clone(), session_id);
+            }
+
+            // A resume reactivates a session *without* replaying it, which is
+            // the only thing that distinguishes it from a load — so the thread
+            // it has is the thread it keeps.
+            method::agent::SESSION_RESUME => {
+                if let Ok(Some(request)) = frame.params_as::<acp::ResumeSessionRequest>() {
+                    self.pending_session_states
+                        .insert(id.clone(), request.session_id.0.to_string());
+                }
+            }
+
+            method::agent::SESSION_DELETE => {
+                if let Ok(Some(request)) = frame.params_as::<acp::DeleteSessionRequest>() {
+                    self.pending_forgets
+                        .insert(id.clone(), request.session_id.0.to_string());
+                }
+            }
+
+            method::agent::SESSION_CLOSE => {
+                if let Ok(Some(request)) = frame.params_as::<acp::CloseSessionRequest>() {
+                    self.pending_forgets
+                        .insert(id.clone(), request.session_id.0.to_string());
+                }
+            }
             method::agent::SESSION_SET_CONFIG_OPTION => {
                 if let Ok(Some(request)) = frame.params_as::<acp::SetSessionConfigOptionRequest>() {
                     self.pending_config_options
@@ -235,8 +317,15 @@ impl SessionStore {
                     {
                         thread.finish_turn(response.stop_reason);
                     }
-                } else if let Some(index) = self.pending_new_sessions.iter().position(|p| p == id) {
-                    self.pending_new_sessions.remove(index);
+                } else if let Some(index) =
+                    self.pending_session_creations.iter().position(|p| p == id)
+                {
+                    self.pending_session_creations.remove(index);
+                    // A fork answers the same shape as a new session — an id
+                    // this store has not seen, with the modes and options it
+                    // starts life with — so one reader covers both. What it
+                    // forked *from* keeps its own thread: the fork is a second
+                    // conversation, not a move.
                     if let Ok(response) =
                         serde_json::from_str::<acp::NewSessionResponse>(result.get())
                     {
@@ -251,6 +340,24 @@ impl SessionStore {
                             thread.set_config_options(options);
                         }
                     }
+                } else if let Some(session_id) = self.pending_session_states.remove(id) {
+                    // `session/resume` answers the same shape as `session/load`,
+                    // so this reads both.
+                    if let Ok(response) =
+                        serde_json::from_str::<acp::LoadSessionResponse>(result.get())
+                        && let Some(thread) = self.threads.get_mut(&session_id)
+                    {
+                        if let Some(modes) = &response.modes {
+                            thread.set_modes(modes);
+                        }
+                        if let Some(options) = &response.config_options {
+                            thread.set_config_options(options);
+                        }
+                    }
+                } else if let Some(session_id) = self.pending_forgets.remove(id) {
+                    // The agent says the session is gone, or has been freed.
+                    // Either way there is nothing here left to replay.
+                    self.forget(&session_id);
                 } else if let Some(session_id) = self.pending_config_options.remove(id)
                     && let Ok(response) =
                         serde_json::from_str::<acp::SetSessionConfigOptionResponse>(result.get())
@@ -271,8 +378,12 @@ impl SessionStore {
                 {
                     thread.finish_turn(acp::StopReason::Cancelled);
                 }
-                self.pending_new_sessions.retain(|pending| pending != id);
+                self.pending_session_creations.retain(|pending| pending != id);
                 self.pending_config_options.remove(id);
+                self.pending_session_states.remove(id);
+                // A refused delete is a session that still exists. Forgetting
+                // its thread here would lose a history the agent still has.
+                self.pending_forgets.remove(id);
             }
 
             _ => {}
@@ -704,6 +815,153 @@ mod tests {
             method::client::ELICITATION_CREATE,
             json!({ "nonsense": true }),
         ));
+
+        assert!(store.pending_elicitations.is_empty());
+    }
+
+    /// A session/load request for `session_id`, as the browser sends it.
+    fn load(id: i64, session_id: &str) -> Frame {
+        request(
+            id,
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": session_id, "cwd": "/w", "mcpServers": [] }),
+        )
+    }
+
+    #[test]
+    fn a_loaded_session_starts_its_thread_from_empty() {
+        // `session/load` streams the whole conversation back. Folding that on
+        // top of what was already here would show every message twice, and
+        // three times after the next load.
+        let mut store = started();
+        store.observe_from_agent(&update(
+            "s1",
+            json!({ "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "hi" } }),
+        ));
+        assert_eq!(store.thread("s1").unwrap().entries.len(), 2);
+
+        store.observe_from_client(&load(30, "s1"));
+        assert_eq!(store.thread("s1").unwrap().entries.len(), 0);
+
+        store.observe_from_agent(&update(
+            "s1",
+            json!({ "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": "hi" } }),
+        ));
+        assert_eq!(store.thread("s1").unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn a_load_answers_with_the_modes_and_options_in_effect() {
+        // The same reason `session/set_config_option` is watched: after a reload
+        // the browser's own handshake is answered from a recording, so this
+        // thread is the only place the current model can come from.
+        let mut store = started();
+        store.observe_from_client(&load(30, "s1"));
+        store.observe_from_agent(
+            &Frame::result(
+                RequestId::Number(30),
+                &json!({
+                    "modes": { "currentModeId": "ask", "availableModes": [{ "id": "ask", "name": "Ask" }] },
+                    "configOptions": [model_option("opus")]
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(current_model(&store), "opus");
+        assert_eq!(
+            store.thread("s1").unwrap().modes.as_ref().unwrap().current_mode_id,
+            "ask"
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_the_conversation_it_had() {
+        // The whole difference between resuming and loading: nothing is
+        // replayed, so nothing may be thrown away either.
+        let mut store = started();
+        store.observe_from_client(&request(
+            31,
+            method::agent::SESSION_RESUME,
+            json!({ "sessionId": "s1", "cwd": "/w" }),
+        ));
+
+        assert_eq!(store.thread("s1").unwrap().entries.len(), 1);
+
+        store.observe_from_agent(
+            &Frame::result(
+                RequestId::Number(31),
+                &json!({ "configOptions": [model_option("opus")] }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(current_model(&store), "opus");
+    }
+
+    #[test]
+    fn a_fork_opens_a_thread_of_its_own() {
+        let mut store = started();
+        store.observe_from_client(&request(
+            32,
+            method::agent::SESSION_FORK,
+            json!({ "sessionId": "s1", "cwd": "/w" }),
+        ));
+        store.observe_from_agent(
+            &Frame::result(
+                RequestId::Number(32),
+                &json!({ "sessionId": "s2", "configOptions": [model_option("opus")] }),
+            )
+            .unwrap(),
+        );
+
+        // The fork is a second conversation, and the one it came from is
+        // untouched: its history stays where the browser can still replay it.
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.thread("s1").unwrap().entries.len(), 1);
+        assert!(store.thread("s2").unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn deleting_or_closing_a_session_forgets_its_thread() {
+        for method in [method::agent::SESSION_DELETE, method::agent::SESSION_CLOSE] {
+            let mut store = started();
+            store.observe_from_client(&request(33, method, json!({ "sessionId": "s1" })));
+            // Not yet: the agent has not said it went through.
+            assert!(store.thread("s1").is_some(), "{method} forgot too early");
+
+            store.observe_from_agent(&Frame::result(RequestId::Number(33), &json!({})).unwrap());
+            assert!(store.thread("s1").is_none(), "{method} did not forget");
+        }
+    }
+
+    #[test]
+    fn a_refused_delete_leaves_the_conversation_alone() {
+        // The agent said no, so the session still exists — and a browser that
+        // reloads is still owed its history.
+        let mut store = started();
+        store.observe_from_client(&request(
+            33,
+            method::agent::SESSION_DELETE,
+            json!({ "sessionId": "s1" }),
+        ));
+        store.observe_from_agent(&Frame::error(
+            RequestId::Number(33),
+            mjx_acp_core::JsonRpcError::invalid_params("no such session"),
+        ));
+
+        assert!(store.thread("s1").is_some());
+    }
+
+    #[test]
+    fn loading_gives_up_on_the_questions_the_old_thread_was_asking() {
+        // The replayed conversation is the whole conversation. A form left
+        // pending from before it would be answered into a thread that no longer
+        // holds the question.
+        let mut store = started();
+        store.observe_from_agent(&ask(serde_json::json!({ "sessionId": "s1" })));
+        store.observe_from_client(&load(30, "s1"));
 
         assert!(store.pending_elicitations.is_empty());
     }
