@@ -459,8 +459,14 @@ function mapElicitations(
   return changed ? { ...thread, entries } : thread;
 }
 
-/** Records a user prompt optimistically, before the agent acknowledges it. */
-export function appendUserPrompt(thread: Thread, text: string): Thread {
+/**
+ * Records a user prompt optimistically, before the agent acknowledges it.
+ *
+ * Takes the blocks rather than the text, because a prompt carrying a mention
+ * is several blocks and the optimistic echo has to match what was actually
+ * sent — see `appendUserContent`, which absorbs the agent's echo of it.
+ */
+export function appendUserPrompt(thread: Thread, content: ContentBlock[]): Thread {
   return {
     ...thread,
     status: "generating",
@@ -470,7 +476,7 @@ export function appendUserPrompt(thread: Thread, text: string): Thread {
       {
         type: "user",
         id: `user-${thread.entries.length}`,
-        content: [{ type: "text", text }],
+        content,
         isOptimistic: true,
       },
     ],

@@ -146,7 +146,7 @@ describe("streaming text", () => {
   test("an echoed prompt is absorbed rather than duplicated", () => {
     // The prompt goes on screen the moment it is sent. An agent that echoes
     // `user_message_chunk` back must not make it appear twice.
-    let thread = appendUserPrompt(emptyThread(), "fix the bug");
+    let thread = appendUserPrompt(emptyThread(), [{ type: "text", text: "fix the bug" }]);
     thread = applyUpdate(
       thread,
       n({ sessionUpdate: "user_message_chunk", content: text("fix the bug") }),
@@ -156,7 +156,7 @@ describe("streaming text", () => {
   });
 
   test("a user chunk that is not an echo is kept", () => {
-    let thread = appendUserPrompt(emptyThread(), "first");
+    let thread = appendUserPrompt(emptyThread(), [{ type: "text", text: "first" }]);
     thread = applyUpdate(
       thread,
       n({ sessionUpdate: "user_message_chunk", content: text("something else entirely") }),

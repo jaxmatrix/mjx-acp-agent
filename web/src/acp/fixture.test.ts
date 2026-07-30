@@ -31,7 +31,7 @@ const updates: SessionUpdate[] = readFileSync(fixturePath, "utf8")
 function folded(): Thread {
   // The capture starts after the prompt was sent, so mirror what the client
   // does: the user's message is on screen before the agent says anything.
-  let thread = appendUserPrompt(emptyThread(), "fix the median bug in stats.js");
+  let thread = appendUserPrompt(emptyThread(), [{ type: "text", text: "fix the median bug in stats.js" }]);
   for (const update of updates) {
     thread = applyUpdate(thread, { sessionId: "s1", update } as SessionNotification);
   }

@@ -1,6 +1,7 @@
 /** The prompt box. */
 
 import { useRef, useState } from "react";
+import type { ContentBlock } from "@agentclientprotocol/sdk";
 import type { AvailableCommand } from "../acp/types";
 
 export function Composer({
@@ -14,7 +15,7 @@ export function Composer({
   /** Whether the session exists yet. */
   ready: boolean;
   commands: AvailableCommand[];
-  onSend(text: string): void;
+  onSend(prompt: ContentBlock[]): void;
   onCancel(): void;
 }) {
   const [text, setText] = useState("");
@@ -34,7 +35,7 @@ export function Composer({
 
   function send() {
     if (!canSend) return;
-    onSend(text.trim());
+    onSend([{ type: "text", text: text.trim() }]);
     setText("");
   }
 

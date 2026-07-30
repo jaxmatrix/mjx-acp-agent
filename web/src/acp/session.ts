@@ -6,6 +6,7 @@
  */
 
 import * as acp from "@agentclientprotocol/sdk";
+import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { createWebSocketStream } from "@agentclientprotocol/sdk/experimental/ws-client";
 
 import {
@@ -525,15 +526,21 @@ export class Session {
     }
   }
 
-  /** Sends a prompt and runs a turn to completion. */
-  async prompt(text: string): Promise<void> {
+  /**
+   * Sends a prompt and runs a turn to completion.
+   *
+   * The blocks, not the text: a prompt carrying an `@`-mention is a run of
+   * text and `resource_link` blocks, and the optimistic copy on screen has to
+   * be the same blocks the agent will echo back.
+   */
+  async prompt(prompt: ContentBlock[]): Promise<void> {
     if (!this.#agent || !this.#sessionId) throw new Error("not connected");
 
-    this.#update((thread) => appendUserPrompt(thread, text));
+    this.#update((thread) => appendUserPrompt(thread, prompt));
     try {
       const response = await this.#agent.request(acp.methods.agent.session.prompt, {
         sessionId: this.#sessionId,
-        prompt: [{ type: "text", text }],
+        prompt,
       });
       this.#update((thread) => this.#endTurn(thread, response.stopReason as StopReason));
     } catch (error) {

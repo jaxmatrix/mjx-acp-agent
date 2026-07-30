@@ -1,6 +1,7 @@
 /** React binding for {@link Session}. */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ContentBlock } from "@agentclientprotocol/sdk";
 
 import { noCapabilities, type AgentCapabilities } from "./acp/capabilities";
 import { resumeStore, sessionStore } from "./acp/resume";
@@ -46,7 +47,7 @@ export interface SessionState {
   closeSession(session: SessionInfo): void;
   newSession(): void;
   frames: InspectorEntry[];
-  prompt(text: string): void;
+  prompt(prompt: ContentBlock[]): void;
   cancel(): void;
   setMode(modeId: string): void;
   setConfigOption(configId: string, value: string | boolean): void;
@@ -146,8 +147,8 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     };
   }, [agentId, cwd, attempt]);
 
-  const prompt = useCallback((text: string) => {
-    session.current?.prompt(text).catch((cause: unknown) => {
+  const prompt = useCallback((blocks: ContentBlock[]) => {
+    session.current?.prompt(blocks).catch((cause: unknown) => {
       setError(cause instanceof Error ? cause.message : String(cause));
     });
   }, []);
