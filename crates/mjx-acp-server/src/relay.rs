@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use mjx_acp_core::{
-    Direction, Frame, JsonRpcError, MethodCorrelator, ResponsePayload, ext, method,
+    Direction, Frame, JsonRpcError, MethodCorrelator, ResponsePayload, acp, ext, method,
 };
 
 use crate::agent_process::{AgentHandle, AgentProcess};
@@ -243,6 +243,9 @@ pub struct Relay<I: Interceptor> {
     /// `session/request_permission` parks the turn until *someone* answers.
     /// Asking the next browser is what makes a reload resume a turn that is
     /// still running rather than one that has quietly stalled.
+    ///
+    /// Not everything the agent asks belongs here — see
+    /// [`is_replayed_question`].
     unanswered: tokio::sync::Mutex<Vec<Frame>>,
     /// Thread state, so a browser that reloads can be given the conversation
     /// back instead of an empty page.
@@ -675,8 +678,12 @@ impl<I: Interceptor> Relay<I> {
             Disposition::Forward => {
                 // Only what really reaches the browser is worth re-asking. The
                 // interceptor's `fs/*` and `terminal/*` traffic is answered by
-                // the server and never seen there.
-                if direction == Direction::AgentToClient && matches!(frame, Frame::Request { .. }) {
+                // the server and never seen there, and a question the replay
+                // brings back by itself must not be asked a second time.
+                if direction == Direction::AgentToClient
+                    && matches!(frame, Frame::Request { .. })
+                    && !is_replayed_question(&frame)
+                {
                     self.unanswered.lock().await.push(frame.clone());
                 }
                 self.forward(direction, &frame, ends_turn).await;
@@ -869,6 +876,29 @@ fn stop_reason_of(payload: &ResponsePayload) -> String {
         .unwrap_or_else(|| "cancelled".into())
 }
 
+/// Whether a replayed thread already brings this question back.
+///
+/// A session-scoped `elicitation/create` is the only one. `SessionStore` folds
+/// it into the thread, so `_mjx/session/replay` puts the form back on screen by
+/// itself, and re-asking as well would show the user the same question twice —
+/// once from the thread and once from the socket.
+///
+/// Everything else the agent asks has nowhere else to live and must be
+/// re-asked: a permission prompt is not thread state, and neither is an
+/// elicitation scoped to a request rather than to a session.
+fn is_replayed_question(frame: &Frame) -> bool {
+    let Frame::Request { method, .. } = frame else {
+        return false;
+    };
+    if method != method::client::ELICITATION_CREATE {
+        return false;
+    }
+    matches!(
+        frame.params_as::<acp::CreateElicitationRequest>(),
+        Ok(Some(request)) if matches!(request.scope(), acp::ElicitationScope::Session(_))
+    )
+}
+
 /// The wire spelling of a direction, matching the TypeScript union.
 fn direction_name(direction: Direction) -> &'static str {
     match direction {
@@ -965,7 +995,7 @@ mod tests {
             &initialize(json!({
                 "protocolVersion": 1,
                 "clientInfo": { "name": "mjx-acp-viewer", "version": "0.1.0" },
-                "clientCapabilities": { "elicitation": { "form": true } }
+                "clientCapabilities": { "elicitation": { "form": {} } }
             })),
             true,
             true,
@@ -976,8 +1006,61 @@ mod tests {
             serde_json::from_str(merged.params().unwrap().get()).unwrap();
         assert_eq!(params["protocolVersion"], 1);
         assert_eq!(params["clientInfo"]["name"], "mjx-acp-viewer");
-        // The browser's own capabilities survive the merge.
-        assert_eq!(params["clientCapabilities"]["elicitation"]["form"], true);
+        // The browser's own capabilities survive the merge. `elicitation` is a
+        // real one it declares, spelled the way the schema wants it: an object,
+        // because a bare `true` reads as absent on the agent's side.
+        assert!(params["clientCapabilities"]["elicitation"]["form"].is_object());
+    }
+
+    fn elicitation(params: serde_json::Value) -> Frame {
+        Frame::Request {
+            id: mjx_acp_core::RequestId::Number(9),
+            method: method::client::ELICITATION_CREATE.into(),
+            params: Some(serde_json::value::to_raw_value(&params).unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_session_scoped_elicitation_is_left_to_the_replay() {
+        // The store folds it into the thread, so asking again after a reload
+        // would put the same form on screen twice.
+        assert!(is_replayed_question(&elicitation(json!({
+            "mode": "form",
+            "sessionId": "s1",
+            "message": "which branch?",
+            "requestedSchema": { "type": "object", "properties": {} }
+        }))));
+    }
+
+    #[test]
+    fn everything_else_the_agent_asks_still_gets_re_asked() {
+        // A permission prompt is not thread state, and neither is an
+        // elicitation tied to a request rather than to a session — both would
+        // be lost outright if the re-ask list skipped them.
+        let permission = Frame::Request {
+            id: mjx_acp_core::RequestId::Number(3),
+            method: method::client::SESSION_REQUEST_PERMISSION.into(),
+            params: None,
+        };
+        assert!(!is_replayed_question(&permission));
+
+        assert!(!is_replayed_question(&elicitation(json!({
+            "mode": "url",
+            "requestId": 4,
+            "elicitationId": "el-1",
+            "url": "https://example.test/",
+            "message": "authorize"
+        }))));
+    }
+
+    #[test]
+    fn an_elicitation_we_cannot_read_is_re_asked_rather_than_dropped() {
+        // The scope decides, and a frame whose scope cannot be parsed has not
+        // been shown to be safe to leave out. Re-asking twice is a worse page;
+        // re-asking never is a turn that never finishes.
+        assert!(!is_replayed_question(&elicitation(json!({
+            "nonsense": true
+        }))));
     }
 
     #[test]
