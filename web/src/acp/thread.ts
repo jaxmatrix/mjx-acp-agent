@@ -13,6 +13,9 @@
 import type { ContentBlock, SessionNotification } from "@agentclientprotocol/sdk";
 import type {
   AssistantChunk,
+  Elicitation,
+  ElicitationState,
+  ElicitationValue,
   Entry,
   PermissionRequest,
   SessionConfigOption,
@@ -359,6 +362,101 @@ export function clearPermission(thread: Thread, toolCallId: string): Thread {
     toolCall: { ...existing.toolCall, awaitingPermission: undefined },
   };
   return { ...thread, entries };
+}
+
+/**
+ * Adds a question the agent has put to the user, or refreshes one already here.
+ *
+ * The refresh is the point. After a reload the same question arrives twice — once
+ * inside the replayed thread, and once re-asked over the new socket, because a
+ * response has to belong to a request *this* connection received. Matching on the
+ * request id is what turns those two into one form on screen.
+ *
+ * The entry keeps its existing id, so React sees the same element rather than a
+ * replacement.
+ */
+export function attachElicitation(thread: Thread, elicitation: Elicitation): Thread {
+  const index = thread.entries.findIndex(
+    (entry) => entry.type === "elicitation" && entry.elicitation.requestId === elicitation.requestId,
+  );
+  if (index === -1) {
+    return {
+      ...thread,
+      entries: [...thread.entries, { type: "elicitation", id: elicitation.id, elicitation }],
+    };
+  }
+
+  const entries = [...thread.entries];
+  const existing = entries[index] as Extract<Entry, { type: "elicitation" }>;
+  entries[index] = {
+    ...existing,
+    elicitation: { ...elicitation, id: existing.id },
+  };
+  return { ...thread, entries };
+}
+
+/**
+ * Records how a question ended, found by the request it answers.
+ *
+ * Revised in place rather than removed, matching the Rust model: the answer is
+ * history worth reading, and every entry id after a removed one would shift.
+ */
+export function settleElicitation(
+  thread: Thread,
+  requestId: string | number,
+  state: ElicitationState,
+  content?: Record<string, ElicitationValue>,
+): Thread {
+  return mapElicitations(thread, (asked) =>
+    asked.state === "pending" && asked.requestId === requestId
+      ? { ...asked, state, ...(content ? { content } : {}) }
+      : asked,
+  );
+}
+
+/**
+ * Records that a URL-mode question is finished.
+ *
+ * URL mode does not end with a response — the agent sends an
+ * `elicitation/complete` naming the elicitation rather than the request.
+ */
+export function completeElicitation(thread: Thread, elicitationId: string): Thread {
+  return mapElicitations(thread, (asked) =>
+    asked.state === "pending" &&
+    asked.mode.mode === "url" &&
+    asked.mode.elicitationId === elicitationId
+      ? { ...asked, state: "accepted" }
+      : asked,
+  );
+}
+
+/**
+ * Gives up on every question still waiting on the user.
+ *
+ * A turn that has ended will not read an answer, so a form left on screen would
+ * invite one that goes nowhere. The server does the same to its own copy.
+ */
+export function cancelPendingElicitations(thread: Thread): Thread {
+  return mapElicitations(thread, (asked) =>
+    asked.state === "pending" ? { ...asked, state: "cancelled" } : asked,
+  );
+}
+
+/** Rewrites every elicitation entry, leaving the thread alone if none changed. */
+function mapElicitations(
+  thread: Thread,
+  revise: (elicitation: Elicitation) => Elicitation,
+): Thread {
+  let changed = false;
+  const entries = thread.entries.map((entry) => {
+    if (entry.type !== "elicitation") return entry;
+    const revised = revise(entry.elicitation);
+    if (revised === entry.elicitation) return entry;
+    changed = true;
+    return { ...entry, elicitation: revised };
+  });
+  // Identity matters: React re-renders on it, so a no-op must stay a no-op.
+  return changed ? { ...thread, entries } : thread;
 }
 
 /** Records a user prompt optimistically, before the agent acknowledges it. */

@@ -8,6 +8,7 @@
 
 import type {
   ContentBlock,
+  ElicitationSchema,
   PermissionOption,
   PlanEntry,
   ToolCallStatus,
@@ -83,6 +84,46 @@ export interface PermissionRequest {
   options: PermissionOption[];
 }
 
+/**
+ * A structured question the agent put to the user.
+ *
+ * Mirrors `mjx_acp_thread::Elicitation`, field for field, because this one *is*
+ * carried by `_mjx/session/replay` — unlike a permission prompt, which the relay
+ * re-asks over the socket instead. A form the user is halfway through is worth
+ * bringing back across a reload, and a permission prompt is hidden by its tool
+ * call settling where an elicitation, which need not have a tool call, is not.
+ */
+export interface Elicitation {
+  /** Stable identity for the UI. */
+  id: string;
+  /** The JSON-RPC id the answer has to carry. */
+  requestId: string | number;
+  message: string;
+  /** The tool call this belongs to. A label, not a home. */
+  toolCallId?: string;
+  mode: ElicitationMode;
+  state: ElicitationState;
+  /** What the user submitted, once they have. */
+  content?: Record<string, ElicitationValue>;
+}
+
+/**
+ * How the user is being asked.
+ *
+ * Only the two modes the protocol defines. An unknown one is declined rather
+ * than modelled: the spec says a client must not render one as if it understood
+ * it.
+ */
+export type ElicitationMode =
+  | { mode: "form"; requestedSchema: ElicitationSchema }
+  | { mode: "url"; elicitationId: string; url: string };
+
+/** The three `CreateElicitationResponse` actions, plus the state before them. */
+export type ElicitationState = "pending" | "accepted" | "declined" | "cancelled";
+
+/** What a form field can come back as. */
+export type ElicitationValue = string | number | boolean | string[];
+
 /** One item in the timeline. */
 export type Entry =
   | {
@@ -99,7 +140,8 @@ export type Entry =
       protocolId?: string;
     }
   | { type: "assistant"; id: string; chunks: AssistantChunk[] }
-  | { type: "toolCall"; id: string; toolCall: ToolCall };
+  | { type: "toolCall"; id: string; toolCall: ToolCall }
+  | { type: "elicitation"; id: string; elicitation: Elicitation };
 
 /** A terminal the server is running for the agent. */
 export interface Terminal {

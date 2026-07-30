@@ -12,12 +12,16 @@
  * one entry rather than the whole page.
  */
 
-import type { ContentBlock, PlanEntry } from "@agentclientprotocol/sdk";
+import type { ContentBlock, ElicitationSchema, PlanEntry } from "@agentclientprotocol/sdk";
 
 import {
   emptyThread,
   type AssistantChunk,
   type AvailableCommand,
+  type Elicitation,
+  type ElicitationMode,
+  type ElicitationState,
+  type ElicitationValue,
   type Entry,
   type SessionConfigOption,
   type SessionConfigSelectOption,
@@ -118,6 +122,13 @@ function toEntry(raw: unknown): Entry | null {
       return toolCall && { type: "toolCall", id: toolCall.id, toolCall };
     }
 
+    // The one request kind the replay carries, so a form the user was halfway
+    // through comes back rather than being asked again.
+    case "elicitation": {
+      const elicitation = toElicitation(raw);
+      return elicitation && { type: "elicitation", id: elicitation.id, elicitation };
+    }
+
     default:
       return null;
   }
@@ -145,8 +156,49 @@ function toToolCall(raw: Record<string, unknown>): ToolCall | null {
     ...("rawOutput" in raw ? { rawOutput: raw.rawOutput } : {}),
     // Deliberately not carried: a permission prompt is not part of the thread
     // the server folds. One still outstanding is re-asked after the replay,
-    // which is what puts it back on the card it belongs to.
+    // which is what puts it back on the card it belongs to. An elicitation is
+    // the other way round — it *is* in the thread, and so is not re-asked.
   };
+}
+
+const ELICITATION_STATES: readonly string[] = ["pending", "accepted", "declined", "cancelled"];
+
+/**
+ * Rebuilds one elicitation, or drops it.
+ *
+ * Dropping is the right cost for a shape we cannot read. Rendering a form whose
+ * schema we misread would collect an answer against the wrong fields, and one
+ * whose request id we misread could not be answered at all.
+ */
+function toElicitation(raw: Record<string, unknown>): Elicitation | null {
+  if (typeof raw.id !== "string" || typeof raw.message !== "string") return null;
+  if (typeof raw.requestId !== "string" && typeof raw.requestId !== "number") return null;
+
+  const mode = toElicitationMode(raw);
+  if (!mode) return null;
+
+  return {
+    id: raw.id,
+    requestId: raw.requestId,
+    message: raw.message,
+    ...(typeof raw.toolCallId === "string" ? { toolCallId: raw.toolCallId } : {}),
+    ...mode,
+    state: ELICITATION_STATES.includes(raw.state as string)
+      ? (raw.state as ElicitationState)
+      : "pending",
+    ...(isRecord(raw.content) ? { content: raw.content as Record<string, ElicitationValue> } : {}),
+  };
+}
+
+/** The mode fields, flattened onto the entry the way Rust writes them. */
+function toElicitationMode(raw: Record<string, unknown>): { mode: ElicitationMode } | null {
+  if (raw.mode === "form" && isRecord(raw.requestedSchema)) {
+    return { mode: { mode: "form", requestedSchema: raw.requestedSchema as ElicitationSchema } };
+  }
+  if (raw.mode === "url" && typeof raw.url === "string" && typeof raw.elicitationId === "string") {
+    return { mode: { mode: "url", elicitationId: raw.elicitationId, url: raw.url } };
+  }
+  return null;
 }
 
 function toUsage(raw: unknown): Usage | undefined {

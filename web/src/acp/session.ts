@@ -15,12 +15,19 @@ import {
   appendTerminalOutput,
   appendUserPrompt,
   applyUpdate,
+  attachElicitation,
   attachPermission,
+  cancelPendingElicitations,
   clearPermission,
+  completeElicitation,
   setTerminalExit,
+  settleElicitation,
 } from "./thread";
 import type {
   AgentInfo,
+  ElicitationMode,
+  ElicitationState,
+  ElicitationValue,
   InspectorEntry,
   SessionConfigOption,
   StopReason,
@@ -57,6 +64,13 @@ export class Session {
   #events: SessionEvents;
   /** Resolvers for permission prompts the user hasn't answered yet. */
   #pendingPermissions = new Map<string, (optionId: string | null) => void>();
+  /**
+   * Resolvers for elicitations the user hasn't answered yet, keyed by request id.
+   *
+   * The request id and not the thread entry, because that is the one identity
+   * the replayed copy of a question and the re-asked one share.
+   */
+  #pendingElicitations = new Map<string, (response: acp.CreateElicitationResponse) => void>();
   /** Whether this socket rejoined an agent that was already running. */
   #resumed = false;
   /**
@@ -90,7 +104,23 @@ export class Session {
       })
       .onRequest(acp.methods.client.session.requestPermission, (ctx) =>
         this.#requestPermission(ctx.params),
-      );
+      )
+      .onRequest(acp.methods.client.elicitation.create, (ctx) =>
+        // `ctx.requestId` is the JSON-RPC id, not anything in the params. It is
+        // the one identity this question shares with the copy of it the server
+        // folded into the thread, which is what lets a reload show one form.
+        //
+        // A null id means a notification, which this is not — but the SDK types
+        // it as possible, and a question we could never answer is one to decline
+        // rather than to put in front of someone.
+        ctx.requestId == null
+          ? { action: "decline" }
+          : this.#createElicitation(ctx.params, ctx.requestId),
+      )
+      .onNotification(acp.methods.client.elicitation.complete, (ctx) => {
+        this.#record(ctx.params, acp.methods.client.elicitation.complete);
+        this.#completeElicitation(ctx.params.elicitationId);
+      });
 
     this.#registerExtensions(app);
 
@@ -206,13 +236,9 @@ export class Session {
         sessionId: this.#sessionId,
         prompt: [{ type: "text", text }],
       });
-      this.#update((thread) => ({
-        ...thread,
-        status: "idle",
-        stopReason: response.stopReason as StopReason,
-      }));
+      this.#update((thread) => this.#endTurn(thread, response.stopReason as StopReason));
     } catch (error) {
-      this.#update((thread) => ({ ...thread, status: "idle" }));
+      this.#update((thread) => this.#endTurn(thread, thread.stopReason));
       throw error;
     }
   }
@@ -265,12 +291,32 @@ export class Session {
     this.#update((thread) => clearPermission(thread, toolCallId));
   }
 
+  /** Answers an outstanding elicitation. */
+  answerElicitation(requestId: string | number, answer: ElicitationAnswer): void {
+    const key = String(requestId);
+    this.#pendingElicitations.get(key)?.(toElicitationResponse(answer));
+    this.#pendingElicitations.delete(key);
+    this.#update((thread) =>
+      settleElicitation(
+        thread,
+        requestId,
+        SETTLED[answer.action],
+        answer.action === "accept" ? answer.content : undefined,
+      ),
+    );
+  }
+
   /** Closes the connection. */
   close(): void {
     // Anything still waiting on a human will never be answered now; reject it
     // so the agent isn't left blocked on a dead socket.
     for (const resolve of this.#pendingPermissions.values()) resolve(null);
     this.#pendingPermissions.clear();
+    // An elicitation is cancelled rather than declined: nobody refused it, the
+    // socket simply went away, and `decline` would tell the agent the user said
+    // no to something they were never shown the end of.
+    for (const resolve of this.#pendingElicitations.values()) resolve({ action: "cancel" });
+    this.#pendingElicitations.clear();
     this.#connection?.close();
   }
 
@@ -308,6 +354,80 @@ export class Session {
   }
 
   /**
+   * Marks a turn finished, and gives up on what it was still asking.
+   *
+   * A form left on screen after the turn is over would collect an answer with
+   * nowhere to go: the agent has stopped listening. The server does the same to
+   * its own copy of the thread, so a reload agrees with what was on screen.
+   */
+  #endTurn(thread: Thread, stopReason: StopReason | undefined): Thread {
+    this.#pendingElicitations.clear();
+    return { ...cancelPendingElicitations(thread), status: "idle", stopReason };
+  }
+
+  /**
+   * Blocks the agent until the user answers a structured question.
+   *
+   * The same shape as `#requestPermission` — an unresolved promise is what
+   * "waiting for the user" means — with one difference: a mode this client
+   * cannot draw is declined immediately rather than waited on. The spec forbids
+   * rendering an unknown mode as if we understood it, and leaving the agent
+   * hanging on a form nobody can see would be worse than saying no.
+   */
+  #createElicitation(
+    params: acp.CreateElicitationRequest,
+    requestId: string | number,
+  ): Promise<acp.CreateElicitationResponse> {
+    this.#record(params, acp.methods.client.elicitation.create);
+
+    const mode = toElicitationMode(params);
+    if (!mode) return Promise.resolve({ action: "decline" });
+
+    this.#update((thread) =>
+      attachElicitation(thread, {
+        // Numbered by position, the way every other minted entry id is. A
+        // replayed copy of this question is renumbered the same way, so the two
+        // agree without either having to know about the other.
+        id: `elicitation-${thread.entries.length}`,
+        requestId,
+        message: params.message,
+        ...(toolCallOf(params) ? { toolCallId: toolCallOf(params)! } : {}),
+        ...mode,
+        state: "pending",
+      }),
+    );
+
+    return new Promise((resolve) => {
+      this.#pendingElicitations.set(String(requestId), resolve);
+    });
+  }
+
+  /**
+   * Finishes a URL-mode exchange the agent says is over.
+   *
+   * The request is still outstanding at this point — URL mode ends with this
+   * notification rather than with the user pressing anything — so it is answered
+   * here. `accept` is the honest reading: the agent would not be telling us it
+   * is finished unless it had what it needed.
+   */
+  #completeElicitation(elicitationId: string): void {
+    // Which request to answer is in the thread, on the entry this notification
+    // names — no second index to keep in step with it.
+    const asked = this.#thread.entries.find(
+      (entry) =>
+        entry.type === "elicitation" &&
+        entry.elicitation.mode.mode === "url" &&
+        entry.elicitation.mode.elicitationId === elicitationId,
+    );
+    if (asked?.type === "elicitation") {
+      const key = String(asked.elicitation.requestId);
+      this.#pendingElicitations.get(key)?.({ action: "accept" });
+      this.#pendingElicitations.delete(key);
+    }
+    this.#update((thread) => completeElicitation(thread, elicitationId));
+  }
+
+  /**
    * Registers the `_mjx/*` notifications.
    *
    * These carry what ACP has no vocabulary for, because it only arises when the
@@ -333,11 +453,7 @@ export class Session {
         // the response to `session/prompt`, and that response was owed to the
         // browser that sent it — so without this the thread would sit at
         // "generating" for a turn that finished minutes ago.
-        this.#update((thread) => ({
-          ...thread,
-          status: "idle",
-          stopReason: ctx.params.stopReason as StopReason,
-        }));
+        this.#update((thread) => this.#endTurn(thread, ctx.params.stopReason as StopReason));
       },
     );
 
@@ -405,6 +521,53 @@ export class Session {
       line: JSON.stringify({ jsonrpc: "2.0", method, params }),
     });
   }
+}
+
+/** What the user did with a form, in the shape the UI hands back. */
+export type ElicitationAnswer =
+  | { action: "accept"; content?: Record<string, ElicitationValue> }
+  | { action: "decline" }
+  | { action: "cancel" };
+
+/** The protocol's action, as the thread spells the state it leaves behind. */
+const SETTLED: Record<ElicitationAnswer["action"], ElicitationState> = {
+  accept: "accepted",
+  decline: "declined",
+  cancel: "cancelled",
+};
+
+function toElicitationResponse(answer: ElicitationAnswer): acp.CreateElicitationResponse {
+  return answer.action === "accept" && answer.content
+    ? { action: "accept", content: answer.content }
+    : { action: answer.action };
+}
+
+/**
+ * The tool call an elicitation names, if it names one.
+ *
+ * Only a session-scoped elicitation can: `toolCallId` lives on that scope, and
+ * the scope is flattened into the request, so it is absent rather than null on
+ * anything else.
+ */
+function toolCallOf(params: acp.CreateElicitationRequest): string | undefined {
+  const scoped = params as { toolCallId?: string | null };
+  return typeof scoped.toolCallId === "string" ? scoped.toolCallId : undefined;
+}
+
+/**
+ * The mode, or null if this client cannot draw it.
+ *
+ * Narrowed with the SDK's own guards rather than by reading `mode`: the union is
+ * flattened on the wire, and the guards are generated from the schema.
+ */
+function toElicitationMode(params: acp.CreateElicitationRequest): { mode: ElicitationMode } | null {
+  if (acp.CreateElicitationRequest.isForm(params)) {
+    return { mode: { mode: "form", requestedSchema: params.requestedSchema } };
+  }
+  if (acp.CreateElicitationRequest.isUrl(params)) {
+    return { mode: { mode: "url", elicitationId: params.elicitationId, url: params.url } };
+  }
+  return null;
 }
 
 /** A human-readable message for anything thrown. */
