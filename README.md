@@ -180,6 +180,13 @@ stream. For elicitations the Rust model writes
 `fixtures/session-elicitations.json` instead and the browser reads it back
 through its replay adapter, which pins the serialization the same way.
 
+`MentionUri` — what an `@`-mention points at — is ported twice for the same
+reason, and pinned the same way by `fixtures/mention-uris.json`. It is not a
+folding rule but a parser, and the place two ports of a URI parser drift is
+percent-encoding: Rust's `Url::set_path` and the WHATWG `pathname` setter do not
+escape the same set, so the browser builds its URIs by hand and the fixture
+holds the two to the same 49 answers.
+
 ## Agents
 
 Anything in the [ACP registry](https://agentclientprotocol.com/registry) that
@@ -265,7 +272,7 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 | `crates/mjx-mock-agent` | Scripted credential-free agent, for the demo and the tests |
 | `web/` | The browser client; `web/src/acp/` is protocol-only and React-free |
 | `demo/pristine/` | The demo's source project, copied to the ignored `demo/workspace/` |
-| `fixtures/` | The recorded turn, the elicitation shapes, and a registry snapshot |
+| `fixtures/` | The recorded turn, the mention URIs, the elicitation shapes, and a registry snapshot |
 | `reference/` | Where the local-only Zed copy goes. Git-ignored. |
 
 ## Known limitations
@@ -289,7 +296,22 @@ browser is strict, and real bugs have only ever shown up in Chromium.
   comes from `session/list`; an agent that does not keep conversations has none,
   and the drawer is not offered at all. `additionalDirectories` on a load or a
   fork is not sent, and pagination is a "load more" rather than infinite scroll.
-- **No MCP passthrough and no `@`-mentions** yet.
+- **Only three kinds of mention can be *made*.** `@` offers a file, a directory
+  or a URL — everything the browser has a source for. The other ten `MentionUri`
+  variants (a symbol, a selection, a diagnostic set…) parse and render, because
+  an agent may send one, but nothing here makes one: that needs an editor.
+- **A mention chip is not clickable.** Clicking it should open the file it
+  names, and there is no editor here to open it in.
+- **A mention is always a `resource_link`, never embedded content**, even when
+  the agent advertises `embeddedContext`. The browser cannot read a file to
+  embed it; the server could, but that would be a fourth interception and it
+  needs its own reason written down.
+- **The composer shows the raw `[@name](uri)` while you type.** The text is the
+  model, the way Zed's is; the sent message shows a chip.
+- **The file picker is not `.gitignore`-aware** and is capped at 500 entries. A
+  `.env` under a workspace root is offered by name. See
+  [SECURITY.md](SECURITY.md).
+- **No MCP passthrough** yet.
 - **No authentication.** See below.
 
 ## Security

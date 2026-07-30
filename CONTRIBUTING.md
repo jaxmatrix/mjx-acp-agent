@@ -24,7 +24,10 @@ the merely-working one.
    thread models fold it and assert the same numbers
    (`crates/mjx-acp-thread/tests/fixture.rs` and `web/src/acp/fixture.test.ts`). This is what stops
    the Rust and TypeScript implementations drifting apart silently. **If you change the folding
-   rules, the same assertion must move on both sides.**
+   rules, the same assertion must move on both sides.** `fixtures/mention-uris.json` is the second
+   such pin, for the two `MentionUri` ports (`crates/mjx-acp-thread/tests/mention_uris.rs` and
+   `web/src/acp/mention.test.ts`); both readers assert the case count, so a case added on one side
+   and not read by the other fails rather than passing quietly.
 3. **End-to-end** — `crates/mjx-acp-server/tests/relay.rs` starts the real server on a real port,
    connects a real WebSocket, and drives the real mock agent through a real PTY. It is the only
    thing that proves the premise: that ACP survives being carried over a WebSocket without either

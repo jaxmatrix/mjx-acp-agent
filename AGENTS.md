@@ -52,7 +52,9 @@ ACP *client* role                   relay + capability host        claude-acp / 
   looking at, because the relay's recorded `session/new` cannot know.
 - **Two thread models, held together by a fixture.** `crates/mjx-acp-thread` (Rust, server) and
   `web/src/acp/thread.ts` (TypeScript, browser) implement the same folding rules. Change one and you
-  change both, then re-run `fixtures/session-updates.jsonl` through each.
+  change both, then re-run `fixtures/session-updates.jsonl` through each. `MentionUri` is ported
+  twice for the same reason and pinned by `fixtures/mention-uris.json` — the two will disagree on
+  percent-encoding if nothing is watching.
 - **Test-driven & incremental** — write the failing test first; keep every increment green.
 - **Atomic commits, no `Co-Authored-By`/AI-attribution trailers.**
 - **Do the work thoroughly and correctly — no monkey-patching.** Decide the design before coding.
