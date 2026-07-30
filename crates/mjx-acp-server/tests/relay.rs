@@ -1153,6 +1153,90 @@ async fn a_cancelled_turn_stops_offering_the_question_it_asked() {
 }
 
 #[tokio::test]
+async fn a_resource_link_survives_the_relay_and_the_replay() {
+    // A mention travels as a resource_link, and every hop is somewhere it could
+    // be flattened to its text: the relay's thread, the agent's transcript, and
+    // the replay a reloaded browser is given back.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session(&mut first).await;
+    let link = server.workspace_file("stats.js");
+    let uri = format!("file://{}", link.display());
+
+    first
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [
+                    { "type": "text", "text": "fix the median bug in " },
+                    { "type": "resource_link", "uri": uri, "name": "stats.js" }
+                ]
+            }),
+        )
+        .await;
+    drop(first);
+
+    // The socket is gone; the agent is not. What comes back has to be the same
+    // conversation, mention and all.
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake(&mut second).await;
+    assert_eq!(info["resumed"], true);
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+
+    let users: Vec<&Value> = thread["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["type"] == "user")
+        .collect();
+    assert_eq!(users.len(), 1, "the prompt was duplicated: {thread}");
+
+    let content = users[0]["content"].as_array().unwrap();
+    let link = content
+        .iter()
+        .find(|block| block["type"] == "resource_link")
+        .unwrap_or_else(|| panic!("the mention was flattened away: {thread}"));
+    assert_eq!(link["uri"], uri);
+
+    // And again through the agent's own transcript, which is a second copy of
+    // the same conversation and a second chance to lose the mention. The agent
+    // annotates the link it replays; the fold has to know it for the same
+    // block all the same.
+    second
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": session_id, "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    let replayed = thread["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["type"] == "user")
+        .flat_map(|entry| entry["content"].as_array().unwrap())
+        .find(|block| block["type"] == "resource_link")
+        .unwrap_or_else(|| panic!("the loaded conversation lost the mention: {thread}"));
+    assert_eq!(replayed["uri"], uri);
+    assert_eq!(replayed["mimeType"], "text/javascript");
+
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn a_second_tab_takes_the_connection_over_and_tells_the_first() {
     // Take-over rather than refusal, deliberately: on a reload the new socket
     // can arrive before the old one's close has been processed, so refusing the
