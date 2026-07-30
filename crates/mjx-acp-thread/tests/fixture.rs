@@ -59,6 +59,7 @@ fn the_recorded_turn_folds_to_a_stable_shape() {
             Entry::User(_) => "user",
             Entry::Assistant(_) => "assistant",
             Entry::ToolCall(_) => "toolCall",
+            Entry::Elicitation(_) => "elicitation",
         })
         .collect();
     assert_eq!(
