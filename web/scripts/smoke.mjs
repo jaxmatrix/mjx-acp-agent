@@ -114,12 +114,20 @@ const result = await client.connectWith(stream, async (agent) => {
     mcpServers: [],
   });
 
+  // Config options, before the turn: switching the model has to work on a
+  // session that has done nothing yet, which is when a user actually picks one.
+  const setConfig = await agent.request(acp.methods.agent.session.setConfigOption, {
+    sessionId: session.sessionId,
+    configId: "model",
+    value: "mock-haiku",
+  });
+
   const response = await agent.request(acp.methods.agent.session.prompt, {
     sessionId: session.sessionId,
     prompt: [{ type: "text", text: "fix the median bug in stats.js" }],
   });
 
-  return { initialized, info, response };
+  return { initialized, info, session, setConfig, response };
 });
 
 const kinds = seen.updates.map((u) => u.sessionUpdate);
@@ -134,6 +142,24 @@ for (const required of [
 }
 
 check(result.response.stopReason === "end_turn", `stopReason was ${result.response.stopReason}`);
+
+// Session config options: advertised, settable, and pushed when the agent
+// changes one itself.
+const currentModel = (options) => options?.find((o) => o.id === "model")?.currentValue;
+check(
+  currentModel(result.session.configOptions) === "mock-sonnet",
+  "session/new advertised no model option",
+);
+check(
+  currentModel(result.setConfig.configOptions) === "mock-haiku",
+  "session/set_config_option did not come back with the new model",
+);
+const configUpdate = seen.updates.findLast((u) => u.sessionUpdate === "config_option_update");
+check(configUpdate != null, "the agent's own model change was never announced");
+check(
+  currentModel(configUpdate?.configOptions) === "mock-opus",
+  "the announced model was not the one the agent switched to",
+);
 check(seen.permissionAsked, "the agent never asked for permission");
 
 // A diff with real before/after text proves the server read the file for us.
