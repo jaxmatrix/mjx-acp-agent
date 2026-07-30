@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 mod agent_process;
 mod config;
 mod id_bridge;
+#[allow(dead_code, reason = "the relay calls into this in the next commit")]
+mod mcp;
 mod relay;
 mod sessions;
 mod workspace_interceptor;
