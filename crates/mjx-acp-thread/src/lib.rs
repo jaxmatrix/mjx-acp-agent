@@ -21,9 +21,11 @@ use mjx_acp_core::{RequestId, acp};
 use serde::{Deserialize, Serialize};
 
 mod fold;
+pub mod mention;
 pub mod paths;
 
 pub use fold::ThreadEvent;
+pub use mention::MentionUri;
 
 /// One item in the timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
