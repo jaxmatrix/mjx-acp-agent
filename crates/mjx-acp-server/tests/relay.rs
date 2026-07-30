@@ -338,6 +338,12 @@ impl Client {
                         &json!({ "outcome": { "outcome": "selected", "optionId": "allow_once" } }),
                     )
                     .unwrap(),
+                    m if m == method::client::ELICITATION_CREATE => Frame::result(
+                        id,
+                        &json!({ "action": "accept",
+                                 "content": { "branch": "fix/median", "remote": "origin" } }),
+                    )
+                    .unwrap(),
                     _ => Frame::error(id, mjx_acp_core::JsonRpcError::method_not_found(&method)),
                 };
                 self.send(&reply).await;
@@ -364,16 +370,48 @@ impl Client {
 
     /// Pumps until the agent asks `method`, and leaves it deliberately
     /// unanswered — which is what parks a turn mid-flight.
-    async fn wait_for_client_request(&mut self, method: &str) {
+    ///
+    /// Returns the params it was asked with.
+    async fn wait_for_client_request(&mut self, method: &str) -> Value {
         loop {
             match self.next_frame().await {
-                Frame::Request { method: asked, .. } if asked == method => {
+                Frame::Request {
+                    method: asked,
+                    params,
+                    ..
+                } if asked == method => {
                     self.client_requests.push(asked);
-                    return;
+                    return params
+                        .as_deref()
+                        .and_then(|p| serde_json::from_str(p.get()).ok())
+                        .unwrap_or(Value::Null);
                 }
                 other => self.handle(other).await,
             }
         }
+    }
+
+    /// Pumps until a response to `id` arrives, answering what the agent asks.
+    async fn wait_for_response(&mut self, id: &RequestId) -> Value {
+        loop {
+            match self.next_frame().await {
+                Frame::Response {
+                    id: ref got,
+                    ref payload,
+                } if got == id => {
+                    return match payload {
+                        ResponsePayload::Result(r) => serde_json::from_str(r.get()).unwrap(),
+                        ResponsePayload::Error(e) => panic!("failed: {}", e.message),
+                    };
+                }
+                other => self.handle(other).await,
+            }
+        }
+    }
+
+    async fn notify(&mut self, method: &str, params: Value) {
+        self.send(&Frame::notification(method, &params).unwrap())
+            .await;
     }
 
     /// Reads until the server closes the socket.
@@ -434,19 +472,32 @@ impl Client {
 /// `_mjx/agent/info` until the handshake completes, because a conformant ACP
 /// client discards anything arriving before it.
 async fn handshake(client: &mut Client) -> Value {
+    // The browser declares nothing: it has no filesystem and cannot spawn a
+    // process. The server adds those on its behalf.
+    handshake_declaring(client, json!({})).await
+}
+
+/// The same, with the client declaring exactly `capabilities`.
+async fn handshake_declaring(client: &mut Client, capabilities: Value) -> Value {
     let init = client
         .request(
             method::agent::INITIALIZE,
             json!({
                 "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
-                // The browser declares nothing: it has no filesystem and cannot
-                // spawn a process. The server adds those on its behalf.
-                "clientCapabilities": {}
+                "clientCapabilities": capabilities
             }),
         )
         .await;
     serde_json::from_value::<acp::InitializeResponse>(init).expect("valid InitializeResponse");
     client.wait_for_ext(ext::AGENT_INFO).await
+}
+
+/// What a client that can render an elicitation declares.
+///
+/// `{}` and not `true`: the schema types these as objects and reads anything
+/// else as absent, so `true` would turn the feature off without saying so.
+fn elicitable() -> Value {
+    json!({ "elicitation": { "form": {}, "url": {} } })
 }
 
 #[tokio::test]
@@ -749,7 +800,12 @@ async fn the_server_can_replay_the_thread_it_watched() {
 
 /// Handshakes, opens a session, and returns `(connection id, session id)`.
 async fn open_session(client: &mut Client) -> (String, String) {
-    let info = handshake(client).await;
+    open_session_declaring(client, json!({})).await
+}
+
+/// The same, with the client declaring exactly `capabilities`.
+async fn open_session_declaring(client: &mut Client, capabilities: Value) -> (String, String) {
+    let info = handshake_declaring(client, capabilities).await;
     let session = client
         .request(
             method::agent::SESSION_NEW,
@@ -783,7 +839,7 @@ async fn a_reload_mid_turn_rejoins_the_agent_and_its_conversation() {
         .await;
     // Park the turn: the agent asks permission and blocks until someone
     // answers, which is exactly the moment a person reaches for reload.
-    first
+    let _asked = first
         .wait_for_client_request(method::client::SESSION_REQUEST_PERMISSION)
         .await;
     drop(first);
@@ -884,6 +940,163 @@ async fn a_question_answered_before_the_reload_is_not_asked_again() {
     assert!(
         second.client_requests.is_empty(),
         "asked again for something already answered: {:?}",
+        second.client_requests
+    );
+
+    server.stop().await;
+}
+
+/// The pending elicitation in a replayed thread, if there is one.
+fn pending_elicitation(thread: &Value) -> Option<&Value> {
+    thread["entries"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["type"] == "elicitation")
+}
+
+#[tokio::test]
+async fn a_reload_gets_the_open_form_from_the_thread_and_from_the_socket() {
+    // Both, and neither alone would do. The replay is what carries the question
+    // and its answer as part of the conversation; the re-ask is what makes it
+    // answerable, because a browser cannot respond to a request the connection
+    // it is holding never received. The browser matches them by request id.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session_declaring(&mut first, elicitable()).await;
+
+    first
+        .start_request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    let asked = first
+        .wait_for_client_request(method::client::ELICITATION_CREATE)
+        .await;
+    assert_eq!(asked["mode"], "form");
+    drop(first);
+
+    // The reload.
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake_declaring(&mut second, elicitable()).await;
+    assert_eq!(info["resumed"], true, "started a new agent instead: {info}");
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    let open = pending_elicitation(&thread).expect("the open form was not in the replay");
+    assert_eq!(open["state"], "pending");
+    assert_eq!(open["mode"], "form");
+    assert_eq!(open["toolCallId"], "call_edit");
+    assert!(open["requestedSchema"]["properties"]["branch"].is_object());
+
+    // And it is asked again, with the same id the thread carries — that pairing
+    // is what lets the browser show one form rather than two.
+    let reasked = second
+        .wait_for_client_request(method::client::ELICITATION_CREATE)
+        .await;
+    assert_eq!(reasked["mode"], "form");
+
+    let id = RequestId::Number(open["requestId"].as_i64().expect("no request id"));
+    second
+        .send(
+            &Frame::result(
+                id,
+                &json!({ "action": "accept",
+                         "content": { "branch": "fix/median", "remote": "upstream" } }),
+            )
+            .unwrap(),
+        )
+        .await;
+
+    let ended = second.wait_for_ext(ext::SESSION_TURN_ENDED).await;
+    assert_eq!(ended["stopReason"], "end_turn", "the turn did not finish");
+
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    let answered = pending_elicitation(&thread).expect("the form vanished from the thread");
+    assert_eq!(answered["state"], "accepted");
+    assert_eq!(answered["content"]["remote"], "upstream");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_cancelled_turn_stops_offering_the_question_it_asked() {
+    // Nobody is going to answer a question whose turn is over. Left pending it
+    // would be offered to every browser that ever attaches, and a replayed
+    // thread would show a live form with nowhere to send the answer.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session_declaring(&mut first, elicitable()).await;
+
+    let prompt = first
+        .start_request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    first
+        .wait_for_client_request(method::client::ELICITATION_CREATE)
+        .await;
+
+    // Cancel with the form still open. A real agent gives up on the question
+    // rather than waiting on an answer nobody is going to give.
+    first
+        .notify(
+            method::agent::SESSION_CANCEL,
+            json!({ "sessionId": session_id }),
+        )
+        .await;
+    let response = first.wait_for_response(&prompt).await;
+    assert_eq!(response["stopReason"], "cancelled");
+
+    let thread = first
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    assert_eq!(
+        pending_elicitation(&thread).expect("the form left the thread")["state"],
+        "cancelled"
+    );
+    drop(first);
+
+    // And the next browser is not asked it either.
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake_declaring(&mut second, elicitable()).await;
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+
+    assert_eq!(
+        pending_elicitation(&thread).expect("the form left the thread")["state"],
+        "cancelled"
+    );
+    assert!(
+        second.client_requests.is_empty(),
+        "a dead turn's questions were put to a new browser: {:?}",
         second.client_requests
     );
 

@@ -4,7 +4,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { resumeStore } from "./acp/resume";
 import { Session, type SessionStatus } from "./acp/session";
-import { emptyThread, type AgentInfo, type InspectorEntry, type Thread } from "./acp/types";
+import {
+  emptyThread,
+  type AgentInfo,
+  type ElicitationAnswer,
+  type InspectorEntry,
+  type Thread,
+} from "./acp/types";
 
 /** Everything a connected view needs. */
 export interface SessionState {
@@ -17,6 +23,7 @@ export interface SessionState {
   setMode(modeId: string): void;
   setConfigOption(configId: string, value: string | boolean): void;
   answerPermission(toolCallId: string, optionId: string | null): void;
+  answerElicitation(requestId: string | number, answer: ElicitationAnswer): void;
   /** Opens a new socket to the same agent, taking it back from another tab. */
   reconnect(): void;
   error?: string;
@@ -113,6 +120,13 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     session.current?.answerPermission(toolCallId, optionId);
   }, []);
 
+  const answerElicitation = useCallback(
+    (requestId: string | number, answer: ElicitationAnswer) => {
+      session.current?.answerElicitation(requestId, answer);
+    },
+    [],
+  );
+
   const reconnect = useCallback(() => setAttempt((n) => n + 1), []);
 
   return {
@@ -125,6 +139,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     setMode,
     setConfigOption,
     answerPermission,
+    answerElicitation,
     reconnect,
     error,
   };

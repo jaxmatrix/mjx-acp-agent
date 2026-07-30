@@ -35,8 +35,9 @@ Builds both halves, starts the server on <http://localhost:4321>, and opens it.
 Needs no credentials and no network.
 
 Pick **Mock Agent** and ask it anything. It scripts a full turn — a thought
-block, streaming text, a file read, a plan, a diff, a permission request, and a
-live terminal — so every UI surface is exercised out of the box. It genuinely
+block, streaming text, a file read, a plan, a diff, a permission request, a live
+terminal, and a form to fill in — so every UI surface is exercised out of the
+box. It genuinely
 reads and rewrites `demo/workspace/stats.js` and genuinely runs `node --test`
 against it, so the green test run at the end is real, not staged.
 
@@ -102,6 +103,12 @@ Three consequences worth knowing:
   socket can arrive before the old one's close has been processed, so refusing
   would make an ordinary refresh fail. The displaced tab is told, and offers to
   take it back.
+- **An open form comes back twice, and lands once.** A pending
+  `elicitation/create` is both carried in the replayed thread and re-asked over
+  the new socket. Neither alone works: the thread is what makes the question and
+  its answer part of the conversation, and the re-ask is what makes it
+  answerable, since a browser cannot respond to a request the connection it is
+  holding never received. The browser matches them by JSON-RPC id.
 - **Anything the handshake announced is announced as of when it started.**
   Session modes and config options — the model selector among them — arrive on
   the `session/new` response, and after a reload that response is a recording.
@@ -123,6 +130,12 @@ which fields a partial update may overwrite — so both are folded through the
 same recorded turn, `fixtures/session-updates.jsonl`, and asserted against the
 same numbers. Two implementations of the same rules are only worth having if
 something notices when they disagree.
+
+Two entry kinds cannot be covered that way, because they arrive as *requests*
+rather than as updates and so can never appear in a recorded notification
+stream. For elicitations the Rust model writes
+`fixtures/session-elicitations.json` instead and the browser reads it back
+through its replay adapter, which pins the serialization the same way.
 
 ## Agents
 
@@ -209,7 +222,7 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 | `crates/mjx-mock-agent` | Scripted credential-free agent, for the demo and the tests |
 | `web/` | The browser client; `web/src/acp/` is protocol-only and React-free |
 | `demo/pristine/` | The demo's source project, copied to the ignored `demo/workspace/` |
-| `fixtures/` | The recorded turn and a registry snapshot |
+| `fixtures/` | The recorded turn, the elicitation shapes, and a registry snapshot |
 | `reference/` | Where the local-only Zed copy goes. Git-ignored. |
 
 ## Known limitations
@@ -226,7 +239,10 @@ browser is strict, and real bugs have only ever shown up in Chromium.
   terminal the agent started, so neither does this.
 - **Binary-only registry agents are not installed for you.** Roughly fifteen
   publish no `npx`/`uvx` distribution; they are listed with an explanation.
-- **No elicitation, no MCP passthrough, no `@`-mentions** yet.
+- **A form's half-filled answer does not survive a reload.** The question and
+  what was finally answered do — they are part of the thread — but text typed
+  into a form and not yet sent is browser-local and goes with the page.
+- **No MCP passthrough and no `@`-mentions** yet.
 - **No authentication.** See below.
 
 ## Security

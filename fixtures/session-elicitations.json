@@ -1,0 +1,85 @@
+{
+  "entries": [
+    {
+      "type": "elicitation",
+      "id": "elicitation-1",
+      "requestId": 7,
+      "message": "How should I record this fix?",
+      "toolCallId": "call_edit",
+      "mode": "form",
+      "requestedSchema": {
+        "type": "object",
+        "title": "Record the fix",
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "title": "Retries",
+            "minimum": 0
+          },
+          "branch": {
+            "type": "string",
+            "title": "Branch",
+            "default": "fix/median"
+          },
+          "remote": {
+            "type": "string",
+            "title": "Remote",
+            "oneOf": [
+              {
+                "const": "origin",
+                "title": "origin"
+              }
+            ]
+          },
+          "reviewers": {
+            "type": "array",
+            "title": "Reviewers",
+            "maxItems": 2,
+            "items": {
+              "anyOf": [
+                {
+                  "const": "ana",
+                  "title": "Ana"
+                }
+              ]
+            }
+          },
+          "squash": {
+            "type": "boolean",
+            "title": "Squash",
+            "default": true
+          },
+          "timeout": {
+            "type": "number",
+            "title": "Timeout",
+            "minimum": 0.5
+          }
+        },
+        "required": [
+          "branch",
+          "remote"
+        ]
+      },
+      "state": "accepted",
+      "content": {
+        "attempts": 2,
+        "branch": "fix/median",
+        "reviewers": [
+          "ana"
+        ],
+        "squash": true
+      }
+    },
+    {
+      "type": "elicitation",
+      "id": "elicitation-2",
+      "requestId": "a",
+      "message": "Read the spec, then come back.",
+      "mode": "url",
+      "elicitationId": "el-1",
+      "url": "https://agentclientprotocol.com/protocol/elicitation",
+      "state": "pending"
+    }
+  ],
+  "status": "idle"
+}

@@ -66,4 +66,9 @@
 {"content":{"text":"is ","type":"text"},"sessionUpdate":"agent_message_chunk"}
 {"content":{"text":"in ","type":"text"},"sessionUpdate":"agent_message_chunk"}
 {"content":{"text":"place.","type":"text"},"sessionUpdate":"agent_message_chunk"}
+{"content":{"text":"\n","type":"text"},"sessionUpdate":"agent_message_chunk"}
+{"content":{"text":"\n","type":"text"},"sessionUpdate":"agent_message_chunk"}
+{"content":{"text":"Pushing ","type":"text"},"sessionUpdate":"agent_message_chunk"}
+{"content":{"text":"to ","type":"text"},"sessionUpdate":"agent_message_chunk"}
+{"content":{"text":"`origin/fix/median`.","type":"text"},"sessionUpdate":"agent_message_chunk"}
 {"used":4812,"size":200000,"cost":{"amount":0.0143,"currency":"USD"},"sessionUpdate":"usage_update"}

@@ -34,6 +34,13 @@ ACP *client* role                   relay + capability host        claude-acp / 
   precisely the bug that resuming exists to fix. Adding a fourth needs a reason written down.
 - **`_mjx/*` is ours, and never reaches an agent.** It carries what ACP has no vocabulary for
   because it only arises when the client is remote. Defined once in `mjx-acp-core::ext`.
+- **One request kind is thread state: an elicitation.** Everything else the agent
+  asks the browser — a permission prompt, `fs/*`, `terminal/*` — is a request in
+  flight and nothing more. A structured question and its answer are part of the
+  conversation, so both thread models hold them and a replay carries them. A
+  pending one is *also* re-asked over the socket, because a browser cannot
+  respond to a request the connection it is holding never received; the two are
+  matched by JSON-RPC id.
 - **Two thread models, held together by a fixture.** `crates/mjx-acp-thread` (Rust, server) and
   `web/src/acp/thread.ts` (TypeScript, browser) implement the same folding rules. Change one and you
   change both, then re-run `fixtures/session-updates.jsonl` through each.

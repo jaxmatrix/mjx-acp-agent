@@ -1,18 +1,23 @@
 import { describe, expect, test } from "vitest";
-import type { SessionNotification } from "@agentclientprotocol/sdk";
+import type { ElicitationSchema, SessionNotification } from "@agentclientprotocol/sdk";
 
 import {
   addTerminal,
   appendTerminalOutput,
   appendUserPrompt,
   applyUpdate,
+  attachElicitation,
   attachPermission,
+  cancelPendingElicitations,
   clearPermission,
+  completeElicitation,
   setTerminalExit,
+  settleElicitation,
 } from "./thread";
 import {
   chunkText,
   emptyThread,
+  type Elicitation,
   type Entry,
   type SessionConfigOption,
   type Thread,
@@ -299,6 +304,101 @@ describe("permission prompts", () => {
     let thread = attachPermission(emptyThread(), "t1", { requestId: "t1", options: [] }, "X");
     thread = clearPermission(thread, "t1");
     expect(onlyToolCall(thread).awaitingPermission).toBeUndefined();
+  });
+});
+
+const BRANCH_SCHEMA: ElicitationSchema = {
+  type: "object",
+  properties: { branch: { type: "string", title: "Branch" } },
+  required: ["branch"],
+};
+
+describe("elicitations", () => {
+  /** A pending form, as the reducer takes one. */
+  function form(requestId: string | number, id = "elicitation-0"): Elicitation {
+    return {
+      id,
+      requestId,
+      message: "Which branch?",
+      toolCallId: "t1",
+      mode: { mode: "form", requestedSchema: BRANCH_SCHEMA },
+      state: "pending",
+    };
+  }
+
+  function onlyElicitation(thread: Thread): Elicitation {
+    const entry = thread.entries.find((e) => e.type === "elicitation");
+    if (entry?.type !== "elicitation") throw new Error("no elicitation entry");
+    return entry.elicitation;
+  }
+
+  test("a question becomes a timeline entry of its own", () => {
+    // Its own entry, not a field on a tool call: an elicitation need not belong
+    // to one, so a single render path means the timeline rather than the card.
+    const thread = attachElicitation(emptyThread(), form(7));
+
+    expect(thread.entries).toHaveLength(1);
+    expect(onlyElicitation(thread).state).toBe("pending");
+  });
+
+  test("the same question arriving twice is one entry", () => {
+    // After a reload it does arrive twice: once inside the replayed thread, and
+    // once re-asked over the new socket, because a response has to belong to a
+    // request this connection received. The request id is what pairs them.
+    let thread = attachElicitation(emptyThread(), form(7, "elicitation-0"));
+    thread = attachElicitation(thread, form(7, "elicitation-9"));
+
+    expect(thread.entries).toHaveLength(1);
+    // The first id wins, so React sees the same element rather than a new one.
+    expect(onlyElicitation(thread).id).toBe("elicitation-0");
+  });
+
+  test("two different questions are two entries", () => {
+    let thread = attachElicitation(emptyThread(), form(7));
+    thread = attachElicitation(thread, form(8, "elicitation-1"));
+    expect(thread.entries).toHaveLength(2);
+  });
+
+  test("answering settles the entry in place and keeps what was submitted", () => {
+    let thread = attachElicitation(emptyThread(), form(7));
+    thread = settleElicitation(thread, 7, "accepted", { branch: "main" });
+
+    expect(thread.entries).toHaveLength(1);
+    expect(onlyElicitation(thread).state).toBe("accepted");
+    expect(onlyElicitation(thread).content).toEqual({ branch: "main" });
+  });
+
+  test("a url question is finished by the notification, not by an answer", () => {
+    const url: Elicitation = {
+      id: "elicitation-0",
+      requestId: 3,
+      message: "Authorize, then come back.",
+      mode: { mode: "url", elicitationId: "el-1", url: "https://example.test/" },
+      state: "pending",
+    };
+    const thread = completeElicitation(attachElicitation(emptyThread(), url), "el-1");
+    expect(onlyElicitation(thread).state).toBe("accepted");
+  });
+
+  test("a turn ending gives up on what is still open, but not on an answer", () => {
+    let thread = attachElicitation(emptyThread(), form(7));
+    thread = attachElicitation(thread, form(8, "elicitation-1"));
+    thread = settleElicitation(thread, 7, "declined");
+    thread = cancelPendingElicitations(thread);
+
+    const states = thread.entries.map((entry) =>
+      entry.type === "elicitation" ? entry.elicitation.state : null,
+    );
+    expect(states).toEqual(["declined", "cancelled"]);
+  });
+
+  test("settling something already settled changes nothing at all", () => {
+    // Identity, not just value: React re-renders on it, so a no-op that returns
+    // a new thread redraws the whole timeline for nothing.
+    const thread = settleElicitation(attachElicitation(emptyThread(), form(7)), 7, "accepted");
+    expect(settleElicitation(thread, 7, "declined")).toBe(thread);
+    expect(cancelPendingElicitations(thread)).toBe(thread);
+    expect(completeElicitation(thread, "nobody")).toBe(thread);
   });
 });
 

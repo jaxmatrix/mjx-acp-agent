@@ -10,7 +10,14 @@ import { describe, expect, test } from "vitest";
 
 import { threadFromReplay } from "./replay";
 import { appendUserPrompt } from "./thread";
-import type { Thread } from "./types";
+import type { Elicitation, Thread } from "./types";
+
+/** The elicitation a replayed thread's first entry holds. */
+function firstElicitation(thread: Thread): Elicitation {
+  const entry = thread.entries[0];
+  if (entry?.type !== "elicitation") throw new Error(`not an elicitation: ${entry?.type}`);
+  return entry.elicitation;
+}
 
 describe("a replayed thread", () => {
   test("an unknown session is nothing, not an empty thread", () => {
@@ -155,5 +162,77 @@ describe("a replayed thread", () => {
   test("a stop reason we do not model is dropped rather than shown", () => {
     expect(threadFromReplay({ entries: [], stopReason: "end_turn" })!.stopReason).toBe("end_turn");
     expect(threadFromReplay({ entries: [], stopReason: "who_knows" })!.stopReason).toBeUndefined();
+  });
+
+  test("an elicitation comes back with everything needed to redraw the form", () => {
+    // The mode fields are flat on the wire, alongside `mode`, the same way the
+    // request itself carries them.
+    const thread = threadFromReplay({
+      entries: [
+        {
+          type: "elicitation",
+          id: "elicitation-1",
+          requestId: 7,
+          message: "Which branch?",
+          toolCallId: "call_edit",
+          mode: "form",
+          requestedSchema: { type: "object", properties: { branch: { type: "string" } } },
+          state: "accepted",
+          content: { branch: "main" },
+        },
+      ],
+    })!;
+
+    const asked = firstElicitation(thread);
+    expect(asked.requestId).toBe(7);
+    expect(asked.state).toBe("accepted");
+    expect(asked.content).toEqual({ branch: "main" });
+    expect(asked.mode).toEqual({
+      mode: "form",
+      requestedSchema: { type: "object", properties: { branch: { type: "string" } } },
+    });
+  });
+
+  test("a url elicitation keeps the id the completion notification names", () => {
+    const thread = threadFromReplay({
+      entries: [
+        {
+          type: "elicitation",
+          id: "elicitation-1",
+          requestId: "a",
+          message: "Authorize.",
+          mode: "url",
+          elicitationId: "el-1",
+          url: "https://example.test/",
+          state: "pending",
+        },
+      ],
+    })!;
+
+    expect(firstElicitation(thread).mode).toEqual({
+      mode: "url",
+      elicitationId: "el-1",
+      url: "https://example.test/",
+    });
+  });
+
+  test("an elicitation we cannot read is dropped rather than half-drawn", () => {
+    // Rendering a form whose schema we misread would collect an answer against
+    // the wrong fields, and one whose request id we misread could not be
+    // answered at all.
+    const thread = threadFromReplay({
+      entries: [
+        { type: "elicitation", id: "e1", requestId: 1, message: "no mode", state: "pending" },
+        { type: "elicitation", id: "e2", message: "no request id", mode: "form",
+          requestedSchema: {}, state: "pending" },
+        { type: "elicitation", id: "e3", requestId: 3, message: "ok", mode: "form",
+          requestedSchema: {}, state: "who_knows" },
+      ],
+    })!;
+
+    expect(thread.entries).toHaveLength(1);
+    // A state we do not model is read as pending: still open is the reading that
+    // shows the user a form rather than silently swallowing the question.
+    expect(firstElicitation(thread).state).toBe("pending");
   });
 });

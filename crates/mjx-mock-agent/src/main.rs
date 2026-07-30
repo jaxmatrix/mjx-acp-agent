@@ -59,6 +59,14 @@ pub struct Agent {
     /// are kept: what is *offered* is fixed, and [`config_options`] rebuilds
     /// the advertised set from these so the two cannot drift.
     config: Mutex<HashMap<String, HashMap<String, Value>>>,
+    /// Whether the client said it can render a form, from `initialize`.
+    ///
+    /// A conformant agent asks only for what the client offered: an elicitation
+    /// sent to a client that declared none comes straight back as an error, and
+    /// the user is left looking at a turn that failed for no visible reason.
+    elicitation_form: AtomicBool,
+    /// Whether the client said it can send the user to a URL.
+    elicitation_url: AtomicBool,
 }
 
 impl Agent {
@@ -94,6 +102,48 @@ impl Agent {
 
         rx.await
             .unwrap_or_else(|_| Err(JsonRpcError::internal("connection closed")))
+    }
+
+    /// Calls a client method, giving up if the turn is cancelled first.
+    ///
+    /// `None` means it gave up. A real agent stops waiting on a question the
+    /// user has walked away from; without this a `session/cancel` would have no
+    /// effect until somebody answered a form nobody cares about any more.
+    ///
+    /// The abandoned entry stays in `pending` until the process exits. That is a
+    /// leak, and a deliberate one: this is a fixture with a lifetime measured in
+    /// seconds, and reaping it would need the request future to own its own
+    /// cleanup for no benefit anyone can observe.
+    pub async fn request_until_cancelled(
+        &self,
+        session_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Option<Reply> {
+        tokio::select! {
+            reply = self.request(method, params) => Some(reply),
+            () = self.until_cancelled(session_id) => None,
+        }
+    }
+
+    /// Resolves once this session's turn has been cancelled.
+    ///
+    /// Polled rather than signalled: cancellation is already an `AtomicBool` the
+    /// script checks between steps, and one waiter does not earn a channel.
+    async fn until_cancelled(&self, session_id: &str) {
+        while !self.is_cancelled(session_id).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Whether the client can render a form we ask it to.
+    pub fn can_elicit_form(&self) -> bool {
+        self.elicitation_form.load(Ordering::Relaxed)
+    }
+
+    /// Whether the client can send the user to a URL for us.
+    pub fn can_elicit_url(&self) -> bool {
+        self.elicitation_url.load(Ordering::Relaxed)
     }
 
     /// Whether the given session's turn has been cancelled.
@@ -164,6 +214,8 @@ async fn main() -> Result<()> {
         pending: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashMap::new()),
         config: Mutex::new(HashMap::new()),
+        elicitation_form: AtomicBool::new(false),
+        elicitation_url: AtomicBool::new(false),
     });
 
     // A single writer task owns stdout, so concurrent handlers can't interleave
@@ -241,17 +293,35 @@ async fn dispatch(agent: Arc<Agent>, frame: Frame) {
 async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value, JsonRpcError> {
     use mjx_acp_core::method::agent as m;
     match method {
-        m::INITIALIZE => Ok(json!({
-            "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
-            "agentInfo": { "name": "mjx-mock-agent", "version": env!("CARGO_PKG_VERSION") },
-            "agentCapabilities": {
-                "loadSession": false,
-                "promptCapabilities": { "image": false, "audio": false, "embeddedContext": true }
-            },
-            // No auth methods: this agent is the whole point of "works out of
-            // the box".
-            "authMethods": []
-        })),
+        m::INITIALIZE => {
+            // Remember what the client offered, because the script has steps
+            // that must not run otherwise. Tested for being an *object*: the
+            // schema spells "supported" as `{}` and "not" as absent or null, so
+            // a bare `true` means the client got it wrong and gets nothing.
+            let elicitation = &params["clientCapabilities"]["elicitation"];
+            agent
+                .elicitation_form
+                .store(elicitation["form"].is_object(), Ordering::Relaxed);
+            agent
+                .elicitation_url
+                .store(elicitation["url"].is_object(), Ordering::Relaxed);
+
+            Ok(json!({
+                "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
+                "agentInfo": {
+                    "name": "mjx-mock-agent", "version": env!("CARGO_PKG_VERSION")
+                },
+                "agentCapabilities": {
+                    "loadSession": false,
+                    "promptCapabilities": {
+                        "image": false, "audio": false, "embeddedContext": true
+                    }
+                },
+                // No auth methods: this agent is the whole point of "works out
+                // of the box".
+                "authMethods": []
+            }))
+        }
 
         m::SESSION_NEW => {
             let session_id = format!("mock-{}", short_id());
