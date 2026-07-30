@@ -21,6 +21,7 @@ use mjx_acp_core::{RequestId, acp};
 use serde::{Deserialize, Serialize};
 
 mod fold;
+pub mod paths;
 
 pub use fold::ThreadEvent;
 
