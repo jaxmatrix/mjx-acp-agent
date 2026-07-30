@@ -116,9 +116,23 @@ export class Session {
       // `configOptions.boolean` is declared because the sidebar renders a
       // toggle for one. Selects need no such opt-in, so this is the only part
       // of the config-option surface that has to be announced.
+      //
+      // `elicitation` is declared *here* rather than merged in by the server,
+      // even though every other client capability the agent gets is the
+      // server's. An elicitation needs a human, and the human is on this side
+      // of the socket — so it is not a server-provided capability and the
+      // relay has no business answering one.
+      //
+      // Both values are `{}` and not `true`: the schema types these as objects
+      // (`ElicitationFormCapabilities`) with a lenient deserializer, so `true`
+      // reads as "absent" on the agent's side and silently disables the whole
+      // feature.
       const initialized = await connection.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: { session: { configOptions: { boolean: {} } } },
+        clientCapabilities: {
+          session: { configOptions: { boolean: {} } },
+          elicitation: { form: {}, url: {} },
+        },
         clientInfo: { name: "mjx-acp-viewer", version: "0.1.0" },
       });
 
