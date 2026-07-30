@@ -553,6 +553,34 @@ button {
   border-radius: 5px;
 }
 
+/* One config selector. Several can share a section, so they need the spacing
+   the single mode selector never did. */
+.config-option + .config-option {
+  margin-top: 0.6rem;
+}
+
+.config-option label {
+  display: block;
+  font-size: 0.8rem;
+  margin-bottom: 0.15rem;
+}
+
+.config-option p {
+  margin: 0.15rem 0 0;
+  font-size: 0.8rem;
+}
+
+.config-option--toggle {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+.config-option--toggle input {
+  margin: 0;
+}
+
 .plan,
 .commands {
   list-style: none;
