@@ -10,7 +10,7 @@
 //! tests; the fixture cannot express two path styles without becoming a second
 //! dialect.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use mjx_acp_thread::mention::MentionUri;
 use mjx_acp_thread::paths::PathStyle;
@@ -61,7 +61,7 @@ fn shape(mention: &MentionUri) -> Value {
         } => {
             object.insert(
                 "absPath".into(),
-                abs_path.as_ref().map_or(Value::Null, |p| path_value(p)),
+                abs_path.as_deref().map_or(Value::Null, path_value),
             );
             object.insert("lineRange".into(), json!([line_range.start(), line_range.end()]));
             object.insert("column".into(), json!(column));
@@ -110,7 +110,7 @@ fn shape(mention: &MentionUri) -> Value {
     shape
 }
 
-fn path_value(path: &PathBuf) -> Value {
+fn path_value(path: &Path) -> Value {
     json!(path.to_string_lossy())
 }
 
