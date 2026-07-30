@@ -20,6 +20,11 @@ Derived from Zed:
       Port of zed `crates/acp_thread/` (acp_thread.rs, mention.rs, terminal.rs)
       with the GPUI, MultiBuffer and Project dependencies removed.
 
+  crates/mjx-acp-thread/src/paths.rs
+      The parts of zed `crates/util/src/paths.rs` that mention.rs needs
+      (PathStyle, is_absolute, PathWithPosition), written from the call sites:
+      zed's util crate is not in reference/, only the ACP crates are.
+
   crates/mjx-agent-catalog/
       Port of zed `crates/project/src/agent_registry_store.rs` and
       `crates/project/src/agent_server_store.rs` (registry fetch, npx/binary
