@@ -38,7 +38,8 @@ The browser is not optional as a test surface. Node's `ws` is lenient where a br
 real bugs have only shown up in Chromium — a rejected handshake, a subprotocol echo, a squashed flex
 item. `node web/scripts/smoke.mjs` drives a running server over the browser's exact code path, and
 `node web/scripts/resume-smoke.mjs` does the same for a reload — parking a turn, dropping the
-socket, and coming back to it.
+socket, and coming back to it — and `node web/scripts/history-smoke.mjs` for the session
+lifecycle: listing an agent's conversations, loading one, and forking, closing and deleting it.
 
 ## Adding support for a new part of the protocol
 
