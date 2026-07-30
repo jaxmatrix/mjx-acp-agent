@@ -31,6 +31,14 @@ pub struct SessionStore {
     /// `session/new` requests in flight, so the id in the response can be
     /// matched with the mode state that comes with it.
     pending_new_sessions: Vec<RequestId>,
+    /// `session/set_config_option` requests in flight, so the refreshed set in
+    /// the response can be attributed to the right session.
+    ///
+    /// Without this a config change made before a reload would be lost: the
+    /// browser's `session/new` is answered from the recording made when the
+    /// session started (see `relay::Handshake`), so the thread here is the only
+    /// place the current value can come from.
+    pending_config_options: HashMap<RequestId, String>,
 }
 
 impl SessionStore {
@@ -72,6 +80,12 @@ impl SessionStore {
 
         match method.as_str() {
             method::agent::SESSION_NEW => self.pending_new_sessions.push(id.clone()),
+            method::agent::SESSION_SET_CONFIG_OPTION => {
+                if let Ok(Some(request)) = frame.params_as::<acp::SetSessionConfigOptionRequest>() {
+                    self.pending_config_options
+                        .insert(id.clone(), request.session_id.0.to_string());
+                }
+            }
             method::agent::SESSION_PROMPT => {
                 let Ok(Some(request)) = frame.params_as::<acp::PromptRequest>() else {
                     return;
@@ -124,7 +138,16 @@ impl SessionStore {
                         if let Some(modes) = &response.modes {
                             thread.set_modes(modes);
                         }
+                        if let Some(options) = &response.config_options {
+                            thread.set_config_options(options);
+                        }
                     }
+                } else if let Some(session_id) = self.pending_config_options.remove(id)
+                    && let Ok(response) =
+                        serde_json::from_str::<acp::SetSessionConfigOptionResponse>(result.get())
+                    && let Some(thread) = self.threads.get_mut(&session_id)
+                {
+                    thread.set_config_options(&response.config_options);
                 }
             }
 
@@ -140,6 +163,7 @@ impl SessionStore {
                     thread.finish_turn(acp::StopReason::Cancelled);
                 }
                 self.pending_new_sessions.retain(|pending| pending != id);
+                self.pending_config_options.remove(id);
             }
 
             _ => {}
@@ -204,6 +228,95 @@ mod tests {
         let modes = store.thread("s1").unwrap().modes.as_ref().unwrap();
         assert_eq!(modes.current_mode_id, "code");
         assert_eq!(modes.available_modes.len(), 1);
+    }
+
+    /// A select option, as an agent would advertise it.
+    fn model_option(current: &str) -> serde_json::Value {
+        json!({
+            "id": "model", "name": "Model", "category": "model",
+            "type": "select", "currentValue": current,
+            "options": [
+                { "value": "sonnet", "name": "Sonnet" },
+                { "value": "opus", "name": "Opus" }
+            ]
+        })
+    }
+
+    fn current_model(store: &SessionStore) -> String {
+        match &store.thread("s1").unwrap().config_options[0].kind {
+            acp::SessionConfigKind::Select(select) => select.current_value.0.to_string(),
+            other => panic!("expected a select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_session_records_its_config_options() {
+        let mut store = SessionStore::new();
+        store.observe_from_client(&request(
+            1,
+            method::agent::SESSION_NEW,
+            json!({ "cwd": "/w", "mcpServers": [] }),
+        ));
+        store.observe_from_agent(
+            &Frame::result(
+                RequestId::Number(1),
+                &json!({ "sessionId": "s1", "configOptions": [model_option("sonnet")] }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(current_model(&store), "sonnet");
+    }
+
+    /// The reason this store watches config options at all: the browser's own
+    /// `session/new` is answered from a recording after a reload, so a change
+    /// made in between is only remembered here.
+    #[test]
+    fn setting_a_config_option_updates_the_thread() {
+        let mut store = started();
+        store.observe_from_client(&request(
+            9,
+            method::agent::SESSION_SET_CONFIG_OPTION,
+            json!({ "sessionId": "s1", "configId": "model", "value": "opus" }),
+        ));
+        store.observe_from_agent(
+            &Frame::result(
+                RequestId::Number(9),
+                &json!({ "configOptions": [model_option("opus")] }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(current_model(&store), "opus");
+    }
+
+    #[test]
+    fn a_rejected_config_change_leaves_nothing_behind() {
+        let mut store = started();
+        store.observe_from_client(&request(
+            9,
+            method::agent::SESSION_SET_CONFIG_OPTION,
+            json!({ "sessionId": "s1", "configId": "model", "value": "opus" }),
+        ));
+        store.observe_from_agent(&Frame::error(
+            RequestId::Number(9),
+            mjx_acp_core::JsonRpcError::invalid_params("no such model"),
+        ));
+
+        assert!(store.pending_config_options.is_empty());
+        assert!(store.thread("s1").unwrap().config_options.is_empty());
+    }
+
+    #[test]
+    fn a_config_option_update_is_folded() {
+        let mut store = started();
+        store.observe_from_agent(&update(
+            "s1",
+            json!({ "sessionUpdate": "config_option_update",
+                    "configOptions": [model_option("opus")] }),
+        ));
+
+        assert_eq!(current_model(&store), "opus");
     }
 
     #[test]

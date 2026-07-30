@@ -25,6 +25,8 @@ pub enum ThreadEvent {
     CommandsUpdated,
     /// The active mode changed.
     ModeUpdated,
+    /// The session config options changed.
+    ConfigOptionsUpdated,
     /// Token accounting changed.
     UsageUpdated,
 }
@@ -73,6 +75,15 @@ impl Thread {
                     None => vec![],
                 }
             }
+            acp::SessionUpdate::ConfigOptionUpdate(update) => {
+                // Deliberately not the shape of the mode arm above. That one
+                // carries an id naming something `session/new` offered, so with
+                // no list it is meaningless; this carries the whole set, so it
+                // is applied even when nothing was advertised at `session/new`
+                // — an agent may start offering options mid-session.
+                self.config_options = update.config_options.clone();
+                vec![ThreadEvent::ConfigOptionsUpdated]
+            }
             acp::SessionUpdate::UsageUpdate(update) => {
                 self.usage = Some(Usage {
                     used: update.used,
@@ -94,6 +105,11 @@ impl Thread {
             current_mode_id: state.current_mode_id.0.to_string(),
             available_modes: state.available_modes.clone(),
         });
+    }
+
+    /// Records the config options reported by `session/new` or `session/load`.
+    pub fn set_config_options(&mut self, options: &[acp::SessionConfigOption]) {
+        self.config_options = options.to_vec();
     }
 
     /// Folds in a user chunk echoed back by the agent.
@@ -560,6 +576,82 @@ mod tests {
         );
         assert_eq!(with.apply(&update), [ThreadEvent::ModeUpdated]);
         assert_eq!(with.modes.unwrap().current_mode_id, "ask");
+    }
+
+    /// The mirror image of the mode rule above, and the reason the two arms are
+    /// not written the same way: this update carries the whole set, so there is
+    /// nothing for it to refer back to.
+    #[test]
+    fn a_config_option_update_stands_on_its_own() {
+        let update: acp::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{
+                "id": "model", "name": "Model", "category": "model",
+                "type": "select", "currentValue": "sonnet",
+                "options": [
+                    { "value": "sonnet", "name": "Sonnet" },
+                    { "value": "opus", "name": "Opus" }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let mut thread = Thread::new();
+        assert_eq!(thread.apply(&update), [ThreadEvent::ConfigOptionsUpdated]);
+        assert_eq!(thread.config_options.len(), 1);
+        assert_eq!(thread.config_options[0].name, "Model");
+    }
+
+    #[test]
+    fn a_config_option_update_replaces_rather_than_merges() {
+        let mut thread = Thread::new();
+        thread.set_config_options(&[
+            serde_json::from_value(serde_json::json!({
+                "id": "model", "name": "Model", "type": "select",
+                "currentValue": "sonnet", "options": [{ "value": "sonnet", "name": "Sonnet" }]
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "id": "web", "name": "Web search", "type": "boolean", "currentValue": true
+            }))
+            .unwrap(),
+        ]);
+
+        let update: acp::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "config_option_update",
+            "configOptions": [{
+                "id": "model", "name": "Model", "type": "select",
+                "currentValue": "opus", "options": [{ "value": "opus", "name": "Opus" }]
+            }]
+        }))
+        .unwrap();
+
+        thread.apply(&update);
+        // The dropped boolean is not a bug: an agent that stops offering an
+        // option says so by leaving it out of the set it sends.
+        assert_eq!(thread.config_options.len(), 1);
+        assert!(matches!(
+            &thread.config_options[0].kind,
+            acp::SessionConfigKind::Select(select) if select.current_value.0.as_ref() == "opus"
+        ));
+    }
+
+    /// Categories are UX only and the spec reserves the right to add more, so
+    /// an unfamiliar one has to survive rather than cost us the option.
+    #[test]
+    fn an_unknown_category_survives() {
+        let option: acp::SessionConfigOption = serde_json::from_value(serde_json::json!({
+            "id": "vibe", "name": "Vibe", "category": "_vendor_vibe",
+            "type": "boolean", "currentValue": false
+        }))
+        .unwrap();
+
+        let mut thread = Thread::new();
+        thread.set_config_options(std::slice::from_ref(&option));
+        let round_tripped: acp::SessionConfigOption =
+            serde_json::from_str(&serde_json::to_string(&thread.config_options[0]).unwrap())
+                .unwrap();
+        assert_eq!(round_tripped.category, option.category);
     }
 
     #[test]

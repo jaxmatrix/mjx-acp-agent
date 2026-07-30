@@ -19,6 +19,8 @@ import {
   type AssistantChunk,
   type AvailableCommand,
   type Entry,
+  type SessionConfigOption,
+  type SessionConfigSelectOption,
   type SessionMode,
   type StopReason,
   type Thread,
@@ -60,6 +62,9 @@ export function threadFromReplay(payload: unknown): Thread | null {
     usage: toUsage(payload.usage),
     availableCommands: asArray(payload.availableCommands) as AvailableCommand[],
     modes: toModes(payload.modes),
+    configOptions: asArray(payload.configOptions)
+      .map(toConfigOption)
+      .filter((option): option is SessionConfigOption => option !== null),
     // Not recoverable. The scrollback of a terminal the agent ran lives in the
     // workspace, not in the thread, so a resumed page shows the tool call
     // without the output it produced.
@@ -164,6 +169,39 @@ function toModes(raw: unknown): Thread["modes"] {
     currentModeId: raw.currentModeId,
     availableModes: asArray(raw.availableModes) as SessionMode[],
   };
+}
+
+/**
+ * Rebuilds one config option, or drops it.
+ *
+ * Dropping one option is the right cost for a shape we don't recognise: the
+ * rest of the selectors still work, whereas trusting it would put a control on
+ * screen that cannot say what it is currently set to.
+ */
+function toConfigOption(raw: unknown): SessionConfigOption | null {
+  if (!isRecord(raw) || typeof raw.id !== "string" || typeof raw.name !== "string") return null;
+
+  const common = {
+    id: raw.id,
+    name: raw.name,
+    ...(typeof raw.description === "string" ? { description: raw.description } : {}),
+    ...(typeof raw.category === "string" ? { category: raw.category } : {}),
+  };
+
+  if (raw.type === "boolean" && typeof raw.currentValue === "boolean") {
+    return { ...common, type: "boolean", currentValue: raw.currentValue };
+  }
+  if (raw.type === "select" && typeof raw.currentValue === "string") {
+    return {
+      ...common,
+      type: "select",
+      currentValue: raw.currentValue,
+      // Left as the agent sent it. Flat and grouped are told apart at render
+      // time, where the choice of control is actually made.
+      options: asArray(raw.options) as SessionConfigSelectOption[],
+    };
+  }
+  return null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

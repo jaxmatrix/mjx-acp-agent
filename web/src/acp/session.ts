@@ -19,7 +19,13 @@ import {
   clearPermission,
   setTerminalExit,
 } from "./thread";
-import type { AgentInfo, InspectorEntry, StopReason, Thread } from "./types";
+import type {
+  AgentInfo,
+  InspectorEntry,
+  SessionConfigOption,
+  StopReason,
+  Thread,
+} from "./types";
 
 /** What the UI subscribes to. */
 export interface SessionEvents {
@@ -106,9 +112,13 @@ export class Session {
 
       // The browser declares only what it can actually do. The server merges in
       // `fs` and `terminal` on the way past, because those live on its side.
+      //
+      // `configOptions.boolean` is declared because the sidebar renders a
+      // toggle for one. Selects need no such opt-in, so this is the only part
+      // of the config-option surface that has to be announced.
       const initialized = await connection.agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: {},
+        clientCapabilities: { session: { configOptions: { boolean: {} } } },
         clientInfo: { name: "mjx-acp-viewer", version: "0.1.0" },
       });
 
@@ -118,6 +128,10 @@ export class Session {
       });
 
       this.#sessionId = session.sessionId;
+      if (session.configOptions) {
+        const configOptions = session.configOptions as SessionConfigOption[];
+        this.#update((thread) => ({ ...thread, configOptions }));
+      }
       if (session.modes) {
         this.#update((thread) => ({
           ...thread,
@@ -207,6 +221,27 @@ export class Session {
     this.#update((thread) =>
       thread.modes ? { ...thread, modes: { ...thread.modes, currentModeId: modeId } } : thread,
     );
+  }
+
+  /**
+   * Switches a session config option — the model, the thinking level, and
+   * whatever else the agent offers.
+   *
+   * Unlike `setMode`, nothing is patched optimistically. The response carries
+   * the whole refreshed set, because setting one option can change another's
+   * available values, so the agent's answer replaces what we had.
+   */
+  async setConfigOption(configId: string, value: string | boolean): Promise<void> {
+    if (!this.#agent || !this.#sessionId) return;
+    const response = await this.#agent.request(acp.methods.agent.session.setConfigOption, {
+      sessionId: this.#sessionId,
+      configId,
+      // A select value goes untyped: the schema reads an absent `type` as a
+      // value id, which is what a select is.
+      ...(typeof value === "boolean" ? { type: "boolean" as const, value } : { value }),
+    });
+    const configOptions = (response.configOptions ?? []) as SessionConfigOption[];
+    this.#update((thread) => ({ ...thread, configOptions }));
   }
 
   /** Answers an outstanding permission prompt. */

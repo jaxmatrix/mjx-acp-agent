@@ -130,6 +130,19 @@ pub async fn run_turn(agent: &Agent, session_id: &str, params: &Value) -> &'stat
     beat(300).await;
     agent.update(session_id, plan(&["in_progress", "pending", "pending"]));
 
+    // 4a. Having seen the shape of the work, the agent moves itself up to a
+    //     more capable model. Agents do change their own settings mid-turn, and
+    //     it is the only way `config_option_update` gets into the recorded
+    //     fixture — the selector in the sidebar is expected to follow.
+    beat(200).await;
+    let options = agent
+        .set_config_option(session_id, "model", json!("mock-opus"))
+        .await;
+    agent.update(
+        session_id,
+        json!({ "sessionUpdate": "config_option_update", "configOptions": options }),
+    );
+
     beat(300).await;
     stream_text(
         agent,
@@ -535,6 +548,34 @@ mod tests {
             "sessionUpdate": "usage_update", "used": 4_812, "size": 200_000,
             "cost": { "amount": 0.0143, "currency": "USD" }
         }));
+    }
+
+    /// Parsing alone is not enough here. The schema deserializes a config
+    /// option list with `VecSkipError`, so a malformed option is *dropped*
+    /// rather than rejected — a typo would leave a valid-looking update with
+    /// nothing in it. Counting what survives is what actually checks the shape.
+    #[test]
+    fn the_advertised_config_options_survive_a_round_trip() {
+        let options = crate::config_options(&crate::default_config_values());
+        let update = json!({ "sessionUpdate": "config_option_update", "configOptions": options });
+        assert_is_session_update(&update);
+
+        let parsed: acp::SessionNotification =
+            serde_json::from_value(json!({ "sessionId": "s1", "update": update })).unwrap();
+        let acp::SessionUpdate::ConfigOptionUpdate(parsed) = parsed.update else {
+            panic!("not a config option update");
+        };
+        assert_eq!(parsed.config_options.len(), 3, "an option was dropped");
+
+        // The grouped variant is the one with no discriminator on the wire, so
+        // it is the one that silently degrades if it is written wrong.
+        let acp::SessionConfigKind::Select(model) = &parsed.config_options[0].kind else {
+            panic!("the model option is not a select");
+        };
+        let acp::SessionConfigSelectOptions::Grouped(groups) = &model.options else {
+            panic!("the model options were not read as grouped");
+        };
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]

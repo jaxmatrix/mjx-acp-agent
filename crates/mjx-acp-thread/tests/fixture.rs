@@ -40,7 +40,7 @@ fn folded() -> Thread {
 fn every_recorded_update_parses() {
     // The fixture is real agent output. If the schema types can't read it back,
     // one of the two is wrong.
-    assert_eq!(FIXTURE.lines().filter(|l| !l.trim().is_empty()).count(), 68);
+    assert_eq!(FIXTURE.lines().filter(|l| !l.trim().is_empty()).count(), 69);
     let _ = folded();
 }
 
@@ -131,6 +131,14 @@ fn the_recorded_turn_folds_to_a_stable_shape() {
     assert_eq!(usage.size, 200_000);
 
     assert_eq!(thread.available_commands.len(), 2);
+
+    // The agent moved itself onto a more capable model partway through, and the
+    // fold followed it.
+    assert_eq!(thread.config_options.len(), 3);
+    let acp::SessionConfigKind::Select(model) = &thread.config_options[0].kind else {
+        panic!("the model option is not a select");
+    };
+    assert_eq!(model.current_value.0.as_ref(), "mock-opus");
 }
 
 #[test]

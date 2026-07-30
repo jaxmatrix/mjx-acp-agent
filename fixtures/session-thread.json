@@ -183,5 +183,72 @@
         "hint": "optional test name filter"
       }
     }
+  ],
+  "configOptions": [
+    {
+      "id": "model",
+      "name": "Model",
+      "description": "Which model answers.",
+      "category": "model",
+      "type": "select",
+      "currentValue": "mock-opus",
+      "options": [
+        {
+          "group": "fast",
+          "name": "Fast",
+          "options": [
+            {
+              "value": "mock-haiku",
+              "name": "Mock Haiku",
+              "description": "Quick, and cheap to be wrong with."
+            }
+          ]
+        },
+        {
+          "group": "capable",
+          "name": "Capable",
+          "options": [
+            {
+              "value": "mock-sonnet",
+              "name": "Mock Sonnet",
+              "description": "The balanced default."
+            },
+            {
+              "value": "mock-opus",
+              "name": "Mock Opus",
+              "description": "Slower, and thinks harder about it."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "thought_level",
+      "name": "Thinking",
+      "category": "thought_level",
+      "type": "select",
+      "currentValue": "balanced",
+      "options": [
+        {
+          "value": "off",
+          "name": "Off"
+        },
+        {
+          "value": "balanced",
+          "name": "Balanced"
+        },
+        {
+          "value": "deep",
+          "name": "Deep"
+        }
+      ]
+    },
+    {
+      "id": "web_search",
+      "name": "Web search",
+      "description": "Let the agent look things up.",
+      "type": "boolean",
+      "currentValue": false
+    }
   ]
 }

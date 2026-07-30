@@ -58,6 +58,48 @@ describe("a replayed thread", () => {
     expect(thread.stopReason).toBeUndefined();
     expect(thread.usage).toBeUndefined();
     expect(thread.modes).toBeUndefined();
+    expect(thread.configOptions).toEqual([]);
+  });
+
+  // The whole reason the server folds config options at all: after a reload the
+  // browser's `session/new` is answered from a recording, so the model actually
+  // in effect can only come from here.
+  test("config options survive a replay", () => {
+    const thread = threadFromReplay({
+      entries: [],
+      status: "idle",
+      configOptions: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          type: "select",
+          currentValue: "opus",
+          options: [{ value: "opus", name: "Opus" }],
+        },
+        { id: "web", name: "Web search", type: "boolean", currentValue: true },
+      ],
+    })!;
+
+    expect(thread.configOptions).toHaveLength(2);
+    expect(thread.configOptions[0]).toMatchObject({ type: "select", currentValue: "opus" });
+    expect(thread.configOptions[1]).toMatchObject({ type: "boolean", currentValue: true });
+  });
+
+  test("a config option we cannot read costs one control, not the page", () => {
+    const thread = threadFromReplay({
+      entries: [],
+      status: "idle",
+      configOptions: [
+        { id: "good", name: "Good", type: "boolean", currentValue: false },
+        // No `currentValue`, so nothing could say what the control is set to.
+        { id: "bad", name: "Bad", type: "select" },
+        { name: "nameless" },
+        "not an option at all",
+      ],
+    })!;
+
+    expect(thread.configOptions.map((option) => option.id)).toEqual(["good"]);
   });
 
   test("entry ids are renumbered so the next prompt cannot collide", () => {

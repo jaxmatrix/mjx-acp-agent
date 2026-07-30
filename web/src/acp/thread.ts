@@ -15,6 +15,7 @@ import type {
   AssistantChunk,
   Entry,
   PermissionRequest,
+  SessionConfigOption,
   Terminal,
   Thread,
   ToolCall,
@@ -61,6 +62,16 @@ export function applyUpdate(thread: Thread, notification: SessionNotification): 
             modes: { ...thread.modes, currentModeId: update.currentModeId as string },
           }
         : thread;
+
+    // Deliberately not shaped like the mode arm above. That one carries an id
+    // naming something `session/new` offered, so with no list it is meaningless;
+    // this carries the whole set, so it applies even when nothing was
+    // advertised — an agent may start offering options mid-session.
+    case "config_option_update":
+      return {
+        ...thread,
+        configOptions: (update.configOptions as SessionConfigOption[]) ?? [],
+      };
 
     case "usage_update":
       return {

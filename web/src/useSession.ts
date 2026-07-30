@@ -15,6 +15,7 @@ export interface SessionState {
   prompt(text: string): void;
   cancel(): void;
   setMode(modeId: string): void;
+  setConfigOption(configId: string, value: string | boolean): void;
   answerPermission(toolCallId: string, optionId: string | null): void;
   /** Opens a new socket to the same agent, taking it back from another tab. */
   reconnect(): void;
@@ -104,6 +105,10 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     void session.current?.setMode(modeId);
   }, []);
 
+  const setConfigOption = useCallback((configId: string, value: string | boolean) => {
+    void session.current?.setConfigOption(configId, value);
+  }, []);
+
   const answerPermission = useCallback((toolCallId: string, optionId: string | null) => {
     session.current?.answerPermission(toolCallId, optionId);
   }, []);
@@ -118,6 +123,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     prompt,
     cancel,
     setMode,
+    setConfigOption,
     answerPermission,
     reconnect,
     error,

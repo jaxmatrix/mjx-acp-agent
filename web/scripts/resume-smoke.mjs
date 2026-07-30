@@ -93,6 +93,19 @@ const s1 = await handshake(first);
 check(first.info.resumed === false, "a fresh connection is not resumed");
 check(Boolean(first.info.connectionId), "a connection id was issued");
 
+// Pick a model before prompting, then confirm the *server* wrote it down. Only
+// its copy survives the reload below, so if it did not record this, nothing did.
+const modelOf = (options) => options?.find((o) => o.id === "model")?.currentValue;
+await first.connection.agent.request(acp.methods.agent.session.setConfigOption, {
+  sessionId: s1.sessionId,
+  configId: "model",
+  value: "mock-haiku",
+});
+const afterSet = await first.connection.agent.request("_mjx/session/replay", {
+  sessionId: s1.sessionId,
+});
+check(modelOf(afterSet.configOptions) === "mock-haiku", "the server recorded the chosen model");
+
 first.connection.agent
   .request(acp.methods.agent.session.prompt, {
     sessionId: s1.sessionId,
@@ -119,6 +132,20 @@ check(replayed.entries[0].type === "user", "the prompt is the first entry");
 check(
   replayed.entries.some((e) => e.type === "toolCall"),
   "tool calls survived",
+);
+
+// The point of folding config options server-side, stated as plainly as it can
+// be: the reload's own `session/new` is answered from the recording made when
+// the session started, so it still says `mock-sonnet`. Only the replay knows
+// the agent has since moved to `mock-opus`. A client-side-only implementation
+// passes every other check here and shows the wrong model.
+check(
+  modelOf(s2.configOptions) === "mock-sonnet",
+  "the replayed handshake is the original one, as it should be",
+);
+check(
+  modelOf(replayed.configOptions) === "mock-opus",
+  `the reload sees the model actually in effect (got ${modelOf(replayed.configOptions)})`,
 );
 
 await until("the unanswered question was re-asked", () => second.notes.includes("permission-asked"));

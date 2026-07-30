@@ -2,6 +2,7 @@
 
 import type { SessionStatus } from "../acp/session";
 import type { AgentInfo, Thread } from "../acp/types";
+import { ConfigOptions } from "./ConfigOptions";
 
 const PLAN_MARK: Record<string, string> = {
   pending: "○",
@@ -14,11 +15,13 @@ export function Sidebar({
   agentInfo,
   status,
   onSetMode,
+  onSetConfigOption,
 }: {
   thread: Thread;
   agentInfo?: AgentInfo;
   status: SessionStatus;
   onSetMode(modeId: string): void;
+  onSetConfigOption(configId: string, value: string | boolean): void;
 }) {
   return (
     <aside className="sidebar">
@@ -58,6 +61,8 @@ export function Sidebar({
           </p>
         </section>
       )}
+
+      <ConfigOptions options={thread.configOptions} onSetConfigOption={onSetConfigOption} />
 
       {thread.plan.length > 0 && (
         <section className="sidebar__section">

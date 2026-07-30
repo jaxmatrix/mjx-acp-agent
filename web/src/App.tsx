@@ -109,6 +109,7 @@ function Conversation({
           agentInfo={session.agentInfo}
           status={session.status}
           onSetMode={session.setMode}
+          onSetConfigOption={session.setConfigOption}
         />
 
         {showInspector && <Inspector frames={session.frames} />}
