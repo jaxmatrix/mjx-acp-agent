@@ -55,6 +55,10 @@ pub struct Agent {
     /// One flag per session, raised by `session/cancel`. The script checks it
     /// between steps.
     cancelled: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// The current value of each config option, per session. Only the values
+    /// are kept: what is *offered* is fixed, and [`config_options`] rebuilds
+    /// the advertised set from these so the two cannot drift.
+    config: Mutex<HashMap<String, HashMap<String, Value>>>,
 }
 
 impl Agent {
@@ -110,6 +114,29 @@ impl Agent {
         flag
     }
 
+    /// This session's config options as they currently stand.
+    pub async fn config_options(&self, session_id: &str) -> Value {
+        let config = self.config.lock().await;
+        match config.get(session_id) {
+            Some(values) => config_options(values),
+            None => config_options(&default_config_values()),
+        }
+    }
+
+    /// Records a new value and returns the whole refreshed set.
+    async fn set_config_option(&self, session_id: &str, config_id: &str, value: Value) -> Value {
+        let mut config = self.config.lock().await;
+        let values = config
+            .entry(session_id.to_string())
+            .or_insert_with(default_config_values);
+        // An id we do not offer is ignored rather than stored. Storing it would
+        // have no effect on what is advertised and would only leak memory.
+        if values.contains_key(config_id) {
+            values.insert(config_id.to_string(), value);
+        }
+        config_options(values)
+    }
+
     async fn resolve(&self, id: &RequestId, reply: Reply) {
         if let Some(tx) = self.pending.lock().await.remove(id) {
             let _ = tx.send(reply);
@@ -136,6 +163,7 @@ async fn main() -> Result<()> {
         next_request_id: AtomicI64::new(1),
         pending: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashMap::new()),
+        config: Mutex::new(HashMap::new()),
     });
 
     // A single writer task owns stdout, so concurrent handlers can't interleave
@@ -225,16 +253,25 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             "authMethods": []
         })),
 
-        m::SESSION_NEW => Ok(json!({
-            "sessionId": format!("mock-{}", short_id()),
-            "modes": {
-                "currentModeId": "code",
-                "availableModes": [
-                    { "id": "ask",  "name": "Ask",  "description": "Answer questions, change nothing." },
-                    { "id": "code", "name": "Code", "description": "Read and edit files." },
-                ]
-            }
-        })),
+        m::SESSION_NEW => {
+            let session_id = format!("mock-{}", short_id());
+            agent
+                .config
+                .lock()
+                .await
+                .insert(session_id.clone(), default_config_values());
+            Ok(json!({
+                "sessionId": session_id,
+                "modes": {
+                    "currentModeId": "code",
+                    "availableModes": [
+                        { "id": "ask",  "name": "Ask",  "description": "Answer questions, change nothing." },
+                        { "id": "code", "name": "Code", "description": "Read and edit files." },
+                    ]
+                },
+                "configOptions": config_options(&default_config_values())
+            }))
+        }
 
         m::SESSION_PROMPT => {
             let session_id = params["sessionId"]
@@ -257,10 +294,89 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             }
             Ok(json!({}))
         }
+        m::SESSION_SET_CONFIG_OPTION => {
+            let session_id = params["sessionId"]
+                .as_str()
+                .ok_or_else(|| JsonRpcError::invalid_params("sessionId is required"))?;
+            let config_id = params["configId"]
+                .as_str()
+                .ok_or_else(|| JsonRpcError::invalid_params("configId is required"))?;
+
+            // No `config_option_update` notification here on purpose. The
+            // response already carries the whole refreshed set, so a
+            // notification would say the same thing twice. The notification is
+            // for changes the *agent* makes on its own, which the script does.
+            let options = agent
+                .set_config_option(session_id, config_id, params["value"].clone())
+                .await;
+            Ok(json!({ "configOptions": options }))
+        }
+
         m::AUTHENTICATE | m::SESSION_CLOSE => Ok(json!({})),
 
         other => Err(JsonRpcError::method_not_found(other)),
     }
+}
+
+/// What every session starts with.
+fn default_config_values() -> HashMap<String, Value> {
+    HashMap::from([
+        ("model".to_string(), json!("mock-sonnet")),
+        ("thought_level".to_string(), json!("balanced")),
+        ("web_search".to_string(), json!(false)),
+    ])
+}
+
+/// The advertised config options, with `values` filled in as current.
+///
+/// One of each control the client can render: a *grouped* select, because a
+/// real model list is grouped and that is a separate rendering path; a flat
+/// select; and a boolean, which is the only variant a client must declare a
+/// capability for. Between them the viewer's config UI has no untested branch.
+fn config_options(values: &HashMap<String, Value>) -> Value {
+    let current = |id: &str| values.get(id).cloned().unwrap_or(Value::Null);
+
+    json!([
+        {
+            "id": "model",
+            "name": "Model",
+            "description": "Which model answers.",
+            "category": "model",
+            "type": "select",
+            "currentValue": current("model"),
+            "options": [
+                { "group": "fast", "name": "Fast", "options": [
+                    { "value": "mock-haiku", "name": "Mock Haiku",
+                      "description": "Quick, and cheap to be wrong with." }
+                ]},
+                { "group": "capable", "name": "Capable", "options": [
+                    { "value": "mock-sonnet", "name": "Mock Sonnet",
+                      "description": "The balanced default." },
+                    { "value": "mock-opus", "name": "Mock Opus",
+                      "description": "Slower, and thinks harder about it." }
+                ]}
+            ]
+        },
+        {
+            "id": "thought_level",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": current("thought_level"),
+            "options": [
+                { "value": "off", "name": "Off" },
+                { "value": "balanced", "name": "Balanced" },
+                { "value": "deep", "name": "Deep" }
+            ]
+        },
+        {
+            "id": "web_search",
+            "name": "Web search",
+            "description": "Let the agent look things up.",
+            "type": "boolean",
+            "currentValue": current("web_search")
+        }
+    ])
 }
 
 /// A short id, unique enough within one process run. Saves a uuid dependency
