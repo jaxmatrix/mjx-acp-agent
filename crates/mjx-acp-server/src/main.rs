@@ -233,6 +233,7 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .route("/api/agents", get(list_agents))
         .route("/api/workspaces", get(list_workspaces))
+        .route("/api/files", get(list_files))
         .route("/api/connections", get(list_connections))
         .route("/ws", get(websocket))
         .with_state(state.clone());
@@ -327,6 +328,92 @@ async fn list_workspaces(State(state): State<Arc<AppState>>) -> impl IntoRespons
         })
         .collect();
     axum::Json(roots)
+}
+
+/// What the composer asks for when it offers `@`-mention candidates.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FilesQuery {
+    /// One configured root. Omitted means every root.
+    root: Option<String>,
+    /// A case-insensitive substring of the path relative to its root.
+    #[serde(default)]
+    q: String,
+    limit: Option<usize>,
+}
+
+/// One mention candidate.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileEntry {
+    root: String,
+    path: String,
+    rel_path: String,
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Files {
+    entries: Vec<FileEntry>,
+    truncated: bool,
+}
+
+/// How many candidates a caller may ask for, and how many it gets by default.
+const FILES_LIMIT_MAX: usize = 500;
+const FILES_LIMIT_DEFAULT: usize = 200;
+
+/// Lists workspace filenames so the browser can offer them as mentions.
+///
+/// Names only, never contents, and always through the same jail `fs/*` uses —
+/// see SECURITY.md, which says plainly what this exposes.
+async fn list_files(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FilesQuery>,
+) -> Response {
+    let root = query.root.as_ref().map(PathBuf::from);
+    let limit = query.limit.unwrap_or(FILES_LIMIT_DEFAULT).min(FILES_LIMIT_MAX);
+
+    let listing = match mjx_workspace::fs::list_within(
+        &state.config.workspace_roots,
+        root.as_deref(),
+        &query.q,
+        limit,
+    ) {
+        Ok(listing) => listing,
+        Err(err) => {
+            // A root outside the workspace is the caller's mistake, not ours.
+            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+        }
+    };
+
+    let entries = listing
+        .entries
+        .into_iter()
+        .map(|entry| FileEntry {
+            rel_path: entry
+                .path
+                .strip_prefix(&entry.root)
+                .unwrap_or(&entry.path)
+                .to_string_lossy()
+                .into_owned(),
+            name: entry
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            root: entry.root.display().to_string(),
+            path: entry.path.display().to_string(),
+            is_dir: entry.is_dir,
+        })
+        .collect();
+
+    axum::Json(Files {
+        entries,
+        truncated: listing.truncated,
+    })
+    .into_response()
 }
 
 /// The first subprotocol the client offered, if any.

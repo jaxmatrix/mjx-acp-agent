@@ -501,6 +501,55 @@ fn elicitable() -> Value {
 }
 
 #[tokio::test]
+async fn the_workspace_is_enumerable_over_http() {
+    let server = Server::start().await;
+
+    let files: Value = reqwest::get(server.http("/api/files"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let entries = files["entries"].as_array().unwrap();
+    let stats = entries
+        .iter()
+        .find(|entry| entry["name"] == "stats.js")
+        .expect("the workspace file must be offered as a mention candidate");
+    assert_eq!(stats["relPath"], "stats.js");
+    assert_eq!(stats["isDir"], false);
+
+    // Names, never contents. A listing that leaked a byte of a file would be a
+    // way around the jail rather than a use of it.
+    let body = serde_json::to_string(&files).unwrap();
+    assert!(
+        !body.contains("median"),
+        "the listing must not carry file contents: {body}"
+    );
+
+    // The query narrows, and it matches the path relative to the root.
+    let filtered: Value = reqwest::get(server.http("/api/files?q=stats.test"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = filtered["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["stats.test.js"]);
+
+    // A root outside the workspace is refused, the same way a read would be.
+    let refused = reqwest::get(server.http("/api/files?root=/etc"))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+}
+
+#[tokio::test]
 async fn the_catalog_is_served_over_http() {
     let server = Server::start().await;
 
