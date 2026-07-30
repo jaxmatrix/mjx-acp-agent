@@ -20,6 +20,10 @@ struct Transcript {
     updates: Vec<Value>,
     /// Methods of the client requests the agent made.
     client_requests: Vec<String>,
+    /// Params of the client requests the agent made, by method.
+    request_params: HashMap<String, Vec<Value>>,
+    /// Params of every `elicitation/complete` the agent sent.
+    completed_elicitations: Vec<Value>,
 }
 
 impl Transcript {
@@ -148,6 +152,18 @@ impl Driver {
     /// Records a notification, or answers a request the agent made of us.
     async fn handle(&mut self, frame: Frame) {
         match frame {
+            // A URL-mode elicitation is finished by a notification rather than
+            // by the response, so this is not only `session/update`.
+            Frame::Notification { method, params }
+                if method == method::client::ELICITATION_COMPLETE =>
+            {
+                let params: Value =
+                    serde_json::from_str(params.expect("the notification has params").get())
+                        .unwrap();
+                serde_json::from_value::<acp::CompleteElicitationNotification>(params.clone())
+                    .unwrap_or_else(|e| panic!("invalid elicitation/complete: {e}\n{params:#}"));
+                self.transcript.completed_elicitations.push(params);
+            }
             Frame::Notification { method, params } => {
                 assert_eq!(method, method::client::SESSION_UPDATE, "unexpected notification");
                 let params: Value =
@@ -168,8 +184,17 @@ impl Driver {
 
                 self.transcript.updates.push(params["update"].clone());
             }
-            Frame::Request { id, method, .. } => {
+            Frame::Request { id, method, params } => {
                 self.transcript.client_requests.push(method.clone());
+                let asked: Value = params
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str(p.get()).ok())
+                    .unwrap_or(Value::Null);
+                self.transcript
+                    .request_params
+                    .entry(method.clone())
+                    .or_default()
+                    .push(asked);
                 let result = self.answers.get(&method).cloned().unwrap_or_else(|| {
                     panic!("agent called {method}, which the driver has no answer for")
                 });
@@ -189,15 +214,27 @@ impl Driver {
 
 /// Handshake plus session creation, shared by the tests below.
 async fn connect(driver: &mut Driver) -> String {
+    connect_declaring(
+        driver,
+        json!({
+            "fs": { "readTextFile": true, "writeTextFile": true },
+            "terminal": true
+        }),
+    )
+    .await
+}
+
+/// The same, with the client declaring exactly `capabilities`.
+///
+/// Which capabilities the client offers is not decoration: the agent asks only
+/// for what it was offered, so this is what decides whether a step runs at all.
+async fn connect_declaring(driver: &mut Driver, capabilities: Value) -> String {
     let init = driver
         .request(
             method::agent::INITIALIZE,
             json!({
                 "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "fs": { "readTextFile": true, "writeTextFile": true },
-                    "terminal": true
-                }
+                "clientCapabilities": capabilities
             }),
         )
         .await;
@@ -431,6 +468,129 @@ async fn a_client_without_fs_or_terminal_still_gets_a_turn() {
     assert_eq!(stop_reason, "end_turn");
     // It still said something useful rather than dying silently.
     assert!(!driver.transcript.assistant_text().is_empty());
+
+    driver.shutdown().await;
+}
+
+/// A driver that can answer everything the script asks, elicitation included.
+fn driver_answering_everything() -> Driver {
+    let mut driver = Driver::spawn("0");
+    driver
+        .answer(
+            method::client::FS_READ_TEXT_FILE,
+            json!({ "content": include_str!("../../../demo/pristine/stats.js") }),
+        )
+        .answer(method::client::FS_WRITE_TEXT_FILE, json!({}))
+        .answer(
+            method::client::SESSION_REQUEST_PERMISSION,
+            json!({ "outcome": { "outcome": "selected", "optionId": "allow_once" } }),
+        )
+        .answer(
+            method::client::TERMINAL_CREATE,
+            json!({ "terminalId": "t1" }),
+        )
+        .answer(
+            method::client::TERMINAL_WAIT_FOR_EXIT,
+            json!({ "exitCode": 0 }),
+        )
+        .answer(method::client::TERMINAL_RELEASE, json!({}))
+        .answer(
+            method::client::ELICITATION_CREATE,
+            json!({ "action": "accept",
+                    "content": { "branch": "fix/median", "remote": "upstream" } }),
+        );
+    driver
+}
+
+/// The capabilities a client that can be elicited declares.
+///
+/// `{}` and not `true`: the schema types these as objects, and a lenient
+/// deserializer reads `true` as absent, which turns the feature off silently.
+fn elicitable() -> Value {
+    json!({
+        "fs": { "readTextFile": true, "writeTextFile": true },
+        "terminal": true,
+        "elicitation": { "form": {}, "url": {} }
+    })
+}
+
+#[tokio::test]
+async fn a_client_that_can_be_elicited_is_asked_in_both_modes() {
+    let mut driver = driver_answering_everything();
+    let session_id = connect_declaring(&mut driver, elicitable()).await;
+    let response = driver
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    assert_eq!(response["stopReason"], "end_turn");
+
+    let asked = driver
+        .transcript
+        .request_params
+        .get(method::client::ELICITATION_CREATE)
+        .expect("the agent never elicited");
+    let modes: Vec<&str> = asked
+        .iter()
+        .filter_map(|params| params["mode"].as_str())
+        .collect();
+    assert_eq!(modes, ["form", "url"]);
+
+    // Both are tied to the session, which is what puts them in a thread. Only
+    // the form names a tool call.
+    assert_eq!(asked[0]["sessionId"], session_id.as_str());
+    assert_eq!(asked[0]["toolCallId"], "call_edit");
+    assert_eq!(asked[1]["sessionId"], session_id.as_str());
+
+    // The URL exchange is finished by a notification, not by the response.
+    assert_eq!(
+        driver
+            .transcript
+            .completed_elicitations
+            .iter()
+            .filter_map(|params| params["elicitationId"].as_str())
+            .collect::<Vec<_>>(),
+        [asked[1]["elicitationId"].as_str().unwrap()]
+    );
+
+    // What the user filled in is read, not ignored.
+    let text = driver.transcript.assistant_text();
+    assert!(text.contains("upstream/fix/median"), "{text:?}");
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_that_declared_nothing_is_never_elicited() {
+    // The protocol's rule, not caution: eliciting from a client that did not
+    // offer to would come straight back as an error, and the user would watch a
+    // turn fail for no visible reason.
+    let mut driver = driver_answering_everything();
+    let session_id = connect(&mut driver).await;
+    driver
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+
+    assert!(
+        !driver
+            .transcript
+            .client_requests
+            .iter()
+            .any(|m| m == method::client::ELICITATION_CREATE),
+        "elicited a client that never said it could render one: {:?}",
+        driver.transcript.client_requests
+    );
+    assert!(driver.transcript.completed_elicitations.is_empty());
 
     driver.shutdown().await;
 }

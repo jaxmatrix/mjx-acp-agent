@@ -1,9 +1,13 @@
 //! The scripted turn.
 //!
 //! Ordered so a viewer developer sees each UI surface appear one at a time:
-//! thought → text → read tool call → plan → diff → permission → terminal.
-//! Every step checks for cancellation first, so `session/cancel` takes effect
-//! within one beat instead of at the end of the script.
+//! thought → text → read tool call → plan → diff → permission → terminal →
+//! elicitation. Every step checks for cancellation first, so `session/cancel`
+//! takes effect within one beat instead of at the end of the script.
+//!
+//! The last step runs only if the client declared it can be elicited. That is
+//! not defensiveness — it is what the protocol requires, and it is why the
+//! integration tests, which declare nothing, never see one.
 
 use mjx_acp_core::method;
 use serde_json::{Value, json};
@@ -238,6 +242,14 @@ pub async fn run_turn(agent: &Agent, session_id: &str, params: &Value) -> &'stat
     )
     .await;
 
+    // 8. Two elicitations: a structured question that is not a permission
+    //    decision. Both modes, because a form built from a schema and a link to
+    //    go away and come back from are separate rendering paths.
+    bail_if_cancelled!();
+    ask_how_to_record(agent, session_id).await;
+    bail_if_cancelled!();
+    confirm_out_of_band(agent, session_id).await;
+
     // Token accounting, for the usage bar.
     agent.update(
         session_id,
@@ -250,6 +262,155 @@ pub async fn run_turn(agent: &Agent, session_id: &str, params: &Value) -> &'stat
     );
 
     "end_turn"
+}
+
+/// The form the client is asked to fill in.
+///
+/// One property of every type the schema allows, so the viewer's form has no
+/// untested branch: a plain string, a titled single-select, a multi-select, an
+/// integer, a float, and a boolean.
+fn record_schema() -> Value {
+    json!({
+        "type": "object",
+        "title": "Record the fix",
+        "description": "Nothing is pushed until you say so.",
+        "properties": {
+            "branch": {
+                "type": "string",
+                "title": "Branch",
+                "description": "Where the commit goes.",
+                "default": "fix/median",
+                "minLength": 1,
+                "maxLength": 80
+            },
+            "remote": {
+                "type": "string",
+                "title": "Remote",
+                "oneOf": [
+                    { "const": "origin", "title": "origin",
+                      "description": "Your fork." },
+                    { "const": "upstream", "title": "upstream",
+                      "description": "The shared repository." }
+                ]
+            },
+            "reviewers": {
+                "type": "array",
+                "title": "Reviewers",
+                "description": "Nobody is required.",
+                "maxItems": 2,
+                "items": { "anyOf": [
+                    { "const": "ana", "title": "Ana" },
+                    { "const": "bo", "title": "Bo" },
+                    { "const": "cy", "title": "Cy" }
+                ]}
+            },
+            "attempts": {
+                "type": "integer",
+                "title": "Retries",
+                "description": "How many times to retry a rejected push.",
+                "minimum": 0,
+                "maximum": 5,
+                "default": 1
+            },
+            "timeout": {
+                "type": "number",
+                "title": "Timeout (seconds)",
+                "minimum": 0.5,
+                "maximum": 120.0,
+                "default": 30.0
+            },
+            "squash": {
+                "type": "boolean",
+                "title": "Squash the commits",
+                "default": true
+            }
+        },
+        "required": ["branch", "remote"]
+    })
+}
+
+/// Asks the client to fill in a form, and says what came back.
+///
+/// Skipped unless the client declared it can render one. A conformant agent does
+/// not elicit from a client that never offered to: the request would come back
+/// as a plain "method not found" and the user would see a turn fail for no
+/// visible reason.
+async fn ask_how_to_record(agent: &Agent, session_id: &str) {
+    if !agent.can_elicit_form() {
+        return;
+    }
+
+    beat(300).await;
+    let reply = agent
+        .request(
+            method::client::ELICITATION_CREATE,
+            json!({
+                "mode": "form",
+                "sessionId": session_id,
+                // Tied to the edit, so a client that shows which call an
+                // elicitation belongs to has something to show.
+                "toolCallId": "call_edit",
+                "message": "How should I record this fix?",
+                "requestedSchema": record_schema()
+            }),
+        )
+        .await;
+
+    let answered = reply
+        .ok()
+        .and_then(|result| serde_json::from_str::<Value>(result.get()).ok());
+    let summary = match answered.as_ref().map(|value| &value["action"]) {
+        Some(action) if action == "accept" => {
+            let content = &answered.as_ref().expect("just matched")["content"];
+            format!(
+                "\n\nPushing to `{}/{}`.",
+                content["remote"].as_str().unwrap_or("origin"),
+                content["branch"].as_str().unwrap_or("fix/median")
+            )
+        }
+        Some(action) if action == "decline" => "\n\nLeaving it uncommitted, then.".to_string(),
+        // Cancelled, refused, or a client that could not answer at all. Saying
+        // nothing was recorded is true in every one of those cases.
+        _ => "\n\nNothing recorded.".to_string(),
+    };
+    stream_text(agent, session_id, &summary).await;
+}
+
+/// Sends the client to a URL, then says the exchange is finished.
+///
+/// URL mode does not end with a response the way a form does — the client is
+/// told the elicitation completed by a notification. Here the agent completes it
+/// itself after a beat, which is what makes the demo deterministic: a real agent
+/// would be waiting on whatever the user does at the far end.
+async fn confirm_out_of_band(agent: &Agent, session_id: &str) {
+    if !agent.can_elicit_url() {
+        return;
+    }
+
+    beat(300).await;
+    let elicitation_id = "mock-elicitation-1";
+    let asked = agent.request(
+        method::client::ELICITATION_CREATE,
+        json!({
+            "mode": "url",
+            "sessionId": session_id,
+            "elicitationId": elicitation_id,
+            "url": "https://agentclientprotocol.com/protocol/elicitation",
+            "message": "Read the elicitation spec, then come back."
+        }),
+    );
+
+    // Concurrently, because the request is only answered once the client has
+    // been told the exchange is over.
+    let finish = async {
+        beat(1_200).await;
+        agent.notify(
+            method::client::ELICITATION_COMPLETE,
+            json!({ "elicitationId": elicitation_id }),
+        );
+    };
+
+    let (_, ()) = tokio::join!(asked, finish);
 }
 
 /// Sends `text` as `agent_message_chunk`s, one word at a time.
@@ -624,6 +785,65 @@ mod tests {
             ]
         });
         serde_json::from_value::<acp::RequestPermissionRequest>(request).unwrap();
+    }
+
+    #[test]
+    fn the_form_elicitation_matches_the_schema() {
+        let request = json!({
+            "mode": "form",
+            "sessionId": "s1",
+            "toolCallId": "call_edit",
+            "message": "How should I record this fix?",
+            "requestedSchema": record_schema()
+        });
+        let parsed = serde_json::from_value::<acp::CreateElicitationRequest>(request).unwrap();
+
+        // Reading it back as the real type is not enough on its own: the schema
+        // keeps an unrecognised property as `Other` rather than rejecting it, so
+        // a typo in a `type` would parse and then render as nothing. Naming the
+        // variants is what makes the assertion mean something.
+        let acp::ElicitationMode::Form(form) = &parsed.mode else {
+            panic!("not read as a form: {:?}", parsed.mode);
+        };
+        let properties = &form.requested_schema.properties;
+        let kinds: Vec<&str> = [
+            "branch",
+            "remote",
+            "reviewers",
+            "attempts",
+            "timeout",
+            "squash",
+        ]
+        .iter()
+        .map(|name| match properties.get(*name) {
+            Some(acp::ElicitationPropertySchema::String(_)) => "string",
+            Some(acp::ElicitationPropertySchema::Integer(_)) => "integer",
+            Some(acp::ElicitationPropertySchema::Number(_)) => "number",
+            Some(acp::ElicitationPropertySchema::Boolean(_)) => "boolean",
+            Some(acp::ElicitationPropertySchema::Array(_)) => "array",
+            other => panic!("{name} was read as {other:?}"),
+        })
+        .collect();
+        assert_eq!(
+            kinds,
+            ["string", "string", "array", "integer", "number", "boolean"]
+        );
+    }
+
+    #[test]
+    fn the_url_elicitation_matches_the_schema() {
+        let request = json!({
+            "mode": "url",
+            "sessionId": "s1",
+            "elicitationId": "mock-elicitation-1",
+            "url": "https://agentclientprotocol.com/protocol/elicitation",
+            "message": "Read the elicitation spec, then come back."
+        });
+        let parsed = serde_json::from_value::<acp::CreateElicitationRequest>(request).unwrap();
+        assert!(matches!(parsed.mode, acp::ElicitationMode::Url(_)));
+
+        let notification = json!({ "elicitationId": "mock-elicitation-1" });
+        serde_json::from_value::<acp::CompleteElicitationNotification>(notification).unwrap();
     }
 
     #[test]
