@@ -1318,6 +1318,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mjx-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mjx-acp-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mjx-mock-agent"
 version = "0.1.0"
 dependencies = [

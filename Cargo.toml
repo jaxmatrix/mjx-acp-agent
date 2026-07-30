@@ -5,6 +5,7 @@ members = [
     "crates/mjx-acp-thread",
     "crates/mjx-agent-catalog",
     "crates/mjx-workspace",
+    "crates/mjx-mcp",
     "crates/mjx-acp-server",
     "crates/mjx-mock-agent",
 ]
@@ -22,6 +23,7 @@ mjx-acp-core = { path = "crates/mjx-acp-core" }
 mjx-acp-thread = { path = "crates/mjx-acp-thread" }
 mjx-agent-catalog = { path = "crates/mjx-agent-catalog" }
 mjx-workspace = { path = "crates/mjx-workspace" }
+mjx-mcp = { path = "crates/mjx-mcp" }
 
 # Same pin Zed uses (../zed/Cargo.toml:519). We consume this crate for its
 # schema types; the JSON-RPC relay itself works on raw frames.
