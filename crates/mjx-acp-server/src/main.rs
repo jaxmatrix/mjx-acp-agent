@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 mod agent_process;
 mod config;
 mod id_bridge;
-#[allow(dead_code, reason = "the relay calls into this in the next commit")]
 mod mcp;
 mod relay;
 mod sessions;
@@ -555,7 +554,7 @@ async fn websocket(
             let pooled = Arc::new(Pooled {
                 agent_id: connect.agent.clone(),
                 cwd: cwd.clone(),
-                connection: relay::start(interceptor, agent, info),
+                connection: relay::start(interceptor, agent, info, state.config.mcp_servers.clone()),
                 idle_since: std::sync::Mutex::new(Some(Instant::now())),
             });
             // With resuming turned off there is nothing to come back to, so the

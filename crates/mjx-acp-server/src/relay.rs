@@ -18,7 +18,9 @@ use mjx_acp_core::{
 };
 
 use crate::agent_process::{AgentHandle, AgentProcess};
+use crate::config::McpServerConfig;
 use crate::id_bridge::IdBridge;
+use crate::mcp::{self, Transports};
 use crate::sessions::SessionStore;
 
 /// How a frame should be handled.
@@ -235,6 +237,10 @@ pub struct Relay<I: Interceptor> {
     /// Announced to each browser once its handshake is answered.
     /// See [`Relay::announce_after_handshake`].
     agent_info: ext::AgentInfo,
+    /// MCP servers from `mjx.toml`, added to every session the browser opens.
+    /// Configuration rather than a capability, which is why it lives here beside
+    /// `agent_info` and not in the interceptor.
+    mcp_servers: Vec<McpServerConfig>,
     /// The agent's answers to the once-per-agent handshake.
     handshake: tokio::sync::Mutex<Handshake>,
     /// Questions the agent has put to the browser and is still waiting on.
@@ -266,6 +272,10 @@ pub struct Relay<I: Interceptor> {
 struct Handshake {
     initialize: Option<Box<serde_json::value::RawValue>>,
     new_session: Option<Box<serde_json::value::RawValue>>,
+    /// Which MCP transports the agent declared, read out of `initialize` once.
+    /// Kept here because this is where the answer is, and because a browser that
+    /// reattached never asks `initialize` again — so nothing else would know.
+    transports: Option<Transports>,
     /// Whether the browser now attached should have its first `session/new`
     /// answered from the recording. Cleared once it has been, so a client that
     /// deliberately opens a second session still gets a real one.
@@ -289,6 +299,23 @@ impl Handshake {
         // The first answer is the one that holds. A later `session/new` is a
         // second session, not a correction of the first.
         slot.get_or_insert_with(|| result.to_owned());
+    }
+
+    /// The MCP transports the agent declared, parsed once.
+    ///
+    /// Empty until `initialize` has been answered — a client that pipelined a
+    /// `session/new` behind it gets stdio servers only, which every agent
+    /// supports, rather than a guess.
+    fn transports(&mut self) -> Transports {
+        if let Some(transports) = self.transports {
+            return transports;
+        }
+        let Some(initialize) = &self.initialize else {
+            return Transports::default();
+        };
+        *self
+            .transports
+            .insert(Transports::from_initialize_result(initialize))
     }
 
     /// The recorded answer to `method`, if this attachment should be given it.
@@ -348,6 +375,7 @@ pub fn start<I: Interceptor>(
     interceptor: Arc<I>,
     agent: AgentProcess,
     agent_info: ext::AgentInfo,
+    mcp_servers: Vec<McpServerConfig>,
 ) -> Arc<Connection<I>> {
     let AgentProcess {
         handle,
@@ -368,6 +396,7 @@ pub fn start<I: Interceptor>(
             to_agent,
         },
         agent_info,
+        mcp_servers,
         handshake: tokio::sync::Mutex::new(Handshake::default()),
         unanswered: tokio::sync::Mutex::new(Vec::new()),
         sessions: tokio::sync::Mutex::new(SessionStore::new()),
@@ -616,6 +645,18 @@ impl<I: Interceptor> Relay<I> {
                 params: params.clone(),
             },
             _ => frame,
+        };
+
+        // Add the configured MCP servers before anything observes the frame, so
+        // the store, the inspector and the interceptor all see the bytes the
+        // agent will actually receive. A `session/new` answered from the
+        // recording never arrives here, which is right: the agent that is still
+        // running was given these servers when the first browser opened it.
+        let frame = if direction == Direction::ClientToAgent && !self.mcp_servers.is_empty() {
+            let transports = self.handshake.lock().await.transports();
+            mcp::merge_mcp_servers(&frame, &self.mcp_servers, &transports).unwrap_or(frame)
+        } else {
+            frame
         };
 
         let method = self.correlator.lock().await.observe(direction, &frame);
@@ -1001,6 +1042,28 @@ mod tests {
         let params: serde_json::Value =
             serde_json::from_str(frame.params().unwrap().get()).unwrap();
         params["clientCapabilities"].clone()
+    }
+
+    #[test]
+    fn the_agents_mcp_transports_are_read_from_the_handshake_it_recorded() {
+        let mut handshake = Handshake::default();
+        // Before `initialize` is answered there is nothing to read, and the
+        // answer must be the conservative one rather than a guess.
+        assert_eq!(handshake.transports(), Transports::default());
+
+        let result = serde_json::value::to_raw_value(&json!({
+            "protocolVersion": 1,
+            "agentCapabilities": { "mcpCapabilities": { "http": true, "sse": false } },
+        }))
+        .unwrap();
+        handshake.record(method::agent::INITIALIZE, &result);
+
+        let transports = handshake.transports();
+        assert!(transports.http);
+        assert!(!transports.sse);
+        // Read once and kept: a browser that reattaches never asks `initialize`
+        // again, so the recording is the only copy there will ever be.
+        assert_eq!(handshake.transports(), transports);
     }
 
     #[test]
