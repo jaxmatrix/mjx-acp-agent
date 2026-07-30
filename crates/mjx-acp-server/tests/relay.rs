@@ -1368,3 +1368,113 @@ async fn the_relay_forwards_frames_it_cannot_classify() {
 
     server.stop().await;
 }
+
+/// The sessions the agent lists, through the relay.
+async fn list_sessions(client: &mut Client, params: Value) -> Vec<Value> {
+    let listed = client.request(method::agent::SESSION_LIST, params).await;
+    listed["sessions"].as_array().cloned().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_past_conversation_is_listed_loaded_and_folded() {
+    // The session lifecycle is forwarded like anything else — the relay
+    // intercepts none of it — and the thread the server folds from a replay is
+    // the one a browser that reloads gets back.
+    let server = Server::start().await;
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+
+    // What the agent said it can do has to reach the browser intact: the UI
+    // offers only what is advertised here.
+    let init = client
+        .request(
+            method::agent::INITIALIZE,
+            json!({ "protocolVersion": mjx_acp_core::PROTOCOL_VERSION, "clientCapabilities": {} }),
+        )
+        .await;
+    assert_eq!(init["agentCapabilities"]["loadSession"], true);
+    assert!(init["agentCapabilities"]["sessionCapabilities"]["list"].is_object());
+    let info = client.wait_for_ext(ext::AGENT_INFO).await;
+
+    let cwd = info["cwd"].clone();
+    let sessions = list_sessions(&mut client, json!({ "cwd": cwd })).await;
+    let past = sessions
+        .first()
+        .expect("the mock agent seeds a conversation from before this run")["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The replay arrives as `session/update` notifications, and `request`
+    // records them on the way past the response.
+    let before = client.updates.len();
+    client
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": past, "cwd": cwd, "mcpServers": [] }),
+        )
+        .await;
+    let replayed = client.updates.len() - before;
+    assert!(replayed > 0, "the load replayed nothing");
+
+    let thread = client
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": past }))
+        .await;
+    let entries = thread["entries"].as_array().expect("no entries").len();
+    assert!(entries > 0, "the server folded none of the replay");
+    assert_eq!(thread["entries"][0]["type"], "user");
+
+    // Again: a second load rebuilds the conversation rather than doubling it.
+    client
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": past, "cwd": cwd, "mcpServers": [] }),
+        )
+        .await;
+    let thread = client
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": past }))
+        .await;
+    assert_eq!(thread["entries"].as_array().map(Vec::len), Some(entries));
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_deleted_session_leaves_neither_a_listing_nor_a_thread() {
+    let server = Server::start().await;
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    let (_, session_id) = open_session(&mut client).await;
+    client
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    assert!(
+        !client
+            .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+            .await
+            .is_null()
+    );
+
+    client
+        .request(method::agent::SESSION_DELETE, json!({ "sessionId": session_id }))
+        .await;
+
+    let sessions = list_sessions(&mut client, json!({})).await;
+    assert!(
+        !sessions.iter().any(|s| s["sessionId"] == session_id.as_str()),
+        "the agent still lists a deleted session: {sessions:#?}"
+    );
+    // And the server let go of it too: replaying a session the agent has
+    // deleted should answer "nothing", not hand back a conversation that no
+    // longer exists anywhere else.
+    let thread = client
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    assert!(thread.is_null(), "{thread:#}");
+
+    server.stop().await;
+}
