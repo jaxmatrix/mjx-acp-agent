@@ -68,6 +68,12 @@ pub struct Agent {
     elicitation_form: AtomicBool,
     /// Whether the client said it can send the user to a URL.
     elicitation_url: AtomicBool,
+    /// How many `mcp/message` notifications the client has sent us.
+    ///
+    /// A hosted MCP server speaks unprompted — `notifications/tools/list_changed`
+    /// after its handshake — and the only proof that reached the agent is that
+    /// something here counted it.
+    mcp_notifications: AtomicI64,
     /// Every conversation this agent has, so it can list one and load it back.
     ///
     /// A `std::sync::Mutex` rather than tokio's, because [`Agent::update`] is
@@ -305,6 +311,92 @@ impl Agent {
         listed
     }
 
+    /// Connects to a server the *client* is holding, and reports what it found.
+    ///
+    /// This is the agent half of MCP-over-ACP: connect by the id we were offered,
+    /// run the MCP handshake, list the tools and call one — every message wrapped
+    /// in `mcp/message` and carried by whoever is holding the server. `None` when
+    /// no server was offered that way, which is the ordinary case.
+    ///
+    /// Failures are reported rather than raised: a test looking at this wants to
+    /// read what went wrong, not watch `session/new` fail with no detail.
+    async fn use_hosted_mcp(&self, meta: &Value) -> Option<Value> {
+        let server_id = meta["mjx.mcpServers"]
+            .as_array()?
+            .iter()
+            .find(|server| server["transport"] == "acp")?["serverId"]
+            .as_str()?
+            .to_string();
+
+        let connected = match self
+            .request(
+                method::client::MCP_CONNECT,
+                json!({ "serverId": server_id }),
+            )
+            .await
+        {
+            Ok(result) => serde_json::from_str::<Value>(result.get()).unwrap_or(Value::Null),
+            Err(error) => return Some(json!({ "error": error.message })),
+        };
+        let Some(connection_id) = connected["connectionId"].as_str().map(str::to_owned) else {
+            return Some(json!({ "error": "mcp/connect answered without a connectionId" }));
+        };
+
+        let mut report = json!({ "serverId": server_id, "connectionId": connection_id });
+
+        // The MCP handshake, and then the two calls that prove a tool is really
+        // reachable: what is offered, and what happens when it is used.
+        for (key, method, params) in [
+            (
+                "initialize",
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "mjx-mock-agent", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            ),
+            ("tools", "tools/list", json!({})),
+            (
+                "called",
+                "tools/call",
+                json!({ "name": "mock_stat", "arguments": { "path": "." } }),
+            ),
+        ] {
+            let message = json!({
+                "connectionId": connection_id,
+                "method": method,
+                "params": params
+            });
+            match self.request(method::client::MCP_MESSAGE, message).await {
+                Ok(result) => {
+                    report[key] = serde_json::from_str(result.get()).unwrap_or(Value::Null);
+                }
+                Err(error) => {
+                    report[key] = json!({ "error": error.message });
+                    return Some(report);
+                }
+            }
+        }
+
+        // Read before letting go, so anything the server said unprompted during
+        // the exchange above has had its chance to arrive.
+        report["notifications"] = self.mcp_notifications.load(Ordering::Relaxed).into();
+
+        // Done with it. A real agent would hold the connection for the session;
+        // this one lets go immediately, so a client that leaks the child it
+        // spawned has somewhere to be caught.
+        report["disconnected"] = self
+            .request(
+                method::client::MCP_DISCONNECT,
+                json!({ "connectionId": connection_id }),
+            )
+            .await
+            .is_ok()
+            .into();
+        Some(report)
+    }
+
     async fn resolve(&self, id: &RequestId, reply: Reply) {
         if let Some(tx) = self.pending.lock().await.remove(id) {
             let _ = tx.send(reply);
@@ -340,6 +432,7 @@ async fn main() -> Result<()> {
         config: Mutex::new(HashMap::new()),
         elicitation_form: AtomicBool::new(false),
         elicitation_url: AtomicBool::new(false),
+        mcp_notifications: AtomicI64::new(0),
         sessions: std::sync::Mutex::new(HashMap::new()),
     });
     seed_yesterdays_conversation(&agent).await;
@@ -384,6 +477,13 @@ async fn dispatch(agent: Arc<Agent>, frame: Frame) {
             agent.resolve(&id, reply).await;
         }
         Frame::Notification { method, params } => {
+            // A hosted MCP server talking to us unprompted, carried over ACP.
+            // Counted rather than acted on: this agent has no use for a tool
+            // list that changed, but a test needs to know it arrived.
+            if method == method::agent::MCP_MESSAGE {
+                agent.mcp_notifications.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if method == method::agent::SESSION_CANCEL {
                 let session_id = params
                     .as_deref()
@@ -468,11 +568,19 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                 .await
                 .insert(session_id.clone(), default_config_values());
             agent.open_session(&session_id, cwd_of(&params).as_str(), None, &[]);
+            let mut meta = mcp_servers_meta(&params)?;
+            // A server offered over ACP is one the *client* is holding, so using
+            // it is the only way to find out whether it works. A real agent would
+            // do this to get its tools; this one does it so a test can see that
+            // the whole path carries them.
+            if let Some(report) = agent.use_hosted_mcp(&meta).await {
+                meta["mjx.mcp"] = report;
+            }
             Ok(json!({
                 "sessionId": session_id,
                 "modes": modes(),
                 "configOptions": config_options(&default_config_values()),
-                "_meta": mcp_servers_meta(&params)?
+                "_meta": meta
             }))
         }
 
@@ -638,6 +746,16 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
         }
 
         m::AUTHENTICATE => Ok(json!({})),
+
+        // The other direction of MCP-over-ACP: a server the client is holding has
+        // something to ask, and this agent is its MCP client. Answered as an MCP
+        // client answers — the response is the bare inner result, with no
+        // envelope, because `MessageMcpResponse` is transparent.
+        m::MCP_MESSAGE => match params["method"].as_str() {
+            Some("roots/list") => Ok(json!({ "roots": [] })),
+            Some(other) => Err(JsonRpcError::method_not_found(other)),
+            None => Err(JsonRpcError::invalid_params("`method` is required")),
+        },
 
         other => Err(JsonRpcError::method_not_found(other)),
     }
