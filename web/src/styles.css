@@ -64,6 +64,16 @@ button {
   grid-template-columns: minmax(0, 1fr) 17rem 26rem;
 }
 
+/* The history sits on the far side from the inspector: one is where a
+   conversation is chosen, the other is where the protocol is read. */
+.app--with-history .app__body {
+  grid-template-columns: 19rem minmax(0, 1fr) 17rem;
+}
+
+.app--with-history.app--with-inspector .app__body {
+  grid-template-columns: 19rem minmax(0, 1fr) 17rem 26rem;
+}
+
 .app__main {
   display: flex;
   flex-direction: column;
@@ -847,6 +857,98 @@ button {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* --------------------------------------------------------------- history */
+
+.history {
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  overflow-y: auto;
+  min-width: 0;
+}
+
+.history__header {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.7rem 0.85rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.history__header h2 {
+  margin: 0;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+
+.history__actions {
+  display: flex;
+  gap: 0.2rem;
+}
+
+.history__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.history__entry {
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.history__entry.is-current {
+  background: var(--panel-2);
+  border-left: 2px solid var(--accent);
+}
+
+.history__title {
+  margin: 0;
+  font-size: 0.85rem;
+  /* Titles are the agent's words, and some agents use the whole first prompt.
+     Two lines is enough to tell conversations apart. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.history__meta,
+.history__cwd {
+  margin: 0.15rem 0 0;
+  font-size: 0.75rem;
+}
+
+.history__cwd {
+  overflow-wrap: anywhere;
+}
+
+.history__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.35rem;
+}
+
+.history__empty,
+.history__more {
+  padding: 0.85rem;
+}
+
+.link-button--danger {
+  color: var(--removed);
+}
+
+.link-button:disabled {
+  color: var(--dim);
+  cursor: default;
 }
 
 /* -------------------------------------------------------------- composer */
