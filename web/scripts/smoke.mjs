@@ -24,6 +24,10 @@ const seen = {
   updates: [],
   ext: new Map(),
   permissionAsked: false,
+  /** Params of every `elicitation/create` the agent sent, in order. */
+  elicitations: [],
+  /** Ids from every `elicitation/complete`. */
+  completed: [],
 };
 
 /** Resolvers for `waitForExt`, keyed by method. */
@@ -71,6 +75,13 @@ const client = acp
     const allow =
       ctx.params.options.find((o) => o.kind === "allow_once") ?? ctx.params.options[0];
     return { outcome: { outcome: "selected", optionId: allow.optionId } };
+  })
+  .onRequest(acp.methods.client.elicitation.create, (ctx) => {
+    seen.elicitations.push(ctx.params);
+    return { action: "accept", content: { branch: "fix/median", remote: "upstream" } };
+  })
+  .onNotification(acp.methods.client.elicitation.complete, (ctx) => {
+    seen.completed.push(ctx.params.elicitationId);
   });
 
 // The `_mjx/*` namespace: everything the server does on the browser's behalf.
@@ -101,8 +112,9 @@ function check(condition, description) {
 const result = await client.connectWith(stream, async (agent) => {
   const initialized = await agent.request(acp.methods.agent.initialize, {
     protocolVersion: acp.PROTOCOL_VERSION,
-    // Declare nothing: the server must add fs and terminal on our behalf.
-    clientCapabilities: {},
+    // `fs` and `terminal` are deliberately absent: the server must add those on
+    // our behalf. `elicitation` is ours to declare, because it needs a human.
+    clientCapabilities: { elicitation: { form: {}, url: {} } },
   });
 
   // Sent right after the initialize response, never before it: a conformant
@@ -161,6 +173,23 @@ check(
   "the announced model was not the one the agent switched to",
 );
 check(seen.permissionAsked, "the agent never asked for permission");
+
+// Elicitation: both modes, since the two are separate rendering paths.
+check(
+  seen.elicitations.map((e) => e.mode).join(",") === "form,url",
+  `elicitation modes were ${seen.elicitations.map((e) => e.mode).join(",") || "none"}`,
+);
+const form = seen.elicitations.find((e) => e.mode === "form");
+check(
+  Object.keys(form?.requestedSchema?.properties ?? {}).length >= 6,
+  "the form schema did not cover every field type",
+);
+// URL mode does not end with the answer, so the notification is the only proof
+// the exchange actually completed.
+check(
+  seen.completed.length > 0,
+  "no elicitation/complete arrived, so the url exchange never finished",
+);
 
 // A diff with real before/after text proves the server read the file for us.
 const diff = seen.updates

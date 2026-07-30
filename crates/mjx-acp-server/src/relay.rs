@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use mjx_acp_core::{
-    Direction, Frame, JsonRpcError, MethodCorrelator, ResponsePayload, acp, ext, method,
+    Direction, Frame, JsonRpcError, MethodCorrelator, ResponsePayload, ext, method,
 };
 
 use crate::agent_process::{AgentHandle, AgentProcess};

@@ -22,7 +22,7 @@ import { createWebSocketStream } from "@agentclientprotocol/sdk/experimental/ws-
 globalThis.WebSocket ??= WebSocket;
 const base = process.argv[2] ?? "ws://127.0.0.1:4321";
 
-function open(query, { answerPermission = false } = {}) {
+function open(query, { answerPermission = false, answerElicitation = false } = {}) {
   const info = {};
   const notes = [];
   const app = acp
@@ -34,7 +34,13 @@ function open(query, { answerPermission = false } = {}) {
         return { outcome: { outcome: "selected", optionId: "allow_once" } };
       }
       return new Promise(() => {}); // never answer: park the turn
-    });
+    })
+    .onRequest(acp.methods.client.elicitation.create, (ctx) => {
+      notes.push(`elicited:${ctx.params.mode}`);
+      if (answerElicitation) return { action: "accept", content: { branch: "fix/median" } };
+      return new Promise(() => {}); // park on the open form
+    })
+    .onNotification(acp.methods.client.elicitation.complete, () => {});
   const noop = (v) => v;
   app.onNotification("_mjx/agent/info", noop, (ctx) => Object.assign(info, ctx.params));
   app.onNotification("_mjx/session/turn_ended", noop, (ctx) =>
@@ -58,7 +64,7 @@ function open(query, { answerPermission = false } = {}) {
 async function handshake(c) {
   await c.connection.agent.request(acp.methods.agent.initialize, {
     protocolVersion: acp.PROTOCOL_VERSION,
-    clientCapabilities: {},
+    clientCapabilities: { elicitation: { form: {}, url: {} } },
     clientInfo: { name: "resume-smoke", version: "0" },
   });
   return c.connection.agent.request(acp.methods.agent.session.new, {
@@ -117,8 +123,11 @@ await until("the agent asked the first tab for permission", () =>
 );
 first.connection.close();
 
-// Second tab: the reload. This one answers, so the turn should finish.
-const second = open(`agent=mock&resume=${first.info.connectionId}`, { answerPermission: true });
+// Second tab: the reload. This one answers everything, so the turn should finish.
+const second = open(`agent=mock&resume=${first.info.connectionId}`, {
+  answerPermission: true,
+  answerElicitation: true,
+});
 const s2 = await handshake(second);
 check(second.info.resumed === true, "the reload rejoined the running agent");
 check(s2.sessionId === s1.sessionId, `the same session came back (${s2.sessionId})`);
@@ -158,6 +167,59 @@ const finished = await second.connection.agent.request("_mjx/session/replay", {
 });
 check(finished.status === "idle", "the thread is idle again");
 check(finished.stopReason === "end_turn", "with the reason the turn ended for");
+
+// A reload with a *form* open, which is the other half of this. A permission
+// prompt is re-asked and nothing else; an elicitation is re-asked *and* carried
+// in the thread, and the two have to land as one question rather than two.
+// Permission is answered so the turn gets as far as the form, then parks there.
+const formTab = open("agent=mock", { answerPermission: true });
+const s3 = await handshake(formTab);
+formTab.connection.agent
+  .request(acp.methods.agent.session.prompt, {
+    sessionId: s3.sessionId,
+    prompt: [{ type: "text", text: "fix the median bug" }],
+  })
+  .catch(() => {});
+await until("the agent put a form to the first tab", () =>
+  formTab.notes.includes("elicited:form"),
+);
+formTab.connection.close();
+
+const formReload = open(`agent=mock&resume=${formTab.info.connectionId}`, {
+  answerPermission: true,
+  answerElicitation: true,
+});
+await handshake(formReload);
+const withForm = await formReload.connection.agent.request("_mjx/session/replay", {
+  sessionId: s3.sessionId,
+});
+const carried = withForm.entries.filter((e) => e.type === "elicitation");
+check(carried.length === 1, `the replay carried ${carried.length} elicitations, expected 1`);
+check(carried[0].state === "pending", `the carried form is ${carried[0].state}, expected pending`);
+check(carried[0].mode === "form", "the carried form kept its mode");
+check(Boolean(carried[0].requestedSchema?.properties), "the carried form kept its schema");
+// The request id is what pairs the carried copy with the re-asked one. Without
+// it the browser would draw two forms for one question.
+check(carried[0].requestId !== undefined, "the carried form carries the id to answer with");
+await until("the open form was re-asked so it can be answered", () =>
+  formReload.notes.includes("elicited:form"),
+);
+await until("answering the re-asked form let the turn finish", () =>
+  formReload.notes.some((n) => n === "turn_ended:end_turn"),
+);
+const answered = await formReload.connection.agent.request("_mjx/session/replay", {
+  sessionId: s3.sessionId,
+});
+const settled = answered.entries.filter((e) => e.type === "elicitation");
+check(
+  settled.every((e) => e.state !== "pending"),
+  `no form was left pending once the turn ended (${settled.map((e) => e.state).join(",")})`,
+);
+check(
+  settled.some((e) => e.state === "accepted" && e.content?.branch === "fix/median"),
+  "what the user typed survived into the thread",
+);
+formReload.connection.close();
 
 // A third tab takes it over, and the second is told why.
 const third = open(`agent=mock&resume=${first.info.connectionId}`);

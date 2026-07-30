@@ -40,7 +40,7 @@ fn folded() -> Thread {
 fn every_recorded_update_parses() {
     // The fixture is real agent output. If the schema types can't read it back,
     // one of the two is wrong.
-    assert_eq!(FIXTURE.lines().filter(|l| !l.trim().is_empty()).count(), 69);
+    assert_eq!(FIXTURE.lines().filter(|l| !l.trim().is_empty()).count(), 74);
     let _ = folded();
 }
 
@@ -193,6 +193,102 @@ fn the_serialized_thread_matches_the_checked_in_fixture() {
     assert_eq!(
         checked_in, serialized,
         "the replay fixture is out of date; regenerate with MJX_UPDATE_FIXTURES=1"
+    );
+}
+
+/// A thread holding one of every elicitation shape.
+///
+/// Hand-built rather than captured, because an elicitation is a *request* and
+/// `fixtures/session-updates.jsonl` holds only notifications — the recorded turn
+/// cannot contain one no matter how the mock is scripted. What can still be
+/// pinned is the serialization, which is what the browser has to read back.
+fn asked() -> Thread {
+    let ask = |params: serde_json::Value| -> acp::CreateElicitationRequest {
+        serde_json::from_value(params).expect("the fixture is a valid elicitation")
+    };
+
+    let mut thread = Thread::new();
+    thread.push_elicitation(
+        mjx_acp_core::RequestId::Number(7),
+        &ask(serde_json::json!({
+            "mode": "form",
+            "sessionId": "s1",
+            "toolCallId": "call_edit",
+            "message": "How should I record this fix?",
+            "requestedSchema": {
+                "type": "object",
+                "title": "Record the fix",
+                "properties": {
+                    "branch": { "type": "string", "title": "Branch", "default": "fix/median" },
+                    "remote": { "type": "string", "title": "Remote", "oneOf": [
+                        { "const": "origin", "title": "origin" }
+                    ]},
+                    "reviewers": { "type": "array", "title": "Reviewers", "maxItems": 2,
+                                   "items": { "anyOf": [{ "const": "ana", "title": "Ana" }] } },
+                    "attempts": { "type": "integer", "title": "Retries", "minimum": 0 },
+                    "timeout": { "type": "number", "title": "Timeout", "minimum": 0.5 },
+                    "squash": { "type": "boolean", "title": "Squash", "default": true }
+                },
+                "required": ["branch", "remote"]
+            }
+        })),
+    );
+    thread.settle_elicitation(
+        &mjx_acp_core::RequestId::Number(7),
+        mjx_acp_thread::ElicitationState::Accepted,
+        Some(std::collections::BTreeMap::from([
+            ("branch".to_string(), "fix/median".into()),
+            (
+                "attempts".to_string(),
+                acp::ElicitationContentValue::Integer(2),
+            ),
+            (
+                "squash".to_string(),
+                acp::ElicitationContentValue::Boolean(true),
+            ),
+            (
+                "reviewers".to_string(),
+                acp::ElicitationContentValue::StringArray(vec!["ana".to_string()]),
+            ),
+        ])),
+    );
+
+    // A second one still waiting, in the other mode, so both render paths and
+    // both lifecycle ends are in the file.
+    thread.push_elicitation(
+        mjx_acp_core::RequestId::String("a".into()),
+        &ask(serde_json::json!({
+            "mode": "url",
+            "sessionId": "s1",
+            "elicitationId": "el-1",
+            "url": "https://agentclientprotocol.com/protocol/elicitation",
+            "message": "Read the spec, then come back."
+        })),
+    );
+    thread
+}
+
+#[test]
+fn the_serialized_elicitations_match_the_checked_in_fixture() {
+    // Same job as the test above, for the one entry kind the recorded turn can
+    // never contain. The browser reads this file back through its replay
+    // adapter, so a renamed field or a mode spelled differently fails there
+    // rather than in a real reload.
+    //
+    // Regenerate with:  MJX_UPDATE_FIXTURES=1 cargo test -p mjx-acp-thread
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/session-elicitations.json");
+    let serialized = format!("{}\n", serde_json::to_string_pretty(&asked()).unwrap());
+
+    if std::env::var_os("MJX_UPDATE_FIXTURES").is_some() {
+        std::fs::write(&path, &serialized).expect("could not write the fixture");
+        return;
+    }
+
+    let checked_in = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        checked_in, serialized,
+        "the elicitation fixture is out of date; regenerate with MJX_UPDATE_FIXTURES=1"
     );
 }
 

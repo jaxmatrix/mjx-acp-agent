@@ -536,7 +536,9 @@ button {
   margin-top: 0.6rem;
 }
 
-.elicitation__field label {
+/* Not every label: a toggle's is a flex row, and `display: block` here would
+   out-specify `.config-option--toggle` and collapse the gap onto the box. */
+.elicitation__field label:not(.config-option--toggle) {
   display: block;
   font-size: 0.8rem;
   margin-bottom: 0.15rem;

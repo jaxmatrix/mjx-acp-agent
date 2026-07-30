@@ -40,7 +40,7 @@ function folded(): Thread {
 
 describe("the recorded turn", () => {
   test("every update is present", () => {
-    expect(updates).toHaveLength(69);
+    expect(updates).toHaveLength(74);
   });
 
   test("folds to the same shape the Rust model produces", () => {
@@ -117,5 +117,66 @@ describe("the recorded turn", () => {
       readFileSync(join(fixtures, "session-thread.json"), "utf8"),
     );
     expect(threadFromReplay(replayed)).toEqual(folded());
+  });
+});
+
+describe("the elicitation fixture", () => {
+  // The recorded turn cannot cover this one. An elicitation is a *request* and
+  // `session-updates.jsonl` holds only notifications, so no way of scripting the
+  // mock would put one in there. `session-elicitations.json` is written by the
+  // Rust model instead — the same pinning, applied to the entry kind the capture
+  // can never reach.
+  //
+  // Regenerate with:  MJX_UPDATE_FIXTURES=1 cargo test -p mjx-acp-thread
+  const thread = threadFromReplay(
+    JSON.parse(readFileSync(join(fixtures, "session-elicitations.json"), "utf8")),
+  );
+
+  function nth(index: number) {
+    const entry = thread?.entries[index];
+    if (entry?.type !== "elicitation") throw new Error(`entry ${index} is not an elicitation`);
+    return entry.elicitation;
+  }
+
+  test("both entries survive the wire", () => {
+    expect(thread?.entries).toHaveLength(2);
+  });
+
+  test("an answered form keeps its schema and what was submitted", () => {
+    const asked = nth(0);
+    expect(asked.requestId).toBe(7);
+    expect(asked.toolCallId).toBe("call_edit");
+    expect(asked.state).toBe("accepted");
+    // Every property type, because each is a separate control in the form.
+    expect(asked.mode.mode).toBe("form");
+    if (asked.mode.mode !== "form") throw new Error("unreachable");
+    const properties = asked.mode.requestedSchema.properties ?? {};
+    expect(Object.entries(properties).map(([name, p]) => [name, p.type])).toEqual([
+      ["attempts", "integer"],
+      ["branch", "string"],
+      ["remote", "string"],
+      ["reviewers", "array"],
+      ["squash", "boolean"],
+      ["timeout", "number"],
+    ]);
+    // Every value shape the protocol allows, read back as itself rather than as
+    // a string: a number that arrives as "2" renders in the wrong control.
+    expect(asked.content).toEqual({
+      branch: "fix/median",
+      attempts: 2,
+      squash: true,
+      reviewers: ["ana"],
+    });
+  });
+
+  test("a pending url question keeps the id its completion will name", () => {
+    const asked = nth(1);
+    expect(asked.requestId).toBe("a");
+    expect(asked.state).toBe("pending");
+    expect(asked.mode).toEqual({
+      mode: "url",
+      elicitationId: "el-1",
+      url: "https://agentclientprotocol.com/protocol/elicitation",
+    });
   });
 });

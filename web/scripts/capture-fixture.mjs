@@ -40,6 +40,11 @@ const client = acp
         .optionId,
     },
   }))
+  // Answered, not parked: the recording has to reach the end of the turn. The
+  // elicitation itself is a request and so never appears in the fixture — only
+  // what the agent says once it has the answer.
+  .onRequest(acp.methods.client.elicitation.create, () => ({ action: "accept" }))
+  .onNotification(acp.methods.client.elicitation.complete, () => {})
   .onNotification(
     "_mjx/agent/info",
     (v) => v,
@@ -54,8 +59,10 @@ const stream = createWebSocketStream(`${base}/ws?agent=${encodeURIComponent(agen
 
 const stopReason = await client.connectWith(stream, async (agent) => {
   await agent.request(acp.methods.agent.initialize, {
+    // Whatever the real browser declares, so the recording is of the turn the
+    // real browser gets. Declare less and the agent leaves steps out.
     protocolVersion: acp.PROTOCOL_VERSION,
-    clientCapabilities: {},
+    clientCapabilities: { elicitation: { form: {}, url: {} } },
   });
   const session = await agent.request(acp.methods.agent.session.new, {
     cwd,

@@ -138,7 +138,7 @@
           "content": [
             {
               "type": "text",
-              "text": "\nAll four tests pass now. The `median` fix is in place."
+              "text": "\nAll four tests pass now. The `median` fix is in place.\n\nPushing to `origin/fix/median`."
             }
           ]
         }
