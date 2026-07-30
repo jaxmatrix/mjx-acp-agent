@@ -37,7 +37,8 @@ Needs no credentials and no network.
 Pick **Mock Agent** and ask it anything. It scripts a full turn — a thought
 block, streaming text, a file read, a plan, a diff, a permission request, a live
 terminal, and a form to fill in — so every UI surface is exercised out of the
-box. It genuinely
+box. It also starts with one conversation already behind it, so **History** has
+something to open before you have had a second one. It genuinely
 reads and rewrites `demo/workspace/stats.js` and genuinely runs `node --test`
 against it, so the green test run at the end is real, not staged.
 
@@ -119,6 +120,48 @@ An agent nobody comes back to is reaped after `[server] resume_ttl_secs`, five
 minutes by default; `0` turns the whole thing off. `GET /api/connections` shows
 what is currently pooled — without the ids, since a connection id is the
 capability to talk to a running agent and nothing authenticates that endpoint.
+
+### Session history
+
+An agent that keeps its conversations can offer them back. `claude-acp` and
+`kilo` advertise `loadSession` and `sessionCapabilities: { list, delete, fork,
+resume, close }`; most of the registry advertises none of it. So the history
+drawer is built from what the connected agent said in `initialize` and nothing
+else — every button is one capability, and an agent that lists but cannot fork
+gets no Fork.
+
+The relay forwards all six untouched. There is no fourth interception here: what
+the server adds is the *fold*, because it keeps a thread per session and a
+`session/load` replays a whole conversation back as `session/update`
+notifications. Those arrive **during** the call, before its response, so both
+sides empty that session's thread before the request goes out. Otherwise the
+replay lands on top of what was already there — every message twice, and three
+times after the next load.
+
+Two smaller consequences:
+
+- **The tab remembers which conversation it is looking at.** A reload still has
+  its `session/new` answered from the recording made when the connection
+  started, which is what makes resuming transparent to an ordinary ACP client —
+  but that is no longer the session on screen once one has been opened from the
+  history, and the relay has no way to know. A remembered session the server has
+  no thread for falls back to the recorded one.
+- **`session/update` is filtered by session id in the browser.** A fork leaves
+  the original running, so more than one conversation can be live on a
+  connection, and folding all of them into the thread on screen would put one
+  conversation's messages in another.
+
+A session belongs to the directory it was started in, and an agent's history
+spans every project it has been used in — so a load, resume or fork carries
+*that session's* `cwd`, not this connection's. Sending the wrong one is refused
+with `-32002`, which reads as if the conversation were missing when it is only
+somewhere else. Opening one from another directory works; the drawer marks it,
+because the workspace the server reads and writes through is still this
+connection's, so files outside it will be refused.
+
+`session/delete` removes a conversation; `session/close` only frees what it is
+holding and leaves it listed. `session/resume` picks one back up *without*
+replaying it, so the thread comes from the server's fold rather than the agent.
 
 ### Two thread models, pinned together
 
@@ -242,6 +285,10 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 - **A form's half-filled answer does not survive a reload.** The question and
   what was finally answered do — they are part of the thread — but text typed
   into a form and not yet sent is browser-local and goes with the page.
+- **Session history is only as good as the agent's.** Everything in the drawer
+  comes from `session/list`; an agent that does not keep conversations has none,
+  and the drawer is not offered at all. `additionalDirectories` on a load or a
+  fork is not sent, and pagination is a "load more" rather than infinite scroll.
 - **No MCP passthrough and no `@`-mentions** yet.
 - **No authentication.** See below.
 

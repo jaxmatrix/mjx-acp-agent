@@ -67,6 +67,50 @@ pub struct Agent {
     elicitation_form: AtomicBool,
     /// Whether the client said it can send the user to a URL.
     elicitation_url: AtomicBool,
+    /// Every conversation this agent has, so it can list one and load it back.
+    ///
+    /// A `std::sync::Mutex` rather than tokio's, because [`Agent::update`] is
+    /// synchronous and that is the funnel every update passes through — which is
+    /// what makes it impossible to emit something and forget to record it. The
+    /// guard is never held across an await: a replay clones the transcript out
+    /// first.
+    sessions: std::sync::Mutex<HashMap<String, MockSession>>,
+}
+
+/// One conversation the agent remembers.
+///
+/// A session belongs to the directory it was started in. The protocol says so
+/// plainly — a load, resume or fork "may differ from any previously used list as
+/// long as the request `cwd` matches the session's `cwd`" — and this enforces
+/// it, because an agent that quietly accepted the wrong directory would let a
+/// client look right while reading the wrong project.
+struct MockSession {
+    /// Where it was started. `session/list` can be filtered by this.
+    cwd: String,
+    /// Taken from the first thing the user said, the way a real agent titles a
+    /// conversation.
+    title: Option<String>,
+    updated_at: String,
+    /// The `update` object of every `session/update` sent for this session, in
+    /// order, so `session/load` can stream the conversation back.
+    transcript: Vec<Value>,
+}
+
+impl MockSession {
+    /// Checks that a request names the directory this session belongs to.
+    ///
+    /// A request with no `cwd` at all is let through: `session/resume` and
+    /// `session/fork` carry one, but a client may leave it out, and refusing
+    /// something the schema allows helps nobody.
+    fn matching(&self, params: &Value) -> Result<(), JsonRpcError> {
+        match params["cwd"].as_str() {
+            Some(cwd) if cwd != self.cwd => Err(JsonRpcError::resource_not_found(format!(
+                "that session belongs to {}, not {cwd}",
+                self.cwd
+            ))),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Agent {
@@ -76,12 +120,44 @@ impl Agent {
         let _ = self.outbox.send(frame);
     }
 
-    /// Sends a `session/update` notification.
+    /// Sends a `session/update` notification, and remembers it.
+    ///
+    /// Remembering here rather than at the call sites is deliberate: the whole
+    /// point of a transcript is that it is complete, and one step of the script
+    /// that reached for [`Agent::emit`] instead would leave a hole in the
+    /// history that only shows up when somebody loads the session back.
     pub fn update(&self, session_id: &str, update: Value) {
+        self.record(session_id, update.clone());
+        self.emit(session_id, update);
+    }
+
+    /// Sends a `session/update` *without* recording it.
+    ///
+    /// Only a replay may do this: the updates it streams are already in the
+    /// transcript, and recording them again would make every load of a session
+    /// longer than the last.
+    fn emit(&self, session_id: &str, update: Value) {
         self.notify(
             method::client::SESSION_UPDATE,
             json!({ "sessionId": session_id, "update": update }),
         );
+    }
+
+    /// Appends to a session's transcript, and marks it as touched just now.
+    fn record(&self, session_id: &str, update: Value) {
+        let mut sessions = self.sessions();
+        // An update for a session we never opened belongs to no conversation,
+        // which is not an error worth failing a turn over.
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.transcript.push(update);
+            session.updated_at = now();
+        }
+    }
+
+    fn sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, MockSession>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Calls a client method and waits for the response.
@@ -187,6 +263,47 @@ impl Agent {
         config_options(values)
     }
 
+    /// Opens a conversation the agent will remember.
+    fn open_session(&self, session_id: &str, cwd: &str, title: Option<String>, from: &[Value]) {
+        self.sessions().insert(
+            session_id.to_string(),
+            MockSession {
+                cwd: cwd.to_string(),
+                title,
+                updated_at: now(),
+                transcript: from.to_vec(),
+            },
+        );
+    }
+
+    /// What `session/list` says, newest first.
+    ///
+    /// Sorted by `updatedAt` descending, which works on the string because ISO
+    /// 8601 in UTC sorts the same way the instants do.
+    fn list_sessions(&self, cwd: Option<&str>) -> Vec<Value> {
+        let sessions = self.sessions();
+        let mut listed: Vec<Value> = sessions
+            .iter()
+            .filter(|(_, session)| cwd.is_none_or(|cwd| session.cwd == cwd))
+            .map(|(id, session)| {
+                let mut info = json!({
+                    "sessionId": id,
+                    "cwd": session.cwd,
+                    "updatedAt": session.updated_at,
+                });
+                // Omitted rather than null when the conversation has not been
+                // said anything to yet: the schema reads both the same way, and
+                // a client showing an empty title has nothing to show.
+                if let Some(title) = &session.title {
+                    info["title"] = json!(title);
+                }
+                info
+            })
+            .collect();
+        listed.sort_by(|a, b| b["updatedAt"].as_str().cmp(&a["updatedAt"].as_str()));
+        listed
+    }
+
     async fn resolve(&self, id: &RequestId, reply: Reply) {
         if let Some(tx) = self.pending.lock().await.remove(id) {
             let _ = tx.send(reply);
@@ -216,7 +333,9 @@ async fn main() -> Result<()> {
         config: Mutex::new(HashMap::new()),
         elicitation_form: AtomicBool::new(false),
         elicitation_url: AtomicBool::new(false),
+        sessions: std::sync::Mutex::new(HashMap::new()),
     });
+    seed_yesterdays_conversation(&agent).await;
 
     // A single writer task owns stdout, so concurrent handlers can't interleave
     // halves of two frames onto the same line.
@@ -312,9 +431,15 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                     "name": "mjx-mock-agent", "version": env!("CARGO_PKG_VERSION")
                 },
                 "agentCapabilities": {
-                    "loadSession": false,
+                    "loadSession": true,
                     "promptCapabilities": {
                         "image": false, "audio": false, "embeddedContext": true
+                    },
+                    // `{}` and not `true` for each: the schema reads anything
+                    // that is not an object as "not supported", so a client
+                    // would quietly offer none of this.
+                    "sessionCapabilities": {
+                        "list": {}, "delete": {}, "fork": {}, "resume": {}, "close": {}
                     }
                 },
                 // No auth methods: this agent is the whole point of "works out
@@ -330,17 +455,127 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                 .lock()
                 .await
                 .insert(session_id.clone(), default_config_values());
+            agent.open_session(&session_id, cwd_of(&params).as_str(), None, &[]);
             Ok(json!({
                 "sessionId": session_id,
-                "modes": {
-                    "currentModeId": "code",
-                    "availableModes": [
-                        { "id": "ask",  "name": "Ask",  "description": "Answer questions, change nothing." },
-                        { "id": "code", "name": "Code", "description": "Read and edit files." },
-                    ]
-                },
+                "modes": modes(),
                 "configOptions": config_options(&default_config_values())
             }))
+        }
+
+        m::SESSION_LIST => {
+            let sessions = agent.list_sessions(params["cwd"].as_str());
+            // No `nextCursor`: everything this agent knows fits in one page, and
+            // claiming otherwise would send a client asking for a page that
+            // does not exist.
+            Ok(json!({ "sessions": sessions }))
+        }
+
+        m::SESSION_LOAD => {
+            let session_id = session_id_of(&params)?;
+            let transcript = {
+                let sessions = agent.sessions();
+                let session = sessions
+                    .get(&session_id)
+                    .ok_or_else(|| JsonRpcError::resource_not_found("no such session"))?;
+                session.matching(&params)?;
+                // Cloned out from under the lock: the replay below awaits, and
+                // this guard must not be held across that.
+                session.transcript.clone()
+            };
+
+            // The whole conversation, as the notifications that built it. They
+            // go out *before* this response, which is the ordering a client has
+            // to survive — see the client-side note in `web/src/acp/session.ts`.
+            for update in transcript {
+                agent.emit(&session_id, update);
+                beat(15).await;
+            }
+
+            Ok(json!({
+                "modes": modes(),
+                "configOptions": agent.config_options(&session_id).await
+            }))
+        }
+
+        m::SESSION_RESUME => {
+            let session_id = session_id_of(&params)?;
+            agent
+                .sessions()
+                .get(&session_id)
+                .ok_or_else(|| JsonRpcError::resource_not_found("no such session"))?
+                .matching(&params)?;
+            // Deliberately silent. A resume reactivates a session without
+            // replaying it, which is the only thing that makes it different
+            // from a load.
+            Ok(json!({
+                "modes": modes(),
+                "configOptions": agent.config_options(&session_id).await
+            }))
+        }
+
+        m::SESSION_FORK => {
+            let session_id = session_id_of(&params)?;
+            let (cwd, title, transcript) = {
+                let sessions = agent.sessions();
+                let source = sessions
+                    .get(&session_id)
+                    .ok_or_else(|| JsonRpcError::resource_not_found("no such session"))?;
+                source.matching(&params)?;
+                (
+                    source.cwd.clone(),
+                    source.title.clone(),
+                    source.transcript.clone(),
+                )
+            };
+
+            let values = agent
+                .config
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_else(default_config_values);
+            let fork_id = format!("mock-{}", short_id());
+            agent
+                .config
+                .lock()
+                .await
+                .insert(fork_id.clone(), values.clone());
+            // A fork carries the history of the session it came from — that is
+            // what distinguishes it from a new session — but is its own
+            // conversation from here on.
+            agent.open_session(
+                &fork_id,
+                &cwd,
+                Some(match title {
+                    Some(title) => format!("Fork of {title}"),
+                    None => format!("Fork of {session_id}"),
+                }),
+                &transcript,
+            );
+
+            Ok(json!({
+                "sessionId": fork_id,
+                "modes": modes(),
+                "configOptions": config_options(&values)
+            }))
+        }
+
+        m::SESSION_DELETE => {
+            let session_id = session_id_of(&params)?;
+            agent.sessions().remove(&session_id);
+            agent.config.lock().await.remove(&session_id);
+            Ok(json!({}))
+        }
+
+        m::SESSION_CLOSE => {
+            // Nothing to free in a mock, and nothing to forget: closing a
+            // session releases its resources, and `session/delete` is what
+            // removes it from the list. Keeping the entry is what lets the
+            // client show a conversation it has finished with.
+            session_id_of(&params)?;
+            Ok(json!({}))
         }
 
         m::SESSION_PROMPT => {
@@ -348,6 +583,10 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                 .as_str()
                 .ok_or_else(|| JsonRpcError::invalid_params("sessionId is required"))?
                 .to_string();
+            // Recorded before the turn runs, and titled from it if this is the
+            // first thing said: a conversation nobody can tell apart in a list
+            // is one nobody will open.
+            title_and_record_prompt(agent, &session_id, &params);
             let flag = agent.begin_turn(&session_id).await;
             let stop_reason = script::run_turn(agent, &session_id, &params).await;
             flag.store(false, Ordering::Relaxed);
@@ -382,10 +621,231 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             Ok(json!({ "configOptions": options }))
         }
 
-        m::AUTHENTICATE | m::SESSION_CLOSE => Ok(json!({})),
+        m::AUTHENTICATE => Ok(json!({})),
 
         other => Err(JsonRpcError::method_not_found(other)),
     }
+}
+
+/// The `sessionId` a lifecycle request names.
+fn session_id_of(params: &Value) -> Result<String, JsonRpcError> {
+    params["sessionId"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| JsonRpcError::invalid_params("sessionId is required"))
+}
+
+/// The directory a session belongs to, falling back to the one we were started
+/// in — which, for an agent spawned per workspace, is the same thing.
+fn cwd_of(params: &Value) -> String {
+    match params["cwd"].as_str() {
+        Some(cwd) if !cwd.is_empty() => cwd.to_string(),
+        _ => working_directory(),
+    }
+}
+
+fn working_directory() -> String {
+    std::env::current_dir()
+        .map(|cwd| cwd.display().to_string())
+        .unwrap_or_default()
+}
+
+/// The modes every session here offers.
+fn modes() -> Value {
+    json!({
+        "currentModeId": "code",
+        "availableModes": [
+            { "id": "ask",  "name": "Ask",  "description": "Answer questions, change nothing." },
+            { "id": "code", "name": "Code", "description": "Read and edit files." },
+        ]
+    })
+}
+
+/// Puts the user's prompt in the session's history, and titles the session with
+/// it if this is the first thing said.
+///
+/// Recorded but not emitted: the client shows its own prompt the moment it sends
+/// it, so echoing it back live would say it twice. It has to be in the
+/// transcript all the same, or a loaded conversation is only the agent's half of
+/// it.
+fn title_and_record_prompt(agent: &Agent, session_id: &str, params: &Value) {
+    let text: String = params["prompt"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if text.is_empty() {
+        return;
+    }
+
+    agent.record(
+        session_id,
+        json!({
+            "sessionUpdate": "user_message_chunk",
+            "content": { "type": "text", "text": text }
+        }),
+    );
+
+    let mut sessions = agent.sessions();
+    if let Some(session) = sessions.get_mut(session_id)
+        && session.title.is_none()
+    {
+        session.title = Some(summarise(&text));
+    }
+}
+
+/// A one-line title from what the user said.
+fn summarise(text: &str) -> String {
+    let line = text.lines().next().unwrap_or(text).trim();
+    match line.char_indices().nth(60) {
+        Some((cut, _)) => format!("{}…", &line[..cut].trim_end()),
+        None => line.to_string(),
+    }
+}
+
+/// A conversation from before this run, so the history is worth opening the
+/// first time the demo starts.
+///
+/// It is written as the update stream that produced it rather than as a
+/// finished thread, because that is what `session/load` has to replay and what
+/// a client has to fold — a canned thread would prove nothing about either.
+async fn seed_yesterdays_conversation(agent: &Arc<Agent>) {
+    let session_id = "mock-yesterday".to_string();
+    agent.config.lock().await.insert(
+        session_id.clone(),
+        HashMap::from([
+            ("model".to_string(), json!("mock-haiku")),
+            ("thought_level".to_string(), json!("balanced")),
+            ("web_search".to_string(), json!(false)),
+        ]),
+    );
+
+    agent.open_session(
+        &session_id,
+        &working_directory(),
+        Some("Rename the helper in stats.js".to_string()),
+        &[
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "rename `avg` to `mean` in stats.js" }
+            }),
+            json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": "One definition and two call sites." }
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "yesterday-1",
+                "title": "Rename avg to mean",
+                "kind": "edit",
+                "status": "completed",
+                "content": [{
+                    "type": "diff",
+                    "path": "stats.js",
+                    "oldText": "export function avg(xs) {\n",
+                    "newText": "export function mean(xs) {\n"
+                }]
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Renamed it, and both call sites with it." }
+            }),
+        ],
+    );
+
+    // Older than anything this run will produce, so the list has an order worth
+    // sorting.
+    if let Some(session) = agent.sessions().get_mut(&session_id) {
+        session.updated_at = iso8601(unix_seconds().saturating_sub(26 * 60 * 60));
+    }
+
+    // And one from a different project entirely. A real agent's history spans
+    // every directory it has been used in, and a client that assumes otherwise
+    // sends the connection's `cwd` to a session that does not belong to it —
+    // which the protocol says to refuse. Seeding one here is what makes that
+    // case reachable in the demo and in the tests.
+    let elsewhere = "mock-elsewhere".to_string();
+    agent
+        .config
+        .lock()
+        .await
+        .insert(elsewhere.clone(), default_config_values());
+    agent.open_session(
+        &elsewhere,
+        OTHER_PROJECT,
+        Some("Add retries to the fetch helper".to_string()),
+        &[
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "retry the fetch three times" }
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Done — three attempts, backing off each time." }
+            }),
+        ],
+    );
+    if let Some(session) = agent.sessions().get_mut(&elsewhere) {
+        session.updated_at = iso8601(unix_seconds().saturating_sub(3 * 24 * 60 * 60));
+    }
+}
+
+/// The directory the second seeded conversation belongs to.
+///
+/// Deliberately not a real path: it stands for "somewhere this connection is
+/// not", and nothing ever reads from it.
+const OTHER_PROJECT: &str = "/projects/another-checkout";
+
+/// Now, as ACP wants a timestamp: ISO 8601 in UTC.
+fn now() -> String {
+    iso8601(unix_seconds())
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Formats a Unix timestamp as `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// Written out rather than pulled in: a date crate for one timestamp in a
+/// fixture agent is a dependency the whole workspace then carries. The civil
+/// calendar conversion is Howard Hinnant's `civil_from_days`, which is exact for
+/// every date this will ever see.
+fn iso8601(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let time = seconds % 86_400;
+
+    // Shift the epoch to 0000-03-01, so leap days land at the end of the cycle
+    // and the year/month arithmetic below needs no special cases.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let march_month = (5 * day_of_year + 2) / 153;
+
+    let day = (day_of_year - (153 * march_month + 2) / 5 + 1) as u32;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    } as u32;
+    let year = era * 400 + year_of_era + i64::from(month <= 2);
+
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60
+    )
 }
 
 /// What every session starts with.
@@ -460,4 +920,30 @@ fn short_id() -> String {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}{n:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_are_iso_8601_in_utc() {
+        assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
+        // A leap day, which is the case the calendar arithmetic exists for.
+        assert_eq!(iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
+        assert_eq!(iso8601(1_767_225_599), "2025-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn timestamps_sort_the_way_the_instants_do() {
+        // `session/list` orders by this string, so the two orders have to agree.
+        assert!(iso8601(1_709_164_800) < iso8601(1_767_225_599));
+    }
+
+    #[test]
+    fn a_title_is_one_line_and_short_enough_to_read() {
+        assert_eq!(summarise("fix the median bug\nand the mean"), "fix the median bug");
+        let long = summarise(&"a".repeat(200));
+        assert!(long.ends_with('…') && long.chars().count() == 61, "{long}");
+    }
 }

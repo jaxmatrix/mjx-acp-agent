@@ -297,6 +297,20 @@ export interface AgentInfo {
   resumed: boolean;
 }
 
+/**
+ * One conversation the agent knows about, from `session/list`.
+ *
+ * Only `sessionId` and `cwd` are promised. A title and a timestamp are what
+ * make a list worth reading, but an agent that keeps neither still lists its
+ * sessions, so both are optional here as they are on the wire.
+ */
+export interface SessionInfo {
+  sessionId: string;
+  cwd: string;
+  title?: string;
+  updatedAt?: string;
+}
+
 /** An entry in the agent picker, from `GET /api/agents`. */
 export interface CatalogEntry {
   id: string;

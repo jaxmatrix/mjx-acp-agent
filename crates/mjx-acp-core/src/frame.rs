@@ -69,6 +69,18 @@ impl JsonRpcError {
         }
     }
 
+    /// `-32002 Resource not found`, ACP's code for a thing that is absent
+    /// rather than refused — a session id it does not have, a file it cannot
+    /// see. The distinction matters to the caller: refused is worth retrying
+    /// differently, absent is not.
+    pub fn resource_not_found(detail: impl fmt::Display) -> Self {
+        Self {
+            code: -32002,
+            message: detail.to_string(),
+            data: None,
+        }
+    }
+
     /// `-32603 Internal error`.
     pub fn internal(detail: impl fmt::Display) -> Self {
         Self {

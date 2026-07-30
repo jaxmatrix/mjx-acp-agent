@@ -41,6 +41,15 @@ ACP *client* role                   relay + capability host        claude-acp / 
   pending one is *also* re-asked over the socket, because a browser cannot
   respond to a request the connection it is holding never received; the two are
   matched by JSON-RPC id.
+- **The session lifecycle is forwarded, not intercepted.** `session/list`,
+  `session/load`, `session/fork`, `session/resume`, `session/delete` and
+  `session/close` pass straight through; what the server adds is the *fold*. A
+  load replays a whole conversation as `session/update` notifications, arriving
+  during the call rather than after it, so both thread models empty that
+  session's thread before the request goes out — otherwise the replay doubles
+  what was already there. The UI offers only the capabilities the agent named in
+  `initialize`, and the browser remembers which of an agent's sessions it is
+  looking at, because the relay's recorded `session/new` cannot know.
 - **Two thread models, held together by a fixture.** `crates/mjx-acp-thread` (Rust, server) and
   `web/src/acp/thread.ts` (TypeScript, browser) implement the same folding rules. Change one and you
   change both, then re-run `fixtures/session-updates.jsonl` through each.
@@ -87,5 +96,6 @@ npm --prefix web run typecheck
 
 ./scripts/demo.sh                 # build everything and open the viewer
 node web/scripts/smoke.mjs        # drive a running server over the browser's own code path
+node web/scripts/history-smoke.mjs     # the same, for session/list and session/load
 node web/scripts/capture-fixture.mjs   # re-record fixtures/session-updates.jsonl
 ```

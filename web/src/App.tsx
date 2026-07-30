@@ -1,11 +1,12 @@
 /** The shell: pick an agent, then talk to it. */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { choiceStore, resumeStore } from "./acp/resume";
 import { AgentPicker } from "./components/AgentPicker";
 import { Composer } from "./components/Composer";
 import { Inspector } from "./components/Inspector";
+import { SessionHistory } from "./components/SessionHistory";
 import { Sidebar } from "./components/Sidebar";
 import { ThreadView } from "./components/ThreadView";
 import { useSession } from "./useSession";
@@ -56,14 +57,38 @@ function Conversation({
 }) {
   const session = useSession(agentId, cwd);
   const [showInspector, setShowInspector] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const busy = session.thread.status === "generating";
+  const { capabilities, refreshSessions } = session;
+
+  // Only agents that advertise `session/list` have a history to show, and that
+  // is not known until the handshake has answered.
+  const canList = capabilities.session.list;
+
+  useEffect(() => {
+    if (canList) refreshSessions();
+  }, [canList, refreshSessions]);
 
   return (
-    <div className={`app ${showInspector ? "app--with-inspector" : ""}`}>
+    <div
+      className={`app ${showInspector ? "app--with-inspector" : ""} ${
+        showHistory ? "app--with-history" : ""
+      }`}
+    >
       <header className="topbar">
         <button type="button" className="link-button" onClick={onDisconnect}>
           ← Agents
         </button>
+        {canList && (
+          <button
+            type="button"
+            className="link-button"
+            onClick={() => setShowHistory((v) => !v)}
+            aria-pressed={showHistory}
+          >
+            History ({session.sessions.length})
+          </button>
+        )}
         <StatusPill session={session} />
         <button
           type="button"
@@ -92,7 +117,30 @@ function Conversation({
         </p>
       )}
 
+      {session.replayingSessionId && (
+        <p className="callout">Replaying the conversation…</p>
+      )}
+
       <div className="app__body">
+        {showHistory && (
+          <SessionHistory
+            sessions={session.sessions}
+            currentSessionId={session.sessionId}
+            workspaceCwd={cwd}
+            capabilities={session.capabilities}
+            replayingSessionId={session.replayingSessionId}
+            moreSessions={session.moreSessions}
+            onLoad={session.loadSession}
+            onResume={session.resumeSession}
+            onFork={session.forkSession}
+            onDelete={session.deleteSession}
+            onClose={session.closeSession}
+            onNew={session.newSession}
+            onRefresh={session.refreshSessions}
+            onMore={session.moreSessionsPlease}
+          />
+        )}
+
         <main className="app__main">
           <ThreadView
             thread={session.thread}

@@ -2,13 +2,15 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { resumeStore } from "./acp/resume";
+import { noCapabilities, type AgentCapabilities } from "./acp/capabilities";
+import { resumeStore, sessionStore } from "./acp/resume";
 import { Session, type SessionStatus } from "./acp/session";
 import {
   emptyThread,
   type AgentInfo,
   type ElicitationAnswer,
   type InspectorEntry,
+  type SessionInfo,
   type Thread,
 } from "./acp/types";
 
@@ -17,6 +19,32 @@ export interface SessionState {
   thread: Thread;
   status: SessionStatus;
   agentInfo?: AgentInfo;
+  /** What the agent said it can do; the history UI offers nothing else. */
+  capabilities: AgentCapabilities;
+  /** The conversations the agent knows about, once they have been asked for. */
+  sessions: SessionInfo[];
+  /** More sessions to fetch, if the agent paginated its answer. */
+  moreSessions: boolean;
+  /** The session on screen. */
+  sessionId?: string;
+  /** Set while `session/load` is streaming a conversation back. */
+  replayingSessionId?: string;
+  /** Asks the agent for its sessions again. */
+  refreshSessions(): void;
+  /** Fetches the next page and appends it. */
+  moreSessionsPlease(): void;
+  /**
+   * These take the whole listing rather than an id: a session belongs to the
+   * directory it was started in, and an agent's history spans every project it
+   * has been used in. Sending this connection's directory for one of those is
+   * what ACP refuses.
+   */
+  loadSession(session: SessionInfo): void;
+  resumeSession(session: SessionInfo): void;
+  forkSession(session: SessionInfo): void;
+  deleteSession(session: SessionInfo): void;
+  closeSession(session: SessionInfo): void;
+  newSession(): void;
   frames: InspectorEntry[];
   prompt(text: string): void;
   cancel(): void;
@@ -33,6 +61,7 @@ export interface SessionState {
 const MAX_FRAMES = 2000;
 
 const resume = resumeStore();
+const sessions = sessionStore();
 
 /** Opens a session against `agentId` in `cwd`, and keeps React in step. */
 export function useSession(agentId: string | null, cwd: string | null): SessionState {
@@ -41,6 +70,11 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
   const [agentInfo, setAgentInfo] = useState<AgentInfo>();
   const [frames, setFrames] = useState<InspectorEntry[]>([]);
   const [error, setError] = useState<string>();
+  const [capabilities, setCapabilities] = useState<AgentCapabilities>(noCapabilities);
+  const [history, setHistory] = useState<SessionInfo[]>([]);
+  const [nextCursor, setNextCursor] = useState<string>();
+  const [sessionId, setSessionId] = useState<string>();
+  const [replayingSessionId, setReplayingSessionId] = useState<string>();
   /** Bumped to reopen the socket; see `reconnect`. */
   const [attempt, setAttempt] = useState(0);
 
@@ -55,10 +89,24 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     setFrames([]);
     setError(undefined);
     setAgentInfo(undefined);
+    setCapabilities(noCapabilities());
+    setHistory([]);
+    setNextCursor(undefined);
+    setSessionId(undefined);
+    setReplayingSessionId(undefined);
     nextSeq.current = 0;
+
+    const memory = {
+      get: () => sessions.get(agentId, cwd ?? ""),
+      set: (id: string) => sessions.set(agentId, cwd ?? "", id),
+      clear: () => sessions.clear(agentId, cwd ?? ""),
+    };
 
     const active = new Session(emptyThread(), {
       thread: setThread,
+      capabilities: setCapabilities,
+      replaying: setReplayingSessionId,
+      sessionChanged: setSessionId,
       agentInfo: (info) => {
         // Keep the handle to come back with. The server mints a new id when it
         // could not honour the one we sent, so writing back whatever it says
@@ -76,7 +124,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
           return next.length > MAX_FRAMES ? next.slice(-MAX_FRAMES) : next;
         });
       },
-    });
+    }, memory);
     session.current = active;
 
     active
@@ -129,10 +177,83 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
   const reconnect = useCallback(() => setAttempt((n) => n + 1), []);
 
+  /** Runs one lifecycle call, and refreshes the list it just changed. */
+  const lifecycle = useCallback(
+    (run: (session: Session) => Promise<unknown>, listAgain = true) => {
+      const active = session.current;
+      if (!active) return;
+      run(active)
+        .then(async () => {
+          if (!listAgain) return;
+          // The list is the agent's, not ours: a fork adds an entry, a delete
+          // removes one, and a prompt can retitle a session. Asking again is
+          // the only way to show what it really has.
+          const { sessions: listed, nextCursor: cursor } = await active.listSessions();
+          setHistory(listed);
+          setNextCursor(cursor);
+        })
+        .catch((cause: unknown) => {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        });
+    },
+    [],
+  );
+
+  const refreshSessions = useCallback(() => lifecycle(async () => {}), [lifecycle]);
+
+  const moreSessionsPlease = useCallback(() => {
+    const active = session.current;
+    if (!active || !nextCursor) return;
+    active
+      .listSessions(nextCursor)
+      .then(({ sessions: listed, nextCursor: cursor }) => {
+        setHistory((current) => [...current, ...listed]);
+        setNextCursor(cursor);
+      })
+      .catch((cause: unknown) => {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      });
+  }, [nextCursor]);
+
+  const loadSession = useCallback(
+    (info: SessionInfo) => lifecycle((s) => s.loadSession(info), false),
+    [lifecycle],
+  );
+  const resumeSession = useCallback(
+    (info: SessionInfo) => lifecycle((s) => s.resumeSession(info), false),
+    [lifecycle],
+  );
+  const forkSession = useCallback(
+    (info: SessionInfo) => lifecycle((s) => s.forkSession(info)),
+    [lifecycle],
+  );
+  const deleteSession = useCallback(
+    (info: SessionInfo) => lifecycle((s) => s.deleteSession(info)),
+    [lifecycle],
+  );
+  const closeSession = useCallback(
+    (info: SessionInfo) => lifecycle((s) => s.closeSession(info)),
+    [lifecycle],
+  );
+  const newSession = useCallback(() => lifecycle((s) => s.newSession()), [lifecycle]);
+
   return {
     thread,
     status,
     agentInfo,
+    capabilities,
+    sessions: history,
+    moreSessions: nextCursor !== undefined,
+    sessionId,
+    replayingSessionId,
+    refreshSessions,
+    moreSessionsPlease,
+    loadSession,
+    resumeSession,
+    forkSession,
+    deleteSession,
+    closeSession,
+    newSession,
     frames,
     prompt,
     cancel,

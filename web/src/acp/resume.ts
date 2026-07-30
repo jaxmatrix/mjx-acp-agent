@@ -25,6 +25,21 @@ export interface ResumeStore {
   clear(agentId: string, cwd: string): void;
 }
 
+/**
+ * Reads and writes which conversation this tab is looking at.
+ *
+ * Separate from the connection id because it answers a different question: the
+ * connection id is *which agent*, and this is *which of its sessions*. They come
+ * apart the moment the user opens one from the history — the relay still answers
+ * a repeat `session/new` with the session that connection started with, which is
+ * no longer the one on screen.
+ */
+export interface SessionStore {
+  get(agentId: string, cwd: string): string | undefined;
+  set(agentId: string, cwd: string, sessionId: string): void;
+  clear(agentId: string, cwd: string): void;
+}
+
 /** Reads and writes what this tab was last connected to. */
 export interface ChoiceStore {
   get(): Choice | undefined;
@@ -45,6 +60,15 @@ export function resumeStore(storage: Storage | undefined = safeSessionStorage())
     get: (agentId, cwd) => read(storage, resumeKey(agentId, cwd)),
     set: (agentId, cwd, connectionId) => write(storage, resumeKey(agentId, cwd), connectionId),
     clear: (agentId, cwd) => write(storage, resumeKey(agentId, cwd), undefined),
+  };
+}
+
+/** The session to come back to, across a reload. */
+export function sessionStore(storage: Storage | undefined = safeSessionStorage()): SessionStore {
+  return {
+    get: (agentId, cwd) => read(storage, sessionKey(agentId, cwd)),
+    set: (agentId, cwd, sessionId) => write(storage, sessionKey(agentId, cwd), sessionId),
+    clear: (agentId, cwd) => write(storage, sessionKey(agentId, cwd), undefined),
   };
 }
 
@@ -76,6 +100,10 @@ export function choiceStore(storage: Storage | undefined = safeSessionStorage())
 
 function resumeKey(agentId: string, cwd: string): string {
   return `mjx.resume.${agentId}.${cwd}`;
+}
+
+function sessionKey(agentId: string, cwd: string): string {
+  return `mjx.session.${agentId}.${cwd}`;
 }
 
 /**
