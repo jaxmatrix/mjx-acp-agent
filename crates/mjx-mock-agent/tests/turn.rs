@@ -142,6 +142,43 @@ impl Driver {
         }
     }
 
+    /// The same, for a request that is *supposed* to be refused.
+    ///
+    /// Returns the error rather than panicking on it, so a test can assert on
+    /// the code — which is the part that tells a client whether the thing it
+    /// asked for is absent or merely refused.
+    async fn request_expecting_error(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> mjx_acp_core::JsonRpcError {
+        let id = RequestId::Number(self.next_id);
+        self.next_id += 1;
+        self.send(&Frame::Request {
+            id: id.clone(),
+            method: method.into(),
+            params: Some(serde_json::value::to_raw_value(&params).unwrap()),
+        })
+        .await;
+
+        loop {
+            match self.next_frame().await {
+                Frame::Response {
+                    id: ref got,
+                    ref payload,
+                } if *got == id => {
+                    return match payload {
+                        ResponsePayload::Error(error) => error.clone(),
+                        ResponsePayload::Result(result) => {
+                            panic!("{method} was expected to fail, got {}", result.get())
+                        }
+                    };
+                }
+                other => self.handle(other).await,
+            }
+        }
+    }
+
     /// Reads one frame, failing the test rather than hanging if the agent
     /// stops talking.
     async fn next_frame(&mut self) -> Frame {
@@ -858,6 +895,81 @@ async fn sessions_can_be_listed_by_the_directory_they_belong_to() {
 
     let elsewhere = list_sessions(&mut driver, json!({ "cwd": "/nowhere/in/particular" })).await;
     assert!(elsewhere.is_empty(), "{elsewhere:#?}");
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_session_belongs_to_the_directory_it_was_started_in() {
+    // The protocol's rule: a load, resume or fork may change the additional
+    // roots, but the request's `cwd` must be the session's own. An agent that
+    // accepted the wrong one would let a client look right while reading the
+    // wrong project.
+    let mut driver = Driver::spawn("0");
+    let session_id = connect(&mut driver).await;
+
+    let sessions = list_sessions(&mut driver, json!({})).await;
+    let elsewhere = sessions
+        .iter()
+        .find(|s| s["cwd"] != env!("CARGO_MANIFEST_DIR"))
+        .expect("a conversation from another directory");
+    let elsewhere_id = elsewhere["sessionId"].as_str().unwrap().to_string();
+    let elsewhere_cwd = elsewhere["cwd"].as_str().unwrap().to_string();
+    assert_ne!(elsewhere_cwd, env!("CARGO_MANIFEST_DIR"));
+
+    // This connection's directory, which is not that session's.
+    let refused = driver
+        .request_expecting_error(
+            method::agent::SESSION_LOAD,
+            json!({
+                "sessionId": &elsewhere_id,
+                "cwd": env!("CARGO_MANIFEST_DIR"),
+                "mcpServers": []
+            }),
+        )
+        .await;
+    // -32002, ACP's "not found": the session exists, but not in the directory
+    // that was asked for, and there is nothing to retry differently.
+    assert_eq!(refused.code, -32002, "{refused:?}");
+
+    // Its own directory works, and replays.
+    let before = driver.transcript.updates.len();
+    driver
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": &elsewhere_id, "cwd": elsewhere_cwd, "mcpServers": [] }),
+        )
+        .await;
+    assert!(driver.transcript.updates.len() > before);
+
+    // And the session this connection started is not confused with it.
+    assert_ne!(elsewhere_id, session_id);
+
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn resuming_and_forking_hold_to_the_same_rule() {
+    let mut driver = Driver::spawn("0");
+    connect(&mut driver).await;
+    let sessions = list_sessions(&mut driver, json!({})).await;
+    let elsewhere = sessions
+        .iter()
+        .find(|s| s["cwd"] != env!("CARGO_MANIFEST_DIR"))
+        .expect("a conversation from another directory")["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for method in [method::agent::SESSION_RESUME, method::agent::SESSION_FORK] {
+        let refused = driver
+            .request_expecting_error(
+                method,
+                json!({ "sessionId": &elsewhere, "cwd": env!("CARGO_MANIFEST_DIR") }),
+            )
+            .await;
+        assert_eq!(refused.code, -32002, "{method}: {refused:?}");
+    }
 
     driver.shutdown().await;
 }

@@ -78,6 +78,12 @@ pub struct Agent {
 }
 
 /// One conversation the agent remembers.
+///
+/// A session belongs to the directory it was started in. The protocol says so
+/// plainly — a load, resume or fork "may differ from any previously used list as
+/// long as the request `cwd` matches the session's `cwd`" — and this enforces
+/// it, because an agent that quietly accepted the wrong directory would let a
+/// client look right while reading the wrong project.
 struct MockSession {
     /// Where it was started. `session/list` can be filtered by this.
     cwd: String,
@@ -88,6 +94,23 @@ struct MockSession {
     /// The `update` object of every `session/update` sent for this session, in
     /// order, so `session/load` can stream the conversation back.
     transcript: Vec<Value>,
+}
+
+impl MockSession {
+    /// Checks that a request names the directory this session belongs to.
+    ///
+    /// A request with no `cwd` at all is let through: `session/resume` and
+    /// `session/fork` carry one, but a client may leave it out, and refusing
+    /// something the schema allows helps nobody.
+    fn matching(&self, params: &Value) -> Result<(), JsonRpcError> {
+        match params["cwd"].as_str() {
+            Some(cwd) if cwd != self.cwd => Err(JsonRpcError::resource_not_found(format!(
+                "that session belongs to {}, not {cwd}",
+                self.cwd
+            ))),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Agent {
@@ -454,7 +477,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                 let sessions = agent.sessions();
                 let session = sessions
                     .get(&session_id)
-                    .ok_or_else(|| JsonRpcError::invalid_params("no such session"))?;
+                    .ok_or_else(|| JsonRpcError::resource_not_found("no such session"))?;
+                session.matching(&params)?;
                 // Cloned out from under the lock: the replay below awaits, and
                 // this guard must not be held across that.
                 session.transcript.clone()
@@ -476,9 +500,11 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
 
         m::SESSION_RESUME => {
             let session_id = session_id_of(&params)?;
-            if !agent.sessions().contains_key(&session_id) {
-                return Err(JsonRpcError::invalid_params("no such session"));
-            }
+            agent
+                .sessions()
+                .get(&session_id)
+                .ok_or_else(|| JsonRpcError::resource_not_found("no such session"))?
+                .matching(&params)?;
             // Deliberately silent. A resume reactivates a session without
             // replaying it, which is the only thing that makes it different
             // from a load.
@@ -494,7 +520,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                 let sessions = agent.sessions();
                 let source = sessions
                     .get(&session_id)
-                    .ok_or_else(|| JsonRpcError::invalid_params("no such session"))?;
+                    .ok_or_else(|| JsonRpcError::resource_not_found("no such session"))?;
+                source.matching(&params)?;
                 (
                     source.cwd.clone(),
                     source.title.clone(),
@@ -735,7 +762,43 @@ async fn seed_yesterdays_conversation(agent: &Arc<Agent>) {
     if let Some(session) = agent.sessions().get_mut(&session_id) {
         session.updated_at = iso8601(unix_seconds().saturating_sub(26 * 60 * 60));
     }
+
+    // And one from a different project entirely. A real agent's history spans
+    // every directory it has been used in, and a client that assumes otherwise
+    // sends the connection's `cwd` to a session that does not belong to it —
+    // which the protocol says to refuse. Seeding one here is what makes that
+    // case reachable in the demo and in the tests.
+    let elsewhere = "mock-elsewhere".to_string();
+    agent
+        .config
+        .lock()
+        .await
+        .insert(elsewhere.clone(), default_config_values());
+    agent.open_session(
+        &elsewhere,
+        OTHER_PROJECT,
+        Some("Add retries to the fetch helper".to_string()),
+        &[
+            json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "retry the fetch three times" }
+            }),
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "Done — three attempts, backing off each time." }
+            }),
+        ],
+    );
+    if let Some(session) = agent.sessions().get_mut(&elsewhere) {
+        session.updated_at = iso8601(unix_seconds().saturating_sub(3 * 24 * 60 * 60));
+    }
 }
+
+/// The directory the second seeded conversation belongs to.
+///
+/// Deliberately not a real path: it stands for "somewhere this connection is
+/// not", and nothing ever reads from it.
+const OTHER_PROJECT: &str = "/projects/another-checkout";
 
 /// Now, as ACP wants a timestamp: ISO 8601 in UTC.
 fn now() -> String {
