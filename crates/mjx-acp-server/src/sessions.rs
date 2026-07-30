@@ -17,12 +17,15 @@
 //! after the replay instead.
 //!
 //! **The one exception is an elicitation**, which is here despite also being a
-//! request in flight. A form the user is halfway through is worth carrying
-//! across a reload rather than being thrown away and asked again, and a
-//! permission prompt can be re-asked cheaply because its tool call's status
-//! hides a stale one — an elicitation need not belong to any tool call, so
-//! nothing would. Because this holds it, the relay must *not* also re-ask it;
-//! see `relay::Relay::unanswered`.
+//! request in flight. A permission prompt is one click and leaves nothing worth
+//! reading behind; a question the agent asked, and what the user answered, is
+//! part of the conversation. So this holds the whole lifecycle, and a reload
+//! shows an accepted form as accepted rather than losing it.
+//!
+//! It is *also* re-asked over the socket (`relay::Relay::unanswered`), and that
+//! is not redundant: a browser cannot answer a request the connection it is
+//! holding never received, so the replay alone would put an unanswerable form on
+//! screen. The two are matched up by request id on the browser's side.
 
 use std::collections::HashMap;
 

@@ -955,11 +955,11 @@ fn pending_elicitation(thread: &Value) -> Option<&Value> {
 }
 
 #[tokio::test]
-async fn a_reload_gets_the_open_form_back_from_the_thread_not_the_socket() {
-    // The difference between an elicitation and a permission prompt. A prompt is
-    // re-asked over the socket; a form is *in* the thread, so the replay brings
-    // it back — and must therefore not also be re-asked, or the user would be
-    // looking at the same question twice.
+async fn a_reload_gets_the_open_form_from_the_thread_and_from_the_socket() {
+    // Both, and neither alone would do. The replay is what carries the question
+    // and its answer as part of the conversation; the re-ask is what makes it
+    // answerable, because a browser cannot respond to a request the connection
+    // it is holding never received. The browser matches them by request id.
     let server = Server::start().await;
 
     let mut first = Client::connect(&server.ws("agent=mock")).await;
@@ -1001,16 +1001,13 @@ async fn a_reload_gets_the_open_form_back_from_the_thread_not_the_socket() {
     assert_eq!(open["toolCallId"], "call_edit");
     assert!(open["requestedSchema"]["properties"]["branch"].is_object());
 
-    assert!(
-        !second
-            .client_requests
-            .contains(&method::client::ELICITATION_CREATE.to_string()),
-        "the form came back twice, once from the thread and once re-asked: {:?}",
-        second.client_requests
-    );
+    // And it is asked again, with the same id the thread carries — that pairing
+    // is what lets the browser show one form rather than two.
+    let reasked = second
+        .wait_for_client_request(method::client::ELICITATION_CREATE)
+        .await;
+    assert_eq!(reasked["mode"], "form");
 
-    // The request id travelled in the thread, so this browser can answer a
-    // question it never heard asked — which is what makes the replay enough.
     let id = RequestId::Number(open["requestId"].as_i64().expect("no request id"));
     second
         .send(

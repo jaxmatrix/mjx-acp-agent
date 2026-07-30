@@ -244,8 +244,10 @@ pub struct Relay<I: Interceptor> {
     /// Asking the next browser is what makes a reload resume a turn that is
     /// still running rather than one that has quietly stalled.
     ///
-    /// Not everything the agent asks belongs here — see
-    /// [`is_replayed_question`].
+    /// A pending elicitation is here as well as in the thread: the thread is
+    /// what carries its *history* across a reload, and this is what makes it
+    /// answerable, since a browser cannot respond to a request the connection it
+    /// is holding never received.
     unanswered: tokio::sync::Mutex<Vec<Frame>>,
     /// Thread state, so a browser that reloads can be given the conversation
     /// back instead of an empty page.
@@ -686,12 +688,15 @@ impl<I: Interceptor> Relay<I> {
             Disposition::Forward => {
                 // Only what really reaches the browser is worth re-asking. The
                 // interceptor's `fs/*` and `terminal/*` traffic is answered by
-                // the server and never seen there, and a question the replay
-                // brings back by itself must not be asked a second time.
-                if direction == Direction::AgentToClient
-                    && matches!(frame, Frame::Request { .. })
-                    && !is_replayed_question(&frame)
-                {
+                // the server and never seen there.
+                //
+                // A pending elicitation goes on the list too, even though the
+                // replay also carries it. The thread is what makes the *history*
+                // of one survive a reload; the re-ask is what makes it
+                // answerable, because a browser cannot respond to a request the
+                // connection it is holding never received. The browser matches
+                // the two up by request id.
+                if direction == Direction::AgentToClient && matches!(frame, Frame::Request { .. }) {
                     self.unanswered.lock().await.push(frame.clone());
                 }
                 self.forward(direction, &frame, ends_turn).await;
@@ -923,29 +928,6 @@ fn session_of(frame: &Frame) -> Option<String> {
     value.get("sessionId")?.as_str().map(str::to_owned)
 }
 
-/// Whether a replayed thread already brings this question back.
-///
-/// A session-scoped `elicitation/create` is the only one. `SessionStore` folds
-/// it into the thread, so `_mjx/session/replay` puts the form back on screen by
-/// itself, and re-asking as well would show the user the same question twice —
-/// once from the thread and once from the socket.
-///
-/// Everything else the agent asks has nowhere else to live and must be
-/// re-asked: a permission prompt is not thread state, and neither is an
-/// elicitation scoped to a request rather than to a session.
-fn is_replayed_question(frame: &Frame) -> bool {
-    let Frame::Request { method, .. } = frame else {
-        return false;
-    };
-    if method != method::client::ELICITATION_CREATE {
-        return false;
-    }
-    matches!(
-        frame.params_as::<acp::CreateElicitationRequest>(),
-        Ok(Some(request)) if matches!(request.scope(), acp::ElicitationScope::Session(_))
-    )
-}
-
 /// The wire spelling of a direction, matching the TypeScript union.
 fn direction_name(direction: Direction) -> &'static str {
     match direction {
@@ -1068,39 +1050,6 @@ mod tests {
     }
 
     #[test]
-    fn a_session_scoped_elicitation_is_left_to_the_replay() {
-        // The store folds it into the thread, so asking again after a reload
-        // would put the same form on screen twice.
-        assert!(is_replayed_question(&elicitation(json!({
-            "mode": "form",
-            "sessionId": "s1",
-            "message": "which branch?",
-            "requestedSchema": { "type": "object", "properties": {} }
-        }))));
-    }
-
-    #[test]
-    fn everything_else_the_agent_asks_still_gets_re_asked() {
-        // A permission prompt is not thread state, and neither is an
-        // elicitation tied to a request rather than to a session — both would
-        // be lost outright if the re-ask list skipped them.
-        let permission = Frame::Request {
-            id: mjx_acp_core::RequestId::Number(3),
-            method: method::client::SESSION_REQUEST_PERMISSION.into(),
-            params: None,
-        };
-        assert!(!is_replayed_question(&permission));
-
-        assert!(!is_replayed_question(&elicitation(json!({
-            "mode": "url",
-            "requestId": 4,
-            "elicitationId": "el-1",
-            "url": "https://example.test/",
-            "message": "authorize"
-        }))));
-    }
-
-    #[test]
     fn a_question_is_matched_to_its_turn_by_the_session_it_names() {
         let permission = Frame::Request {
             id: mjx_acp_core::RequestId::Number(3),
@@ -1131,16 +1080,6 @@ mod tests {
             params: None,
         };
         assert!(session_of(&no_params).is_none());
-    }
-
-    #[test]
-    fn an_elicitation_we_cannot_read_is_re_asked_rather_than_dropped() {
-        // The scope decides, and a frame whose scope cannot be parsed has not
-        // been shown to be safe to leave out. Re-asking twice is a worse page;
-        // re-asking never is a turn that never finishes.
-        assert!(!is_replayed_question(&elicitation(json!({
-            "nonsense": true
-        }))));
     }
 
     #[test]
