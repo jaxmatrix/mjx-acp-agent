@@ -584,7 +584,15 @@ fn prompt_text(params: &Value) -> String {
         .map(|blocks| {
             blocks
                 .iter()
-                .filter_map(|b| b["text"].as_str())
+                .filter_map(|b| {
+                    b["text"].as_str().map(str::to_string).or_else(|| {
+                        // A prompt of nothing but mentions still says something.
+                        (b["type"] == "resource_link")
+                            .then(|| b["name"].as_str().or_else(|| b["uri"].as_str()))
+                            .flatten()
+                            .map(|named| format!("@{named}"))
+                    })
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         })
@@ -884,5 +892,15 @@ mod tests {
         ]});
         assert_eq!(prompt_text(&params), "fix median");
         assert!(!prompt_text(&json!({ "prompt": [] })).is_empty());
+    }
+
+    #[test]
+    fn a_prompt_of_only_mentions_still_says_something() {
+        // "@stats.js" and no prose is a real prompt. Reading only text blocks
+        // would leave the thought stream with nothing to work from.
+        let params = json!({ "prompt": [
+            { "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" }
+        ]});
+        assert_eq!(prompt_text(&params), "@stats.js");
     }
 }

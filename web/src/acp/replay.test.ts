@@ -123,7 +123,7 @@ describe("a replayed thread", () => {
     })!;
     expect(replayed.entries.map((entry) => entry.id)).toEqual(["user-0", "assistant-1"]);
 
-    const next: Thread = appendUserPrompt(replayed, "and now this");
+    const next: Thread = appendUserPrompt(replayed, [{ type: "text", text: "and now this" }]);
     const ids = next.entries.map((entry) => entry.id);
     expect(new Set(ids).size, `duplicate keys: ${ids.join(", ")}`).toBe(ids.length);
   });

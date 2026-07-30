@@ -501,6 +501,55 @@ fn elicitable() -> Value {
 }
 
 #[tokio::test]
+async fn the_workspace_is_enumerable_over_http() {
+    let server = Server::start().await;
+
+    let files: Value = reqwest::get(server.http("/api/files"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let entries = files["entries"].as_array().unwrap();
+    let stats = entries
+        .iter()
+        .find(|entry| entry["name"] == "stats.js")
+        .expect("the workspace file must be offered as a mention candidate");
+    assert_eq!(stats["relPath"], "stats.js");
+    assert_eq!(stats["isDir"], false);
+
+    // Names, never contents. A listing that leaked a byte of a file would be a
+    // way around the jail rather than a use of it.
+    let body = serde_json::to_string(&files).unwrap();
+    assert!(
+        !body.contains("median"),
+        "the listing must not carry file contents: {body}"
+    );
+
+    // The query narrows, and it matches the path relative to the root.
+    let filtered: Value = reqwest::get(server.http("/api/files?q=stats.test"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = filtered["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["stats.test.js"]);
+
+    // A root outside the workspace is refused, the same way a read would be.
+    let refused = reqwest::get(server.http("/api/files?root=/etc"))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+}
+
+#[tokio::test]
 async fn the_catalog_is_served_over_http() {
     let server = Server::start().await;
 
@@ -1099,6 +1148,90 @@ async fn a_cancelled_turn_stops_offering_the_question_it_asked() {
         "a dead turn's questions were put to a new browser: {:?}",
         second.client_requests
     );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_resource_link_survives_the_relay_and_the_replay() {
+    // A mention travels as a resource_link, and every hop is somewhere it could
+    // be flattened to its text: the relay's thread, the agent's transcript, and
+    // the replay a reloaded browser is given back.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session(&mut first).await;
+    let link = server.workspace_file("stats.js");
+    let uri = format!("file://{}", link.display());
+
+    first
+        .request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session_id,
+                "prompt": [
+                    { "type": "text", "text": "fix the median bug in " },
+                    { "type": "resource_link", "uri": uri, "name": "stats.js" }
+                ]
+            }),
+        )
+        .await;
+    drop(first);
+
+    // The socket is gone; the agent is not. What comes back has to be the same
+    // conversation, mention and all.
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake(&mut second).await;
+    assert_eq!(info["resumed"], true);
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+
+    let users: Vec<&Value> = thread["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["type"] == "user")
+        .collect();
+    assert_eq!(users.len(), 1, "the prompt was duplicated: {thread}");
+
+    let content = users[0]["content"].as_array().unwrap();
+    let link = content
+        .iter()
+        .find(|block| block["type"] == "resource_link")
+        .unwrap_or_else(|| panic!("the mention was flattened away: {thread}"));
+    assert_eq!(link["uri"], uri);
+
+    // And again through the agent's own transcript, which is a second copy of
+    // the same conversation and a second chance to lose the mention. The agent
+    // annotates the link it replays; the fold has to know it for the same
+    // block all the same.
+    second
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": session_id, "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    let thread = second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
+        .await;
+    let replayed = thread["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["type"] == "user")
+        .flat_map(|entry| entry["content"].as_array().unwrap())
+        .find(|block| block["type"] == "resource_link")
+        .unwrap_or_else(|| panic!("the loaded conversation lost the mention: {thread}"));
+    assert_eq!(replayed["uri"], uri);
+    assert_eq!(replayed["mimeType"], "text/javascript");
 
     server.stop().await;
 }

@@ -35,8 +35,10 @@ portable-pty = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+percent-encoding = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 toml = "0.9"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }

@@ -14,6 +14,11 @@ read files, write files, and execute commands.
 - **Filesystem jail.** `fs/read_text_file` and `fs/write_text_file` are
   canonicalised and rejected outside the workspace roots configured in
   `mjx.toml`. Symlinks are resolved before the check.
+- **File enumeration is jailed too.** `GET /api/files` lists the *names* of files
+  under the workspace roots, so the composer can offer them for `@`-mentions. It
+  resolves the root it was asked for through the same `resolve_within` the
+  filesystem jail uses, never follows a symlinked directory out of a root,
+  returns at most 500 paths, and never returns a byte of a file's contents.
 - **No credential brokering.** The server never handles API keys. Real agents
   authenticate themselves the same way they do from a terminal (`claude-acp`
   reuses the `claude` CLI's own session, etc.).
@@ -26,6 +31,12 @@ read files, write files, and execute commands.
 - There is no rate limiting, no session isolation between browser tabs beyond
   one subprocess per connection, and no audit log beyond the in-memory
   inspector.
+- **`GET /api/files` is unauthenticated and needs no WebSocket.** Every other way
+  to reach the workspace goes through a connection; this one is a plain `GET`.
+  Anyone who can reach the port can learn every filename under the workspace
+  roots, whether or not an agent is running. It is not filtered by `.gitignore`
+  either — a `.env` in a root is listed by name, never by content. Filenames leak
+  intent, and this is strictly more than the rest of `/api/*` gives away.
 - **A connection id is a bearer capability.** An agent outlives the socket that
   started it so a reload can rejoin it, and the id that does the rejoining is
   the whole authorisation: anyone who has one can read that conversation,

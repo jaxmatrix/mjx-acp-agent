@@ -10,6 +10,7 @@ import { useState } from "react";
 import type { ToolKind } from "@agentclientprotocol/sdk";
 
 import { DiffView } from "./DiffView";
+import { ResourceRow } from "./Mention";
 import { PermissionPrompt } from "./PermissionPrompt";
 import { TerminalView } from "./TerminalView";
 import type { Terminal, ToolCall } from "../acp/types";
@@ -106,6 +107,15 @@ export function ToolCallCard({
                 );
               }
               case "content":
+                if (content.content.type === "resource_link") {
+                  return (
+                    <ResourceRow
+                      key={index}
+                      uri={content.content.uri}
+                      name={content.content.name}
+                    />
+                  );
+                }
                 return (
                   <pre key={index} className="tool-call__text">
                     {content.content.type === "text"

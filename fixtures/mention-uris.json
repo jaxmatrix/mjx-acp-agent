@@ -1,0 +1,373 @@
+[
+  {
+    "name": "a file uri",
+    "input": "file:///path/to/file.rs",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/path/to/file.rs", "label": "file.rs" },
+    "uri": "file:///path/to/file.rs"
+  },
+  {
+    "name": "a trailing slash means a directory",
+    "input": "file:///path/to/dir/",
+    "mode": "parse",
+    "expect": { "variant": "directory", "absPath": "/path/to/dir/", "label": "dir" },
+    "uri": "file:///path/to/dir/"
+  },
+  {
+    "name": "a symbol carries its name and line range",
+    "input": "file:///path/to/file.rs?symbol=MySymbol#L10:20",
+    "mode": "parse",
+    "expect": {
+      "variant": "symbol",
+      "absPath": "/path/to/file.rs",
+      "label": "MySymbol",
+      "lineRange": [9, 19]
+    },
+    "uri": "file:///path/to/file.rs?symbol=MySymbol#L10:20"
+  },
+  {
+    "name": "a fragment without a symbol is a selection",
+    "input": "file:///path/to/file.rs#L5:15",
+    "mode": "parse",
+    "expect": {
+      "variant": "selection",
+      "absPath": "/path/to/file.rs",
+      "label": "file.rs (5:15)",
+      "lineRange": [4, 14],
+      "column": null
+    },
+    "uri": "file:///path/to/file.rs#L5:15"
+  },
+  {
+    "name": "a selection with a column round trips",
+    "input": "file:///path/to/file.rs?column=5#L42:42",
+    "mode": "parse",
+    "expect": {
+      "variant": "selection",
+      "absPath": "/path/to/file.rs",
+      "lineRange": [41, 41],
+      "column": 4
+    },
+    "uri": "file:///path/to/file.rs?column=5#L42:42"
+  },
+  {
+    "name": "an untitled buffer selection has no path",
+    "input": "zed:///agent/untitled-buffer#L1:10",
+    "mode": "parse",
+    "expect": {
+      "variant": "selection",
+      "absPath": null,
+      "label": "Untitled (1:10)",
+      "lineRange": [0, 9]
+    },
+    "uri": "zed:///agent/untitled-buffer#L1:10"
+  },
+  {
+    "name": "a single line number is a one line range",
+    "input": "file:///path/to/file.rs#L1872",
+    "mode": "parse",
+    "expect": { "variant": "selection", "lineRange": [1871, 1871] }
+  },
+  {
+    "name": "a dash separated line range",
+    "input": "file:///path/to/file.rs#L10-20",
+    "mode": "parse",
+    "expect": { "variant": "selection", "lineRange": [9, 19] }
+  },
+  {
+    "name": "a dash separated line range spelled with two Ls",
+    "input": "file:///path/to/file.rs#L10-L20",
+    "mode": "parse",
+    "expect": { "variant": "selection", "lineRange": [9, 19] }
+  },
+  {
+    "name": "a thread",
+    "input": "zed:///agent/thread/session123?name=Thread+name",
+    "mode": "parse",
+    "expect": { "variant": "thread", "id": "session123", "label": "Thread name" },
+    "uri": "zed:///agent/thread/session123?name=Thread+name"
+  },
+  {
+    "name": "a legacy rule",
+    "input": "zed:///agent/rule/d8694ff2-90d5-4b6f-be33-33c1763acd52?name=Some+rule",
+    "mode": "parse",
+    "expect": {
+      "variant": "rule",
+      "id": "d8694ff2-90d5-4b6f-be33-33c1763acd52",
+      "label": "Some rule"
+    },
+    "uri": "zed:///agent/rule/d8694ff2-90d5-4b6f-be33-33c1763acd52?name=Some+rule"
+  },
+  {
+    "name": "diagnostics default to errors only",
+    "input": "zed:///agent/diagnostics?include_warnings=true",
+    "mode": "parse",
+    "expect": {
+      "variant": "diagnostics",
+      "label": "Diagnostics",
+      "includeErrors": true,
+      "includeWarnings": true
+    },
+    "uri": "zed:///agent/diagnostics?include_warnings=true"
+  },
+  {
+    "name": "diagnostics can ask for warnings only",
+    "input": "zed:///agent/diagnostics?include_warnings=true&include_errors=false",
+    "mode": "parse",
+    "expect": { "variant": "diagnostics", "includeErrors": false, "includeWarnings": true },
+    "uri": "zed:///agent/diagnostics?include_warnings=true&include_errors=false"
+  },
+  {
+    "name": "a pasted image",
+    "input": "zed:///agent/pasted-image?name=Screenshot",
+    "mode": "parse",
+    "expect": { "variant": "pastedImage", "label": "Screenshot" },
+    "uri": "zed:///agent/pasted-image?name=Screenshot"
+  },
+  {
+    "name": "a fetch url is kept verbatim",
+    "input": "http://example.com/path?query=value#fragment",
+    "mode": "parse",
+    "expect": {
+      "variant": "fetch",
+      "url": "http://example.com/path?query=value#fragment",
+      "label": "http://example.com/path?query=value#fragment"
+    },
+    "uri": "http://example.com/path?query=value#fragment"
+  },
+  {
+    "name": "an https fetch url",
+    "input": "https://example.com/api/endpoint",
+    "mode": "parse",
+    "expect": { "variant": "fetch", "url": "https://example.com/api/endpoint" },
+    "uri": "https://example.com/api/endpoint"
+  },
+  {
+    "name": "a terminal selection names its line count",
+    "input": "zed:///agent/terminal-selection?lines=42",
+    "mode": "parse",
+    "expect": { "variant": "terminalSelection", "lineCount": 42, "label": "Terminal (42 lines)" },
+    "uri": "zed:///agent/terminal-selection?lines=42"
+  },
+  {
+    "name": "one line of terminal is singular",
+    "input": "zed:///agent/terminal-selection?lines=1",
+    "mode": "parse",
+    "expect": { "variant": "terminalSelection", "label": "Terminal (1 line)" }
+  },
+  {
+    "name": "a git diff against a base ref",
+    "input": "zed:///agent/git-diff?base=main",
+    "mode": "parse",
+    "expect": { "variant": "gitDiff", "baseRef": "main", "label": "Branch Diff (main)" },
+    "uri": "zed:///agent/git-diff?base=main"
+  },
+  {
+    "name": "a merge conflict",
+    "input": "zed:///agent/merge-conflict?path=%2Fa%2Fstats.js",
+    "mode": "parse",
+    "expect": {
+      "variant": "mergeConflict",
+      "filePath": "/a/stats.js",
+      "label": "Merge Conflict (stats.js)"
+    },
+    "uri": "zed:///agent/merge-conflict?path=%2Fa%2Fstats.js"
+  },
+  {
+    "name": "a skill",
+    "input": "zed:///agent/skill?name=rust-best-practices&source=my-project&path=%2Fskills%2FSKILL.md",
+    "mode": "parse",
+    "expect": {
+      "variant": "skill",
+      "label": "rust-best-practices",
+      "source": "my-project",
+      "absPath": "/skills/SKILL.md"
+    },
+    "uri": "zed:///agent/skill?name=rust-best-practices&source=my-project&path=%2Fskills%2FSKILL.md"
+  },
+  {
+    "name": "the legacy file form",
+    "input": "zed:///agent/file?path=%2Fpath%2Fto%2Ffile.rs",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/path/to/file.rs" }
+  },
+  {
+    "name": "the legacy directory form",
+    "input": "zed:///agent/directory?path=%2Fpath%2Fto%2Fdir",
+    "mode": "parse",
+    "expect": { "variant": "directory", "absPath": "/path/to/dir" }
+  },
+  {
+    "name": "the legacy selection form",
+    "input": "zed:///agent/selection?path=%2Fpath%2Fto%2Ffile.rs#L5:15",
+    "mode": "parse",
+    "expect": { "variant": "selection", "absPath": "/path/to/file.rs", "lineRange": [4, 14] }
+  },
+  {
+    "name": "the legacy symbol form",
+    "input": "zed:///agent/symbol/MySymbol?path=%2Fpath%2Fto%2Ffile.rs#L10:20",
+    "mode": "parse",
+    "expect": {
+      "variant": "symbol",
+      "label": "MySymbol",
+      "absPath": "/path/to/file.rs",
+      "lineRange": [9, 19]
+    }
+  },
+  {
+    "name": "a non-ascii filename round trips",
+    "input": "file:///path/to/%E6%97%A5%E6%9C%AC%E8%AA%9E.txt",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/path/to/日本語.txt", "label": "日本語.txt" },
+    "uri": "file:///path/to/%E6%97%A5%E6%9C%AC%E8%AA%9E.txt"
+  },
+  {
+    "name": "a space in a filename is escaped on the way out",
+    "input": "file:///tmp/a%20b.txt",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/tmp/a b.txt" },
+    "uri": "file:///tmp/a%20b.txt"
+  },
+  {
+    "name": "a hash in a filename is escaped on the way out",
+    "input": "file:///tmp/a%23b.txt",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/tmp/a#b.txt" },
+    "uri": "file:///tmp/a%23b.txt"
+  },
+  {
+    "name": "a question mark in a filename is escaped on the way out",
+    "input": "file:///tmp/a%3Fb.txt",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/tmp/a?b.txt" },
+    "uri": "file:///tmp/a%3Fb.txt"
+  },
+  {
+    "name": "parentheses stay literal in a uri, which is why links escape them",
+    "input": "file:///tmp/a(1).txt",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/tmp/a(1).txt", "label": "a(1).txt" },
+    "uri": "file:///tmp/a(1).txt"
+  },
+  {
+    "name": "a stray percent is left alone rather than guessed at",
+    "input": "file:///tmp/100%_done.txt",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/tmp/100%_done.txt" },
+    "uri": "file:///tmp/100%_done.txt"
+  },
+  {
+    "name": "a bare absolute path is a file mention",
+    "input": "/path/to/file.rs",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/path/to/file.rs" }
+  },
+  {
+    "name": "a bare path with a row is a selection",
+    "input": "/path/to/file.rs:42",
+    "mode": "parse",
+    "expect": { "variant": "selection", "absPath": "/path/to/file.rs", "lineRange": [41, 41] }
+  },
+  {
+    "name": "a bare path with a row and a column",
+    "input": "/path/to/file.rs:42:5",
+    "mode": "parse",
+    "expect": {
+      "variant": "selection",
+      "absPath": "/path/to/file.rs",
+      "lineRange": [41, 41],
+      "column": 4
+    },
+    "uri": "file:///path/to/file.rs?column=5#L42:42"
+  },
+  {
+    "name": "a bare path with a fragment line",
+    "input": "/path/to/file.rs#L42",
+    "mode": "parse",
+    "expect": { "variant": "selection", "absPath": "/path/to/file.rs", "lineRange": [41, 41] }
+  },
+  {
+    "name": "the backticks an agent adds are stripped",
+    "input": "`/path/to/file.rs`",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/path/to/file.rs" }
+  },
+  {
+    "name": "parse keeps a bare path verbatim, escapes and all",
+    "input": "/tmp/a%20b.rs",
+    "mode": "parse",
+    "expect": { "variant": "file", "absPath": "/tmp/a%20b.rs" }
+  },
+  {
+    "name": "a hyperlink decodes its percent escapes",
+    "input": "/tmp/a%20b.rs",
+    "mode": "parseHyperlink",
+    "expect": { "variant": "file", "absPath": "/tmp/a b.rs" }
+  },
+  {
+    "name": "a separator escape survives decoding",
+    "input": "/tmp/..%2F..%2Fsecret",
+    "mode": "parseHyperlink",
+    "expect": { "variant": "file", "absPath": "/tmp/..%2F..%2Fsecret" }
+  },
+  {
+    "name": "an invalid escape passes through a hyperlink unchanged",
+    "input": "/tmp/100%_done.txt",
+    "mode": "parseHyperlink",
+    "expect": { "variant": "file", "absPath": "/tmp/100%_done.txt" }
+  },
+  {
+    "name": "a literal hyperlink keeps its percent escapes",
+    "input": "/tmp/a%20b.rs",
+    "mode": "parseHyperlinkLiteral",
+    "expect": { "variant": "file", "absPath": "/tmp/a%20b.rs" }
+  },
+  {
+    "name": "a literal hyperlink still reads a line suffix",
+    "input": "/tmp/a%20b.rs:42",
+    "mode": "parseHyperlinkLiteral",
+    "expect": { "variant": "selection", "absPath": "/tmp/a%20b.rs", "lineRange": [41, 41] }
+  },
+  {
+    "name": "a literal hyperlink is nothing when it would not differ",
+    "input": "/tmp/a b.rs",
+    "mode": "parseHyperlinkLiteral",
+    "expect": { "none": true }
+  },
+  {
+    "name": "a separator escape is never ambiguous",
+    "input": "/tmp/a%2Fb.rs",
+    "mode": "parseHyperlinkLiteral",
+    "expect": { "none": true }
+  },
+  {
+    "name": "a url is spec-encoded, so it is never ambiguous",
+    "input": "file:///tmp/a%20b.rs",
+    "mode": "parseHyperlinkLiteral",
+    "expect": { "none": true }
+  },
+  {
+    "name": "a relative path is not a bare-path mention",
+    "input": "tmp/a%20b.rs",
+    "mode": "parseHyperlinkLiteral",
+    "expect": { "none": true }
+  },
+  {
+    "name": "an unrecognized scheme is refused",
+    "input": "ftp://example.com",
+    "mode": "parse",
+    "expect": { "error": true }
+  },
+  {
+    "name": "an unrecognized zed path is refused",
+    "input": "zed:///agent/unknown/test",
+    "mode": "parse",
+    "expect": { "error": true }
+  },
+  {
+    "name": "a zed url outside the agent namespace is refused",
+    "input": "zed:///invalid/path",
+    "mode": "parse",
+    "expect": { "error": true }
+  }
+]

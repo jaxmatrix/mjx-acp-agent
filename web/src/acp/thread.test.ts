@@ -146,7 +146,7 @@ describe("streaming text", () => {
   test("an echoed prompt is absorbed rather than duplicated", () => {
     // The prompt goes on screen the moment it is sent. An agent that echoes
     // `user_message_chunk` back must not make it appear twice.
-    let thread = appendUserPrompt(emptyThread(), "fix the bug");
+    let thread = appendUserPrompt(emptyThread(), [{ type: "text", text: "fix the bug" }]);
     thread = applyUpdate(
       thread,
       n({ sessionUpdate: "user_message_chunk", content: text("fix the bug") }),
@@ -155,8 +155,47 @@ describe("streaming text", () => {
     expect(thread.entries).toHaveLength(1);
   });
 
+  test("an echoed resource link the agent annotated is still absorbed", () => {
+    // A resource_link needs only a name and a uri, and carries seven optional
+    // fields an agent is free to fill in on the way back. What it points at is
+    // what identifies it; comparing every field would show the prompt twice.
+    let thread = appendUserPrompt(emptyThread(), [
+      { type: "resource_link", uri: "file:///w/stats.js", name: "stats.js" },
+    ]);
+    thread = applyUpdate(
+      thread,
+      n({
+        sessionUpdate: "user_message_chunk",
+        content: {
+          type: "resource_link",
+          uri: "file:///w/stats.js",
+          name: "stats.js",
+          mimeType: "text/javascript",
+          size: 420,
+        },
+      }),
+    );
+
+    expect(thread.entries).toHaveLength(1);
+  });
+
+  test("a link to somewhere else is not an echo", () => {
+    let thread = appendUserPrompt(emptyThread(), [
+      { type: "resource_link", uri: "file:///w/stats.js", name: "stats.js" },
+    ]);
+    thread = applyUpdate(
+      thread,
+      n({
+        sessionUpdate: "user_message_chunk",
+        content: { type: "resource_link", uri: "file:///w/other.js", name: "stats.js" },
+      }),
+    );
+
+    expect(thread.entries).toHaveLength(2);
+  });
+
   test("a user chunk that is not an echo is kept", () => {
-    let thread = appendUserPrompt(emptyThread(), "first");
+    let thread = appendUserPrompt(emptyThread(), [{ type: "text", text: "first" }]);
     thread = applyUpdate(
       thread,
       n({ sessionUpdate: "user_message_chunk", content: text("something else entirely") }),

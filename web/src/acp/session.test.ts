@@ -25,6 +25,8 @@ interface AgentLog {
   methods: string[];
   loaded: string[];
   replayed: string[];
+  /** Every `session/prompt` the agent received, blocks and all. */
+  prompts: acp.ContentBlock[][];
 }
 
 /**
@@ -39,7 +41,7 @@ function connectedAgent(
   resumed = false,
   threads: Set<string> = new Set(["yesterday", "fresh"]),
 ): { stream: acp.Stream; log: AgentLog } {
-  const log: AgentLog = { methods: [], loaded: [], replayed: [] };
+  const log: AgentLog = { methods: [], loaded: [], replayed: [], prompts: [] };
   /** Where each session lives, as an agent's history really does span projects. */
   const homes: Record<string, string> = {
     yesterday: "/w",
@@ -74,6 +76,11 @@ function connectedAgent(
         resumed,
       } as never);
       return { protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: capabilities } as never;
+    })
+    .onRequest(acp.methods.agent.session.prompt, (ctx) => {
+      log.methods.push("session/prompt");
+      log.prompts.push(ctx.params.prompt);
+      return { stopReason: "end_turn" as const };
     })
     .onRequest(acp.methods.agent.session.new, () => {
       log.methods.push("session/new");
@@ -202,7 +209,7 @@ describe("a session that can reach its agent's history", () => {
 
     // Something on screen first, so an empty thread afterwards would be an
     // accident rather than the point.
-    await session.prompt("hello").catch(() => {});
+    await session.prompt([{ type: "text", text: "hello" }]).catch(() => {});
     await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
 
     // Exactly the replayed conversation: the prompt that was on screen belonged
@@ -303,5 +310,40 @@ describe("a session that can reach its agent's history", () => {
 
     expect(session.sessionId).toBe("fresh"); // the fake agent hands out one id
     expect(held.value()).toBe("fresh");
+  });
+});
+
+describe("a prompt that carries more than text", () => {
+  test("every block reaches the agent, in order", async () => {
+    // The SDK validates the request against the real schema on the way past,
+    // so this is the whole seam: composer to wire.
+    const { session, log } = await connected();
+    const prompt: acp.ContentBlock[] = [
+      { type: "text", text: "fix the median bug in " },
+      { type: "resource_link", uri: "file:///w/stats.js", name: "stats.js" },
+      { type: "text", text: " please" },
+    ];
+
+    await session.prompt(prompt);
+
+    expect(log.prompts).toHaveLength(1);
+    expect(log.prompts[0]).toEqual(prompt);
+  });
+
+  test("the optimistic echo carries the same blocks that were sent", async () => {
+    // Not the text of them: the agent echoes each block back and the fold
+    // matches them one at a time, so a lossy optimistic copy shows the prompt
+    // twice.
+    const { session, seen } = await connected();
+    const prompt: acp.ContentBlock[] = [
+      { type: "text", text: "look at " },
+      { type: "resource_link", uri: "file:///w/stats.js", name: "stats.js" },
+    ];
+
+    await session.prompt(prompt);
+
+    const entries = seen.thread().entries;
+    const user = entries.find((entry) => entry.type === "user");
+    expect(user?.content).toEqual(prompt);
   });
 });

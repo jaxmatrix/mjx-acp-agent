@@ -86,7 +86,12 @@ export function Sidebar({
           <ul className="commands">
             {thread.availableCommands.map((command) => (
               <li key={command.name}>
-                <code>/{command.name}</code>
+                <code>
+                  /{command.name}
+                  {/* A command that takes an argument says so here too, not
+                      only in the composer — this is where they are browsed. */}
+                  {command.input && ` <${command.input.hint}>`}
+                </code>
                 <span className="dim"> {command.description}</span>
               </li>
             ))}

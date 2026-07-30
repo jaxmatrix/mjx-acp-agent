@@ -134,9 +134,19 @@ const result = await client.connectWith(stream, async (agent) => {
     value: "mock-haiku",
   });
 
+  // A prompt carrying a mention, the way the composer builds one. Built by
+  // hand here — this is a .mjs script and cannot import `promptBlocks` from
+  // TypeScript, which vitest covers instead.
   const response = await agent.request(acp.methods.agent.session.prompt, {
     sessionId: session.sessionId,
-    prompt: [{ type: "text", text: "fix the median bug in stats.js" }],
+    prompt: [
+      { type: "text", text: "fix the median bug in " },
+      {
+        type: "resource_link",
+        uri: `file://${info.cwd}/stats.js`,
+        name: "stats.js",
+      },
+    ],
   });
 
   return { initialized, info, session, setConfig, response };
@@ -210,6 +220,22 @@ const terminalText = Buffer.concat(
 check(terminalText.length > 0, "terminal chunks decoded to nothing");
 
 check((seen.ext.get("_mjx/fs/wrote") ?? []).length > 0, "no file write was mirrored");
+
+// The mention reached the agent: the mock titles a session from its prompt,
+// and a mention-only reading of it is all it had to work from.
+const listed = await (async () => {
+  const listing = await fetch(`${base.replace(/^ws/, "http")}/api/files?q=stats&limit=20`);
+  check(listing.ok, `GET /api/files answered ${listing.status}`);
+  return listing.ok ? await listing.json() : { entries: [] };
+})();
+check(
+  listed.entries.some((entry) => entry.name === "stats.js"),
+  "the composer's file picker was offered no stats.js",
+);
+check(
+  !JSON.stringify(listed).includes("median"),
+  "the file listing carried file contents, not just names",
+);
 check(
   (seen.ext.get("_mjx/inspector/frame") ?? []).length > 0,
   "the inspector was told nothing about intercepted traffic",
@@ -221,6 +247,7 @@ console.log(`cwd        ${result.info.cwd}`);
 console.log(`updates    ${seen.updates.length} (${new Set(kinds).size} kinds)`);
 console.log(`terminal   ${terminalChunks.length} chunks, ${terminalText.length} bytes`);
 console.log(`intercept  ${(seen.ext.get("_mjx/inspector/frame") ?? []).length} frames`);
+console.log(`files      ${listed.entries.length} mention candidates`);
 console.log(`stopReason ${result.response.stopReason}`);
 
 if (failures.length > 0) {

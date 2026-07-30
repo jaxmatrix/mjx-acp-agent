@@ -172,9 +172,31 @@ function appendUserContent(
   };
 }
 
-/** Structural equality, for spotting an echoed prompt. */
+/**
+ * Whether two blocks are the same block, for spotting an echoed prompt.
+ *
+ * Compared by what identifies each kind, not by serialisation. An agent is
+ * free to add a `mimeType`, a `title` or a `size` when it echoes a link back —
+ * `resource_link` requires only `name` and `uri` and carries seven optional
+ * fields — and a prompt shown twice is worse than one shown with the agent's
+ * extra fields. Mirrored by `same_block` in `crates/mjx-acp-thread/src/fold.rs`.
+ */
 function sameBlock(a: ContentBlock, b: ContentBlock): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  if (a.type !== b.type) return false;
+  switch (a.type) {
+    case "text":
+      return a.text === (b as typeof a).text;
+    case "resource_link":
+      // What it points at is what it is.
+      return a.uri === (b as typeof a).uri;
+    case "image":
+    case "audio":
+      return a.data === (b as typeof a).data && a.mimeType === (b as typeof a).mimeType;
+    case "resource":
+      return a.resource.uri === (b as typeof a).resource.uri;
+    default:
+      return JSON.stringify(a) === JSON.stringify(b);
+  }
 }
 
 /**
@@ -459,8 +481,14 @@ function mapElicitations(
   return changed ? { ...thread, entries } : thread;
 }
 
-/** Records a user prompt optimistically, before the agent acknowledges it. */
-export function appendUserPrompt(thread: Thread, text: string): Thread {
+/**
+ * Records a user prompt optimistically, before the agent acknowledges it.
+ *
+ * Takes the blocks rather than the text, because a prompt carrying a mention
+ * is several blocks and the optimistic echo has to match what was actually
+ * sent — see `appendUserContent`, which absorbs the agent's echo of it.
+ */
+export function appendUserPrompt(thread: Thread, content: ContentBlock[]): Thread {
   return {
     ...thread,
     status: "generating",
@@ -470,7 +498,7 @@ export function appendUserPrompt(thread: Thread, text: string): Thread {
       {
         type: "user",
         id: `user-${thread.entries.length}`,
-        content: [{ type: "text", text }],
+        content,
         isOptimistic: true,
       },
     ],

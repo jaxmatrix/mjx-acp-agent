@@ -151,6 +151,7 @@ function Conversation({
             busy={busy}
             ready={session.status.state === "ready"}
             commands={session.thread.availableCommands}
+            cwd={session.agentInfo?.cwd ?? cwd}
             onSend={session.prompt}
             onCancel={session.cancel}
           />

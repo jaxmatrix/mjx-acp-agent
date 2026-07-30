@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 mjx-acp-core.workspace = true
 agent-client-protocol.workspace = true
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+url.workspace = true
