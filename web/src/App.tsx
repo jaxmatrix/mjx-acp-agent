@@ -144,6 +144,7 @@ function Conversation({
         <main className="app__main">
           <ThreadView
             thread={session.thread}
+            terminals={session.terminals}
             onPermission={session.answerPermission}
             onElicitation={session.answerElicitation}
           />

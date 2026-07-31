@@ -5,6 +5,7 @@ import type { ContentBlock } from "@agentclientprotocol/sdk";
 
 import { noCapabilities, type AgentCapabilities } from "./acp/capabilities";
 import { resumeStore, sessionStore } from "./acp/resume";
+import type { Terminals } from "./acp/terminals";
 import { AgentConnection, type ConnectionStatus } from "./acp/agentConnection";
 import {
   emptyThread,
@@ -18,6 +19,8 @@ import {
 /** Everything a connected view needs. */
 export interface SessionState {
   thread: Thread;
+  /** The connection's terminals — see `acp/terminals.ts`. */
+  terminals: Terminals;
   status: ConnectionStatus;
   agentInfo?: AgentInfo;
   /** What the agent said it can do; the history UI offers nothing else. */
@@ -67,6 +70,7 @@ const sessions = sessionStore();
 /** Opens a session against `agentId` in `cwd`, and keeps React in step. */
 export function useSession(agentId: string | null, cwd: string | null): SessionState {
   const [thread, setThread] = useState<Thread>(emptyThread);
+  const [terminals, setTerminals] = useState<Terminals>({});
   const [status, setStatus] = useState<ConnectionStatus>({ state: "connecting" });
   const [agentInfo, setAgentInfo] = useState<AgentInfo>();
   const [frames, setFrames] = useState<InspectorEntry[]>([]);
@@ -87,6 +91,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
     // Reset rather than accumulate: switching agents starts a new conversation.
     setThread(emptyThread());
+    setTerminals({});
     setFrames([]);
     setError(undefined);
     setAgentInfo(undefined);
@@ -105,6 +110,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
     const active = new AgentConnection(emptyThread(), {
       thread: setThread,
+      terminals: setTerminals,
       capabilities: setCapabilities,
       replaying: setReplayingSessionId,
       sessionChanged: setSessionId,
@@ -240,6 +246,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
   return {
     thread,
+    terminals,
     status,
     agentInfo,
     capabilities,

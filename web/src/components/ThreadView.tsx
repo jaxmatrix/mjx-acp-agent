@@ -7,14 +7,18 @@ import remarkGfm from "remark-gfm";
 import { ElicitationPrompt } from "./ElicitationPrompt";
 import { MentionChip } from "./Mention";
 import { ToolCallCard } from "./ToolCallCard";
+import type { Terminals } from "../acp/terminals";
 import { chunkText, type AssistantChunk, type ElicitationAnswer, type Thread } from "../acp/types";
 
 export function ThreadView({
   thread,
+  terminals,
   onPermission,
   onElicitation,
 }: {
   thread: Thread;
+  /** The connection's terminals, not the thread's — see `acp/terminals.ts`. */
+  terminals: Terminals;
   onPermission(toolCallId: string, optionId: string | null): void;
   onElicitation(requestId: string | number, answer: ElicitationAnswer): void;
 }) {
@@ -77,7 +81,7 @@ export function ThreadView({
               <ToolCallCard
                 key={entry.id}
                 toolCall={entry.toolCall}
-                terminals={thread.terminals}
+                terminals={terminals}
                 onPermission={onPermission}
               />
             );

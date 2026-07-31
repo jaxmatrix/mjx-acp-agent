@@ -12,6 +12,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import { describe, expect, test } from "vitest";
 
 import { AgentConnection, type ConnectionEvents, type OpenSessions } from "./agentConnection";
+import type { Terminals } from "./terminals";
 import { emptyThread, type Thread } from "./types";
 
 /** A conversation the fake agent remembers, as the updates that built it. */
@@ -77,9 +78,17 @@ function connectedAgent(
       } as never);
       return { protocolVersion: acp.PROTOCOL_VERSION, agentCapabilities: capabilities } as never;
     })
-    .onRequest(acp.methods.agent.session.prompt, (ctx) => {
+    .onRequest(acp.methods.agent.session.prompt, async (ctx) => {
       log.methods.push("session/prompt");
       log.prompts.push(ctx.params.prompt);
+      // The server's announcement, not the agent's: a terminal the relay
+      // started on the agent's behalf. Sent during the turn, where one is.
+      await ctx.client.notify("_mjx/terminal/created" as never, {
+        terminalId: `term-${log.prompts.length}`,
+        command: "cargo",
+        args: ["test"],
+        cwd: "/w",
+      } as never);
       return { stopReason: "end_turn" as const };
     })
     .onRequest(acp.methods.agent.session.new, () => {
@@ -142,14 +151,22 @@ function connectedAgent(
 }
 
 /** Everything `AgentConnection` reports, collected. */
-function watcher(): { events: ConnectionEvents; thread: () => Thread; replaying: () => string[] } {
+function watcher(): {
+  events: ConnectionEvents;
+  thread: () => Thread;
+  terminals: () => Terminals;
+  replaying: () => string[];
+} {
   let thread = emptyThread();
+  let terminals: Terminals = {};
   const replaying: string[] = [];
   return {
     thread: () => thread,
+    terminals: () => terminals,
     replaying: () => replaying,
     events: {
       thread: (next) => (thread = next),
+      terminals: (next) => (terminals = next),
       agentInfo: () => {},
       capabilities: () => {},
       replaying: (sessionId) => replaying.push(sessionId ?? "—"),
@@ -219,6 +236,21 @@ describe("a session that can reach its agent's history", () => {
     expect(session.sessionId).toBe("yesterday");
     expect(seen.replaying()).toEqual(["yesterday", "—"]);
     expect(log.loaded).toEqual(["yesterday@/w"]);
+  });
+
+  test("a terminal's scrollback outlives the conversation it was started in", async () => {
+    // Why terminals are held by the connection rather than by a thread. A load
+    // replaces the thread wholesale — it is rebuilt from the server's fold,
+    // which has no terminals in it — so scrollback kept in one was lost the
+    // moment a past conversation was opened.
+    const { session, seen } = await connected();
+    await session.prompt([{ type: "text", text: "run the tests" }]).catch(() => {});
+    expect(Object.keys(seen.terminals())).toEqual(["term-1"]);
+
+    await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
+
+    expect(seen.thread().entries).toHaveLength(2);
+    expect(seen.terminals()["term-1"]?.command).toBe("cargo");
   });
 
   test("a second load is not a longer conversation", async () => {

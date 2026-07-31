@@ -13,7 +13,8 @@ import { DiffView } from "./DiffView";
 import { ResourceRow } from "./Mention";
 import { PermissionPrompt } from "./PermissionPrompt";
 import { TerminalView } from "./TerminalView";
-import type { Terminal, ToolCall } from "../acp/types";
+import type { Terminals } from "../acp/terminals";
+import type { ToolCall } from "../acp/types";
 
 /** A glyph per tool kind, so the timeline is scannable without reading. */
 const ICONS: Record<ToolKind, string> = {
@@ -42,7 +43,7 @@ export function ToolCallCard({
   onPermission,
 }: {
   toolCall: ToolCall;
-  terminals: Record<string, Terminal>;
+  terminals: Terminals;
   onPermission(toolCallId: string, optionId: string | null): void;
 }) {
   // Finished calls start collapsed: the interesting one is the one running.

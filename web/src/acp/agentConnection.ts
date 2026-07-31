@@ -19,6 +19,10 @@ import { threadFromReplay } from "./replay";
 import {
   addTerminal,
   appendTerminalOutput,
+  setTerminalExit,
+  type Terminals,
+} from "./terminals";
+import {
   appendUserPrompt,
   applyUpdate,
   attachElicitation,
@@ -26,7 +30,6 @@ import {
   cancelPendingElicitations,
   clearPermission,
   completeElicitation,
-  setTerminalExit,
   settleElicitation,
 } from "./thread";
 import {
@@ -47,6 +50,8 @@ import {
 export interface ConnectionEvents {
   /** A new thread state. */
   thread(next: Thread): void;
+  /** New terminal state, for every terminal on this connection. */
+  terminals(next: Terminals): void;
   /** Which agent the server connected us to. */
   agentInfo(info: AgentInfo): void;
   /** What the agent said it can do, once the handshake has answered. */
@@ -102,6 +107,13 @@ export class AgentConnection {
   #agent?: acp.ClientContext;
   #sessionId?: string;
   #thread: Thread;
+  /**
+   * Every terminal the server has started for this agent.
+   *
+   * On the connection rather than in a thread, because that is where one
+   * belongs: see `acp/terminals.ts`.
+   */
+  #terminals: Terminals = {};
   #events: ConnectionEvents;
   /** Resolvers for permission prompts the user hasn't answered yet. */
   #pendingPermissions = new Map<string, (optionId: string | null) => void>();
@@ -144,6 +156,11 @@ export class AgentConnection {
   /** The current thread. */
   get thread(): Thread {
     return this.#thread;
+  }
+
+  /** The terminals running on this connection. */
+  get terminals(): Terminals {
+    return this.#terminals;
   }
 
   /** What the connected agent supports. */
@@ -782,7 +799,9 @@ export class AgentConnection {
       passthrough<{ terminalId: string; command: string; args: string[]; cwd: string }>,
       (ctx) => {
         const { terminalId, command, args, cwd } = ctx.params;
-        this.#update((thread) => addTerminal(thread, { id: terminalId, command, args, cwd }));
+        this.#updateTerminals((terminals) =>
+          addTerminal(terminals, { id: terminalId, command, args, cwd }),
+        );
       },
     );
 
@@ -791,8 +810,8 @@ export class AgentConnection {
       passthrough<{ terminalId: string; chunk: string; truncated: boolean }>,
       (ctx) => {
         const bytes = decodeChunk(ctx.params.chunk);
-        this.#update((thread) =>
-          appendTerminalOutput(thread, ctx.params.terminalId, bytes, ctx.params.truncated),
+        this.#updateTerminals((terminals) =>
+          appendTerminalOutput(terminals, ctx.params.terminalId, bytes, ctx.params.truncated),
         );
       },
     );
@@ -801,8 +820,8 @@ export class AgentConnection {
       ext.terminalExit,
       passthrough<{ terminalId: string; exitCode?: number; signal?: string }>,
       (ctx) => {
-        this.#update((thread) =>
-          setTerminalExit(thread, ctx.params.terminalId, ctx.params.exitCode, ctx.params.signal),
+        this.#updateTerminals((terminals) =>
+          setTerminalExit(terminals, ctx.params.terminalId, ctx.params.exitCode, ctx.params.signal),
         );
       },
     );
@@ -817,6 +836,11 @@ export class AgentConnection {
   #update(mutate: (thread: Thread) => Thread): void {
     this.#thread = mutate(this.#thread);
     this.#events.thread(this.#thread);
+  }
+
+  #updateTerminals(mutate: (terminals: Terminals) => Terminals): void {
+    this.#terminals = mutate(this.#terminals);
+    this.#events.terminals(this.#terminals);
   }
 
   #record(params: unknown, method: string): void {

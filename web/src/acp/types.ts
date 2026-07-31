@@ -260,7 +260,6 @@ export interface Thread {
   availableCommands: AvailableCommand[];
   modes?: { currentModeId: string; availableModes: SessionMode[] };
   configOptions: SessionConfigOption[];
-  terminals: Record<string, Terminal>;
 }
 
 /** An empty thread. */
@@ -271,7 +270,6 @@ export function emptyThread(): Thread {
     status: "idle",
     availableCommands: [],
     configOptions: [],
-    terminals: {},
   };
 }
 
