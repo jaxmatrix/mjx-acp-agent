@@ -949,7 +949,7 @@ fn title_and_record_prompt(agent: &Agent, session_id: &str, params: &Value) {
 fn summarise(text: &str) -> String {
     let line = text.lines().next().unwrap_or(text).trim();
     match line.char_indices().nth(60) {
-        Some((cut, _)) => format!("{}…", &line[..cut].trim_end()),
+        Some((cut, _)) => format!("{}…", line[..cut].trim_end()),
         None => line.to_string(),
     }
 }
