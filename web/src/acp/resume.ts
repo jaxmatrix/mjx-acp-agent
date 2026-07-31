@@ -26,17 +26,20 @@ export interface ResumeStore {
 }
 
 /**
- * Reads and writes which conversation this tab is looking at.
+ * Reads and writes which of an agent's conversations this tab has open.
  *
  * Separate from the connection id because it answers a different question: the
  * connection id is *which agent*, and this is *which of its sessions*. They come
  * apart the moment the user opens one from the history — the relay still answers
  * a repeat `session/new` with the session that connection started with, which is
- * no longer the one on screen.
+ * no longer the only one being looked at.
+ *
+ * A list rather than one id, because a viewer that can hold several
+ * conversations has to bring all of them back, not the last one touched.
  */
 export interface SessionStore {
-  get(agentId: string, cwd: string): string | undefined;
-  set(agentId: string, cwd: string, sessionId: string): void;
+  get(agentId: string, cwd: string): string[];
+  set(agentId: string, cwd: string, sessionIds: string[]): void;
   clear(agentId: string, cwd: string): void;
 }
 
@@ -63,11 +66,29 @@ export function resumeStore(storage: Storage | undefined = safeSessionStorage())
   };
 }
 
-/** The session to come back to, across a reload. */
+/** The sessions to come back to, across a reload. */
 export function sessionStore(storage: Storage | undefined = safeSessionStorage()): SessionStore {
   return {
-    get: (agentId, cwd) => read(storage, sessionKey(agentId, cwd)),
-    set: (agentId, cwd, sessionId) => write(storage, sessionKey(agentId, cwd), sessionId),
+    get(agentId, cwd) {
+      const stored = read(storage, sessionKey(agentId, cwd));
+      if (!stored) return [];
+      try {
+        const parsed: unknown = JSON.parse(stored);
+        // Anything under our key that is not a list of ids is not ours, and a
+        // conversation restored from a shape we misread would be the wrong one.
+        return Array.isArray(parsed) && parsed.every((id) => typeof id === "string")
+          ? (parsed as string[])
+          : [];
+      } catch {
+        return [];
+      }
+    },
+    set: (agentId, cwd, sessionIds) =>
+      write(
+        storage,
+        sessionKey(agentId, cwd),
+        sessionIds.length > 0 ? JSON.stringify(sessionIds) : undefined,
+      ),
     clear: (agentId, cwd) => write(storage, sessionKey(agentId, cwd), undefined),
   };
 }
@@ -103,7 +124,7 @@ function resumeKey(agentId: string, cwd: string): string {
 }
 
 function sessionKey(agentId: string, cwd: string): string {
-  return `mjx.session.${agentId}.${cwd}`;
+  return `mjx.sessions.${agentId}.${cwd}`;
 }
 
 /**

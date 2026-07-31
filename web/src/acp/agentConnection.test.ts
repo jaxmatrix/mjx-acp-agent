@@ -223,13 +223,15 @@ function watcher(): {
   };
 }
 
-/** A memory that starts holding `sessionId`, as a reloaded tab's would. */
-function memory(sessionId?: string): OpenSessions & { value: () => string | undefined } {
-  let held = sessionId;
+/** A memory that starts holding `sessionIds`, as a reloaded tab's would. */
+function memory(sessionIds: string[] = []): OpenSessions & { value: () => string[] } {
+  let held = [...sessionIds];
   return {
     get: () => held,
-    set: (id) => (held = id),
-    clear: () => (held = undefined),
+    add: (id) => {
+      if (!held.includes(id)) held = [...held, id];
+    },
+    remove: (id) => (held = held.filter((one) => one !== id)),
     value: () => held,
   };
 }
@@ -241,7 +243,7 @@ const LIFECYCLE = {
 
 async function connected(
   capabilities: unknown = LIFECYCLE,
-  held?: string,
+  held?: string[],
   threads?: Set<string>,
   parks?: Set<string>,
 ) {
@@ -371,35 +373,48 @@ describe("a session that can reach its agent's history", () => {
     expect(log.loaded).toEqual(["yesterday@/w"]);
   });
 
-  test("remembers the conversation on screen, so a reload comes back to it", async () => {
+  test("remembers every conversation open, so a reload comes back to all of them", async () => {
     const { session, memory: held } = await connected();
-    expect(held.value()).toBe("fresh");
+    expect(held.value()).toEqual(["fresh"]);
     await session.loadSession({ sessionId: "yesterday", cwd: "/w" });
-    expect(held.value()).toBe("yesterday");
+    // Both: the one the connection started with is still open beside the one
+    // just loaded, and a reload that came back to only the last would lose it.
+    expect(held.value()).toEqual(["fresh", "yesterday"]);
   });
 
-  test("a reload takes back the session it remembers, not the connection's first", async () => {
+  test("a reload takes back the sessions it remembers, not just the connection's first", async () => {
     // The relay answers a repeat `session/new` with the session the connection
-    // started with. After the user has opened one from the history, that is no
-    // longer the conversation on screen — and only the tab knows which is.
-    const { log, seen, on } = await connected(LIFECYCLE, "yesterday");
-    expect(on()).toBe("yesterday");
+    // started with, and knows nothing of the others. Only the tab does.
+    const { session, log, seen } = await connected(LIFECYCLE, ["fresh", "yesterday"]);
+
+    expect(session.sessions).toEqual(expect.arrayContaining(["fresh", "yesterday"]));
     // From the server's fold, not from the agent: nothing was asked to replay,
-    // because the conversation never stopped.
-    expect(log.replayed).toEqual(["yesterday"]);
+    // because the conversations never stopped.
+    expect(log.replayed).toEqual(["fresh", "yesterday"]);
     expect(log.loaded).toEqual([]);
-    expect(seen.thread().entries).toHaveLength(1);
+    expect(seen.thread("yesterday").entries).toHaveLength(1);
+    expect(seen.thread("fresh").entries).toHaveLength(1);
+
+    // And exactly one `session/new`, however many came back. The relay lets
+    // every later one through to the agent, so one per conversation would
+    // leave a real, empty session behind for each of them on every reload.
+    expect(log.methods.filter((method) => method === "session/new")).toHaveLength(1);
   });
 
-  test("a remembered session the server has lost falls back to the recorded one", async () => {
-    // Deleted, or on a connection that has since been reaped. An empty page
-    // with a composer pointed at a session that is gone is worse than the
-    // conversation this connection actually started with.
-    const { memory: held, log, on } = await connected(LIFECYCLE, "yesterday", new Set(["fresh"]));
+  test("a remembered session the server has lost costs that one, not the others", async () => {
+    // Deleted, or on a connection that has since been reaped. Losing the whole
+    // restore over one of them would be the wrong price: the rest are still
+    // there, and a composer pointed at a session that is gone is worse than one
+    // tab fewer.
+    const { session, memory: held, log } = await connected(
+      LIFECYCLE,
+      ["fresh", "yesterday"],
+      new Set(["fresh"]),
+    );
 
-    expect(on()).toBe("fresh");
-    expect(held.value()).toBe("fresh");
-    expect(log.replayed).toEqual(["yesterday", "fresh"]);
+    expect(log.replayed).toEqual(["fresh", "yesterday"]);
+    expect(session.sessions).toEqual(["fresh"]);
+    expect(held.value()).toEqual(["fresh"]);
   });
 
   test("deleting a conversation drops its thread and says so", async () => {

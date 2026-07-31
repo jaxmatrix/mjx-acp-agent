@@ -111,10 +111,19 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     nextSeq.current = 0;
     showing.current = undefined;
 
+    const key = cwd ?? "";
     const memory = {
-      get: () => sessions.get(agentId, cwd ?? ""),
-      set: (id: string) => sessions.set(agentId, cwd ?? "", id),
-      clear: () => sessions.clear(agentId, cwd ?? ""),
+      get: () => sessions.get(agentId, key),
+      add: (id: string) => {
+        const held = sessions.get(agentId, key);
+        if (!held.includes(id)) sessions.set(agentId, key, [...held, id]);
+      },
+      remove: (id: string) =>
+        sessions.set(
+          agentId,
+          key,
+          sessions.get(agentId, key).filter((held) => held !== id),
+        ),
     };
 
     const show = (sessionId: string) => {

@@ -69,17 +69,21 @@ export interface ConnectionEvents {
 }
 
 /**
- * Which conversation this tab is looking at, across a reload.
+ * Which conversations this tab has open, across a reload.
  *
  * An interface rather than the storage itself, because nothing under `acp/`
  * should know about `sessionStorage` — and because a session that is never
  * remembered still works, it just comes back to the connection's original
  * conversation.
+ *
+ * A set rather than one id: the relay answers a repeat `session/new` with the
+ * conversation the connection started with, and has no way to know which others
+ * were open beside it. Only the tab knows, so only the tab can say.
  */
 export interface OpenSessions {
-  get(): string | undefined;
-  set(sessionId: string): void;
-  clear(): void;
+  get(): string[];
+  add(sessionId: string): void;
+  remove(sessionId: string): void;
 }
 
 /**
@@ -305,9 +309,9 @@ export class AgentConnection {
       this.#events.capabilities(this.#capabilities);
 
       // Read before anything writes it: `#openSession` below records the
-      // session this connection came back with, which would overwrite the one
-      // the tab was actually looking at.
-      const remembered = this.#memory?.get();
+      // session this connection came back with, which would otherwise be mixed
+      // in with the ones the tab actually had open.
+      const remembered = this.#memory?.get() ?? [];
 
       // Exactly one, however many conversations this browser is restoring. The
       // relay answers the *first* `session/new` of an attachment from its
@@ -328,7 +332,7 @@ export class AgentConnection {
       // this is the same session it was already running. What it has been doing
       // since is in the thread the server folded.
       if (this.#resumed) {
-        await this.#resumeThread(connection.agent, session.sessionId, remembered);
+        await this.#restore(connection.agent, session.sessionId, remembered);
       }
 
       this.#events.status({ state: "ready" });
@@ -367,36 +371,38 @@ export class AgentConnection {
   }
 
   /**
-   * Takes back the conversation this tab was looking at before the reload.
+   * Takes back every conversation this tab had open before the reload.
    *
-   * Usually that is the session the connection started with, and `recorded` —
+   * One of them is the session the connection started with, and `recorded` —
    * the id the relay answered `session/new` with from its recording — is it.
-   * But once a session has been opened from the history they are different
-   * conversations, and the relay has no way to know which one was on screen: it
-   * answers the handshake the same either way. So the tab remembers, and what
-   * it remembers is tried first.
+   * The rest were opened from the history or started since, and the relay has
+   * no way to know about them: it answers the handshake the same either way. So
+   * the tab remembers, and what it remembers is what comes back.
    *
-   * A remembered session the server has no thread for is one that has been
-   * deleted, or belongs to a connection that has since been reaped. Falling
-   * back to the recorded one is better than an empty page with a composer
-   * pointed at a session that is gone.
+   * One `session/new` has already been sent, and only one may be: the relay
+   * answers the first of an attachment from its recording and lets every later
+   * one through to the agent, so asking again per remembered conversation would
+   * leave a real, empty session behind for each of them on every reload. These
+   * come back by replay alone.
+   *
+   * A remembered session the server has no thread for has been deleted, or
+   * belongs to a connection that has since been reaped. It is dropped and the
+   * others are unaffected — one conversation going missing is no reason to lose
+   * the rest.
    */
-  async #resumeThread(
+  async #restore(
     agent: acp.ClientContext,
     recorded: string,
-    remembered: string | undefined,
+    remembered: string[],
   ): Promise<void> {
-    if (remembered && remembered !== recorded) {
-      this.#openSession(remembered);
-      if (await this.#replay(agent, remembered)) return;
-
-      // Gone: deleted, or on a connection that has since been reaped. Drop the
-      // thread we opened for it and come back to the one this connection
-      // started with, which is still there.
-      this.#forget(remembered);
-      this.#memory?.set(recorded);
-    }
     await this.#replay(agent, recorded);
+
+    for (const sessionId of remembered) {
+      if (sessionId === recorded) continue;
+      this.#openSession(sessionId);
+      if (await this.#replay(agent, sessionId)) continue;
+      this.#forget(sessionId);
+    }
   }
 
   /** Lists the conversations the agent knows about. */
@@ -546,7 +552,7 @@ export class AgentConnection {
    * it twice would replace a live thread with an empty one.
    */
   #openSession(sessionId: string): void {
-    this.#memory?.set(sessionId);
+    this.#memory?.add(sessionId);
     if (this.#threads.has(sessionId)) return;
     this.#threads.set(sessionId, emptyThread());
     this.#events.sessionOpened(sessionId);
@@ -560,6 +566,7 @@ export class AgentConnection {
    * listening for one.
    */
   #forget(sessionId: string): void {
+    this.#memory?.remove(sessionId);
     if (!this.#threads.delete(sessionId)) return;
     for (const [key, pending] of this.#pendingElicitations) {
       if (pending.sessionId !== sessionId) continue;
