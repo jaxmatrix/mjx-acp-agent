@@ -45,9 +45,9 @@ pub enum Disposition {
 /// Decides what happens to each frame, and services the client methods the
 /// server owns.
 ///
-/// The server installs exactly one: `WorkspaceInterceptor`. The trait exists
-/// so the relay itself stays ignorant of what the filesystem and terminal
-/// capabilities need.
+/// The trait exists so the relay itself stays ignorant of what the filesystem,
+/// terminal and authentication paths need. Several can be installed at once by
+/// composing them with [`Chain`].
 pub trait Interceptor: Send + Sync + 'static {
     /// Called once before any frames flow, so an interceptor can start
     /// background work that needs to write to the connection.
@@ -71,8 +71,99 @@ pub trait Interceptor: Send + Sync + 'static {
         Disposition::Forward
     }
 
+    /// Called for an `_mjx/*` request from the browser the relay does not
+    /// answer itself. Returns whether this interceptor answered it.
+    ///
+    /// These never reach [`Interceptor::on_client_frame`]: an extension request
+    /// is answered with the browser's own id and so must not be rebound into the
+    /// agent's id space, which is why the relay diverts them first. This hook is
+    /// how an interceptor gets at them anyway.
+    fn on_extension_request(&self, frame: &Frame, outbox: &Outbox) -> bool {
+        let _ = (frame, outbox);
+        false
+    }
+
     /// Called once the connection has ended.
     fn stop(&self) {}
+}
+
+/// Two interceptors as one.
+///
+/// The relay drives a single interceptor, and nesting these gives it as many as
+/// are needed without the relay learning to hold a list. Composition rules, in
+/// full, because getting one of them wrong is silent:
+///
+/// * `start` runs in order, `stop` in reverse — an interceptor's own setup
+///   should be torn down after anything installed on top of it.
+/// * A frame is folded left. [`Disposition::Forward`] passes the current frame
+///   to the next member; [`Disposition::Rewrite`] replaces it and carries on, so
+///   a later member sees what an earlier one made.
+/// * [`Disposition::Intercept`] short-circuits: an intercepted frame reaches
+///   neither peer, so there is nothing left downstream to decide.
+/// * The first member to answer an `_mjx/*` request wins.
+#[allow(dead_code, reason = "installed once the auth interceptor exists")]
+pub struct Chain<A, B> {
+    first: A,
+    second: B,
+}
+
+#[allow(dead_code, reason = "installed once the auth interceptor exists")]
+impl<A: Interceptor, B: Interceptor> Chain<A, B> {
+    /// Runs `first` before `second`.
+    pub fn new(first: A, second: B) -> Self {
+        Self { first, second }
+    }
+
+    /// Folds one frame through both members.
+    fn fold(
+        &self,
+        frame: &Frame,
+        outbox: &Outbox,
+        step: impl Fn(&dyn Interceptor, &Frame, &Outbox) -> Disposition,
+    ) -> Disposition {
+        let mut rewritten: Option<Frame> = None;
+        for member in [&self.first as &dyn Interceptor, &self.second] {
+            let current = rewritten.as_ref().unwrap_or(frame);
+            match step(member, current, outbox) {
+                Disposition::Forward => {}
+                Disposition::Rewrite(next) => rewritten = Some(next),
+                Disposition::Intercept => return Disposition::Intercept,
+            }
+        }
+        match rewritten {
+            Some(frame) => Disposition::Rewrite(frame),
+            None => Disposition::Forward,
+        }
+    }
+}
+
+impl<A: Interceptor, B: Interceptor> Interceptor for Chain<A, B> {
+    fn start(&self, outbox: &Outbox) {
+        self.first.start(outbox);
+        self.second.start(outbox);
+    }
+
+    fn on_client_frame(&self, frame: &Frame, outbox: &Outbox) -> Disposition {
+        self.fold(frame, outbox, |member, frame, outbox| {
+            member.on_client_frame(frame, outbox)
+        })
+    }
+
+    fn on_agent_frame(&self, frame: &Frame, outbox: &Outbox) -> Disposition {
+        self.fold(frame, outbox, |member, frame, outbox| {
+            member.on_agent_frame(frame, outbox)
+        })
+    }
+
+    fn on_extension_request(&self, frame: &Frame, outbox: &Outbox) -> bool {
+        self.first.on_extension_request(frame, outbox)
+            || self.second.on_extension_request(frame, outbox)
+    }
+
+    fn stop(&self) {
+        self.second.stop();
+        self.first.stop();
+    }
 }
 
 /// The browser end of an outbox: whichever socket is attached right now, if any.
@@ -825,7 +916,15 @@ impl<I: Interceptor> Relay<I> {
                 }
                 Err(err) => Frame::error(id.clone(), JsonRpcError::invalid_params(err)),
             },
-            other => Frame::error(id.clone(), JsonRpcError::method_not_found(other)),
+            // Not ours, so offer it to the interceptor before giving up. It
+            // answers on the browser's own id, which is why these never went
+            // through `on_client_frame` in the first place.
+            other => {
+                if self.interceptor.on_extension_request(frame, &self.outbox) {
+                    return;
+                }
+                Frame::error(id.clone(), JsonRpcError::method_not_found(other))
+            }
         };
 
         self.outbox.to_browser(&reply);
@@ -1198,6 +1297,179 @@ mod tests {
             method: method::agent::INITIALIZE.into(),
             params: Some(serde_json::value::to_raw_value(&params).unwrap()),
         }
+    }
+
+    /// Records what it was asked, and does whatever it was told to.
+    struct Spy {
+        name: &'static str,
+        seen: std::sync::Mutex<Vec<String>>,
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+        client: fn(&Frame) -> Disposition,
+        answers_extensions: bool,
+    }
+
+    impl Spy {
+        fn new(name: &'static str, events: &Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                name,
+                seen: std::sync::Mutex::new(Vec::new()),
+                events: events.clone(),
+                client: |_| Disposition::Forward,
+                answers_extensions: false,
+            }
+        }
+
+        fn saying(mut self, client: fn(&Frame) -> Disposition) -> Self {
+            self.client = client;
+            self
+        }
+
+        fn answering_extensions(mut self) -> Self {
+            self.answers_extensions = true;
+            self
+        }
+
+        fn note(&self, what: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("{}:{what}", self.name));
+        }
+
+        fn methods_seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Interceptor for Spy {
+        fn start(&self, _outbox: &Outbox) {
+            self.note("start");
+        }
+
+        fn on_client_frame(&self, frame: &Frame, _outbox: &Outbox) -> Disposition {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(frame.method().unwrap_or_default().to_owned());
+            (self.client)(frame)
+        }
+
+        fn on_extension_request(&self, _frame: &Frame, _outbox: &Outbox) -> bool {
+            self.note("extension");
+            self.answers_extensions
+        }
+
+        fn stop(&self) {
+            self.note("stop");
+        }
+    }
+
+    fn renamed(to: &str) -> Frame {
+        Frame::Request {
+            id: mjx_acp_core::RequestId::Number(1),
+            method: to.into(),
+            params: None,
+        }
+    }
+
+    #[test]
+    fn a_chain_shows_each_member_what_the_last_one_made() {
+        // The rule that matters most: the workspace interceptor rewrites
+        // `initialize` to add its capabilities, and anything after it must see
+        // the rewritten frame or it would add its own to a copy that is thrown
+        // away.
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chain = Chain::new(
+            Spy::new("first", &events).saying(|_| Disposition::Rewrite(renamed("rewritten/once"))),
+            Spy::new("second", &events)
+                .saying(|_| Disposition::Rewrite(renamed("rewritten/twice"))),
+        );
+        let (outbox, _rx) = Outbox::for_test();
+
+        let out = chain.on_client_frame(&initialize(serde_json::json!({})), &outbox);
+        let Disposition::Rewrite(frame) = out else {
+            panic!("a chain whose members rewrote must report a rewrite");
+        };
+        assert_eq!(frame.method(), Some("rewritten/twice"));
+        assert_eq!(chain.second.methods_seen(), ["rewritten/once"]);
+    }
+
+    #[test]
+    fn intercepting_stops_the_chain() {
+        // An intercepted frame reaches neither peer, so there is nothing left
+        // for a later member to decide — and letting it run would invite it to
+        // answer a frame that has already been answered.
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chain = Chain::new(
+            Spy::new("first", &events).saying(|_| Disposition::Intercept),
+            Spy::new("second", &events),
+        );
+        let (outbox, _rx) = Outbox::for_test();
+
+        let out = chain.on_client_frame(&initialize(serde_json::json!({})), &outbox);
+        assert!(matches!(out, Disposition::Intercept));
+        assert!(
+            chain.second.methods_seen().is_empty(),
+            "the second member should never have been asked"
+        );
+    }
+
+    #[test]
+    fn a_chain_nobody_touched_forwards_the_original() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chain = Chain::new(Spy::new("first", &events), Spy::new("second", &events));
+        let (outbox, _rx) = Outbox::for_test();
+
+        let out = chain.on_client_frame(&initialize(serde_json::json!({})), &outbox);
+        assert!(matches!(out, Disposition::Forward));
+    }
+
+    #[test]
+    fn a_chain_starts_in_order_and_stops_in_reverse() {
+        // Teardown mirrors setup: whatever was installed on top comes off first.
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chain = Chain::new(Spy::new("first", &events), Spy::new("second", &events));
+        let (outbox, _rx) = Outbox::for_test();
+
+        chain.start(&outbox);
+        chain.stop();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["first:start", "second:start", "second:stop", "first:stop"]
+        );
+    }
+
+    #[test]
+    fn the_first_member_to_answer_an_extension_wins() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chain = Chain::new(
+            Spy::new("first", &events).answering_extensions(),
+            Spy::new("second", &events),
+        );
+        let (outbox, _rx) = Outbox::for_test();
+
+        assert!(chain.on_extension_request(&renamed(ext::AUTH_STATE), &outbox));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["first:extension"],
+            "the second member must not be asked to answer again"
+        );
+    }
+
+    #[test]
+    fn an_extension_nobody_claims_is_still_unanswered() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let chain = Chain::new(Spy::new("first", &events), Spy::new("second", &events));
+        let (outbox, _rx) = Outbox::for_test();
+
+        // False, so the relay falls through to `method_not_found` — a browser
+        // asking for something nobody implements must hear so.
+        assert!(!chain.on_extension_request(&renamed("_mjx/nope"), &outbox));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["first:extension", "second:extension"]
+        );
     }
 
     fn capabilities_of(frame: &Frame) -> serde_json::Value {
