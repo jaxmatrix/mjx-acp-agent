@@ -1,65 +1,56 @@
-/** The shell: pick an agent, then talk to it. */
+/** The shell: pick an agent, then talk to it — as many at once as you like. */
 
 import { useEffect, useState } from "react";
 
-import { choiceStore, resumeStore } from "./acp/resume";
 import { AgentPicker } from "./components/AgentPicker";
 import { Composer } from "./components/Composer";
 import { Inspector } from "./components/Inspector";
 import { SessionHistory } from "./components/SessionHistory";
 import { Sidebar } from "./components/Sidebar";
 import { ThreadView } from "./components/ThreadView";
-import { useSession } from "./useSession";
-
-const choice = choiceStore();
-const resume = resumeStore();
+import { useSessions, type TabState, type Viewer } from "./useSessions";
 
 export function App() {
-  // Restored, not empty: the server keeps the agent alive across a reload, and
-  // a page that came back to the picker would leave that conversation running
-  // where nobody could see it.
-  const [connection, setConnection] = useState(choice.get);
+  const viewer = useSessions();
+  const [picking, setPicking] = useState(false);
 
-  if (!connection) {
+  // Nothing open — a first visit, or everything closed. The picker is the whole
+  // page then, and a way to add an agent beside the ones already open when not.
+  //
+  // What is open is restored rather than empty: the server keeps agents alive
+  // across a reload, and a page that came back to the picker would leave those
+  // conversations running where nobody could see them.
+  if (viewer.tabs.length === 0 || picking) {
     return (
       <AgentPicker
         onConnect={(agentId, cwd) => {
-          choice.set({ agentId, cwd });
-          setConnection({ agentId, cwd });
+          viewer.connect(agentId, cwd);
+          setPicking(false);
         }}
+        {...(viewer.tabs.length > 0 ? { onCancel: () => setPicking(false) } : {})}
       />
     );
   }
 
-  return (
-    <Conversation
-      agentId={connection.agentId}
-      cwd={connection.cwd}
-      onDisconnect={() => {
-        // Leaving on purpose is not a reload. Forget the agent so the next
-        // visit starts clean rather than rejoining something abandoned.
-        resume.clear(connection.agentId, connection.cwd);
-        choice.clear();
-        setConnection(undefined);
-      }}
-    />
-  );
+  // Connections are open but no conversation has come back yet.
+  if (!viewer.current) return <p className="callout">Connecting…</p>;
+
+  return <Conversation viewer={viewer} current={viewer.current} onAdd={() => setPicking(true)} />;
 }
 
 function Conversation({
-  agentId,
-  cwd,
-  onDisconnect,
+  viewer,
+  current,
+  onAdd,
 }: {
-  agentId: string;
-  cwd: string;
-  onDisconnect(): void;
+  viewer: Viewer;
+  current: TabState;
+  onAdd(): void;
 }) {
-  const session = useSession(agentId, cwd);
   const [showInspector, setShowInspector] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
-  const busy = session.thread.status === "generating";
-  const { capabilities, refreshSessions } = session;
+  const busy = current.thread.status === "generating";
+  const { capabilities, refreshSessions } = current;
 
   // Only agents that advertise `session/list` have a history to show, and that
   // is not known until the handshake has answered.
@@ -76,8 +67,8 @@ function Conversation({
       }`}
     >
       <header className="topbar">
-        <button type="button" className="link-button" onClick={onDisconnect}>
-          ← Agents
+        <button type="button" className="link-button" onClick={onAdd}>
+          + Agent
         </button>
         {canList && (
           <button
@@ -86,94 +77,121 @@ function Conversation({
             onClick={() => setShowHistory((v) => !v)}
             aria-pressed={showHistory}
           >
-            History ({session.sessions.length})
+            History ({current.sessions.length})
           </button>
         )}
-        <StatusPill session={session} />
+        <StatusPill current={current} />
         <button
           type="button"
           className="link-button"
           onClick={() => setShowInspector((v) => !v)}
           aria-pressed={showInspector}
         >
-          {showInspector ? "Hide" : "Show"} protocol ({session.frames.length})
+          {showInspector ? "Hide" : "Show"} protocol ({current.frames.length})
         </button>
       </header>
 
-      {session.error && <p className="callout callout--error">{session.error}</p>}
-      {session.status.state === "failed" && (
-        <p className="callout callout--error">
-          Connection failed: {session.status.message}
-        </p>
+      {current.error && <p className="callout callout--error">{current.error}</p>}
+      {current.status.state === "failed" && (
+        <p className="callout callout--error">Connection failed: {current.status.message}</p>
       )}
-      {session.status.state === "takenOver" && (
+      {current.status.state === "takenOver" && (
         // The agent is still running; it is just answering to another tab now.
-        // Taking it back is the same move that tab made to get it.
+        // Taking it back is the same move that tab made to get it, and every
+        // conversation open on this connection comes back with it.
+        //
+        // Named, because another agent may be open beside this one and only
+        // this one has been taken.
         <p className="callout">
-          This session was opened in another tab.{" "}
-          <button type="button" className="link-button" onClick={session.reconnect}>
+          {current.agentInfo?.name ?? current.tab.agentId} was opened in another tab.{" "}
+          <button type="button" className="link-button" onClick={current.reconnect}>
             Take it back
           </button>
         </p>
       )}
 
-      {session.replayingSessionId && (
-        <p className="callout">Replaying the conversation…</p>
-      )}
+      {current.replayingSessionId && <p className="callout">Replaying the conversation…</p>}
 
       <div className="app__body">
         {showHistory && (
           <SessionHistory
-            sessions={session.sessions}
-            currentSessionId={session.sessionId}
-            workspaceCwd={cwd}
-            capabilities={session.capabilities}
-            replayingSessionId={session.replayingSessionId}
-            moreSessions={session.moreSessions}
-            onLoad={session.loadSession}
-            onResume={session.resumeSession}
-            onFork={session.forkSession}
-            onDelete={session.deleteSession}
-            onClose={session.closeSession}
-            onNew={session.newSession}
-            onRefresh={session.refreshSessions}
-            onMore={session.moreSessionsPlease}
+            sessions={current.sessions}
+            currentSessionId={current.tab.sessionId}
+            workspaceCwd={current.tab.cwd}
+            capabilities={current.capabilities}
+            replayingSessionId={current.replayingSessionId}
+            moreSessions={current.moreSessions}
+            onLoad={current.loadSession}
+            onResume={current.resumeSession}
+            onFork={current.forkSession}
+            onDelete={current.deleteSession}
+            onClose={current.closeSession}
+            onNew={current.newSession}
+            onRefresh={current.refreshSessions}
+            onMore={current.moreSessionsPlease}
           />
         )}
 
         <main className="app__main">
           <ThreadView
-            thread={session.thread}
-            terminals={session.terminals}
-            onPermission={session.answerPermission}
-            onElicitation={session.answerElicitation}
+            thread={current.thread}
+            terminals={current.terminals}
+            onPermission={current.answerPermission}
+            onElicitation={current.answerElicitation}
           />
           <Composer
             busy={busy}
-            ready={session.status.state === "ready"}
-            commands={session.thread.availableCommands}
-            cwd={session.agentInfo?.cwd ?? cwd}
-            onSend={session.prompt}
-            onCancel={session.cancel}
+            ready={current.status.state === "ready"}
+            commands={current.thread.availableCommands}
+            cwd={current.agentInfo?.cwd ?? current.tab.cwd}
+            onSend={current.prompt}
+            onCancel={current.cancel}
           />
         </main>
 
         <Sidebar
-          thread={session.thread}
-          agentInfo={session.agentInfo}
-          status={session.status}
-          onSetMode={session.setMode}
-          onSetConfigOption={session.setConfigOption}
+          thread={current.thread}
+          agentInfo={current.agentInfo}
+          status={current.status}
+          onSetMode={current.setMode}
+          onSetConfigOption={current.setConfigOption}
         />
 
-        {showInspector && <Inspector frames={session.frames} />}
+        {showInspector && <Inspector frames={current.frames} />}
       </div>
+
+      {/* Every conversation is live; this is the one place to switch between
+          them until the tab strip lands. */}
+      {viewer.tabs.length > 1 && (
+        <nav className="tabs-fallback">
+          {viewer.tabs.map((tab) => (
+            <button
+              key={`${tab.agentId} ${tab.cwd} ${tab.sessionId}`}
+              type="button"
+              className="link-button"
+              aria-pressed={tab.sessionId === current.tab.sessionId}
+              onClick={() => viewer.focus(tab)}
+            >
+              {tab.agentId}
+              {viewer.busy(tab) ? " •" : ""}
+            </button>
+          ))}
+        </nav>
+      )}
     </div>
   );
 }
 
-function StatusPill({ session }: { session: ReturnType<typeof useSession> }) {
-  const { status, thread } = session;
+/**
+ * Whether this connection is reachable, and whether its agent is working.
+ *
+ * Two questions rather than one, now that a connection carries several
+ * conversations — the socket is the connection's and the turn is one
+ * conversation's. They still share a pill until the tab strip has somewhere to
+ * show the second per tab.
+ */
+function StatusPill({ current }: { current: TabState }) {
+  const { status, thread } = current;
   if (status.state === "connecting") return <span className="pill">connecting…</span>;
   if (status.state === "failed") return <span className="pill pill--failed">disconnected</span>;
   if (status.state === "takenOver") return <span className="pill pill--failed">other tab</span>;

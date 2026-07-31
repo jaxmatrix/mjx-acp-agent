@@ -5,8 +5,11 @@ import type { CatalogEntry, WorkspaceRoot } from "../acp/types";
 
 export function AgentPicker({
   onConnect,
+  onCancel,
 }: {
   onConnect(agentId: string, cwd: string): void;
+  /** Absent on a first visit: there is nothing to go back to. */
+  onCancel?(): void;
 }) {
   const [agents, setAgents] = useState<CatalogEntry[]>([]);
   const [workspaces, setWorkspaces] = useState<WorkspaceRoot[]>([]);
@@ -41,6 +44,12 @@ export function AgentPicker({
           A web transport for the Agent Client Protocol. Pick an agent — the server starts it and
           relays the protocol to this page.
         </p>
+        {onCancel && (
+          // The conversations already open are still running behind this.
+          <button type="button" className="link-button" onClick={onCancel}>
+            ← Back
+          </button>
+        )}
       </header>
 
       {error && <p className="callout callout--error">Could not reach the server: {error}</p>}

@@ -43,14 +43,38 @@ export interface SessionStore {
   clear(agentId: string, cwd: string): void;
 }
 
-/** Reads and writes what this tab was last connected to. */
-export interface ChoiceStore {
-  get(): Choice | undefined;
-  set(choice: Choice): void;
-  clear(): void;
+/**
+ * Reads and writes the agents this tab has open, in order.
+ *
+ * A list rather than one, because the viewer holds a connection per agent and
+ * directory in play — two agents on one workspace is two sockets, since a socket
+ * is bound to one of each. Which *conversations* are open on each of them is a
+ * different question, answered by {@link SessionStore}.
+ */
+export interface ConnectionsStore {
+  get(): Choice[];
+  set(connections: Choice[]): void;
 }
 
-const CHOICE_KEY = "mjx.connection";
+/**
+ * Reads and writes which conversation this tab was last looking at.
+ *
+ * Its own key rather than a field on either list above: the lists say what is
+ * open, and this says where the eye was. A focus naming something that is no
+ * longer open is simply ignored.
+ */
+export interface FocusStore {
+  get(): Tab | undefined;
+  set(tab: Tab): void;
+}
+
+/** One conversation open in the viewer. */
+export interface Tab extends Choice {
+  sessionId: string;
+}
+
+const CONNECTIONS_KEY = "mjx.connections";
+const FOCUS_KEY = "mjx.focus";
 
 /**
  * A store over `storage`, defaulting to this tab's `sessionStorage`.
@@ -93,30 +117,55 @@ export function sessionStore(storage: Storage | undefined = safeSessionStorage()
   };
 }
 
-/** The agent and directory to come back to, across a reload. */
-export function choiceStore(storage: Storage | undefined = safeSessionStorage()): ChoiceStore {
+/** The agents and directories to come back to, across a reload. */
+export function connectionsStore(
+  storage: Storage | undefined = safeSessionStorage(),
+): ConnectionsStore {
   return {
     get() {
-      const stored = read(storage, CHOICE_KEY);
-      if (!stored) return undefined;
-      try {
-        const parsed: unknown = JSON.parse(stored);
-        if (
-          typeof parsed === "object" &&
-          parsed !== null &&
-          typeof (parsed as Choice).agentId === "string" &&
-          typeof (parsed as Choice).cwd === "string"
-        ) {
-          return { agentId: (parsed as Choice).agentId, cwd: (parsed as Choice).cwd };
-        }
-      } catch {
-        // Whatever is in there is not ours. Start from the picker.
-      }
-      return undefined;
+      const parsed = parse(read(storage, CONNECTIONS_KEY));
+      // Whatever is in there is not ours. Start from the picker.
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(isChoice).map(({ agentId, cwd }) => ({ agentId, cwd }));
     },
-    set: (choice) => write(storage, CHOICE_KEY, JSON.stringify(choice)),
-    clear: () => write(storage, CHOICE_KEY, undefined),
+    set: (connections) =>
+      write(
+        storage,
+        CONNECTIONS_KEY,
+        connections.length > 0 ? JSON.stringify(connections) : undefined,
+      ),
   };
+}
+
+/** The conversation to come back to, across a reload. */
+export function focusStore(storage: Storage | undefined = safeSessionStorage()): FocusStore {
+  return {
+    get() {
+      const parsed = parse(read(storage, FOCUS_KEY));
+      if (!isChoice(parsed) || typeof (parsed as Tab).sessionId !== "string") return undefined;
+      const tab = parsed as Tab;
+      return { agentId: tab.agentId, cwd: tab.cwd, sessionId: tab.sessionId };
+    },
+    set: (tab) => write(storage, FOCUS_KEY, JSON.stringify(tab)),
+  };
+}
+
+function parse(stored: string | undefined): unknown {
+  if (!stored) return undefined;
+  try {
+    return JSON.parse(stored);
+  } catch {
+    return undefined;
+  }
+}
+
+function isChoice(value: unknown): value is Choice {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as Choice).agentId === "string" &&
+    typeof (value as Choice).cwd === "string"
+  );
 }
 
 function resumeKey(agentId: string, cwd: string): string {

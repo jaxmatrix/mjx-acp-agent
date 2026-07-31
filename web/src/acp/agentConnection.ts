@@ -504,6 +504,17 @@ export class AgentConnection {
     this.#forget(sessionId);
   }
 
+  /**
+   * Stops holding a conversation, without touching it on the agent.
+   *
+   * What closing a tab means. The agent keeps the session — it is still in the
+   * history, and can be opened again — this only gives up the thread and the
+   * questions that came with it. `closeSession` is the destructive one.
+   */
+  dropSession(sessionId: string): void {
+    this.#forget(sessionId);
+  }
+
   /** Frees a conversation's resources, leaving it in the list. */
   async closeSession(session: TargetSession): Promise<void> {
     if (!this.#agent) return;
