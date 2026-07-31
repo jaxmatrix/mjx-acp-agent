@@ -1234,6 +1234,108 @@ button {
   border-radius: 0 5px 5px 0;
 }
 
+/* ------------------------------------------------------------------ auth */
+
+/* An agent that wants authenticating is not a broken agent, so this is not
+   styled as an error. It is a form of instructions. */
+.auth {
+  margin: 0 1rem 1rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.auth__title {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+}
+
+.auth__lead {
+  margin: 0 0 1rem;
+  color: var(--dim);
+  max-width: 62ch;
+}
+
+.auth__methods {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.auth__method {
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.auth__method-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.auth__provider,
+.auth__label,
+.auth__description {
+  color: var(--dim);
+}
+
+.auth__description,
+.auth__instructions {
+  margin: 0.35rem 0 0;
+  max-width: 62ch;
+}
+
+.auth__secrets {
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.9em;
+}
+
+/* Set or not set. There is deliberately no styling for a *value*, because
+   there is no value: the server holds credentials so the browser does not. */
+.auth__secrets .auth__status {
+  margin-left: 0.5rem;
+}
+
+.auth__secrets .is-present .auth__status {
+  color: var(--added);
+}
+
+.auth__secrets .is-missing .auth__status {
+  color: var(--warn);
+}
+
+.auth__link {
+  margin: 0.6rem 0 0;
+}
+
+.auth__declines {
+  margin-top: 0.6rem;
+  color: var(--dim);
+  font-size: 0.9em;
+}
+
+.auth__declines ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.1rem;
+}
+
+/* The one terminal in the viewer that takes keystrokes. */
+.auth .terminal {
+  margin-top: 1rem;
+}
+
 @media (max-width: 60rem) {
   .app__body,
   .app--with-inspector .app__body {

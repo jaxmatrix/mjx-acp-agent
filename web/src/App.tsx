@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 
 import { AgentPicker } from "./components/AgentPicker";
+import { AuthPanel } from "./components/AuthPanel";
 import { Composer } from "./components/Composer";
 import { Inspector } from "./components/Inspector";
 import { SessionHistory } from "./components/SessionHistory";
@@ -109,6 +110,19 @@ function Conversation({
       {current.error && <p className="callout callout--error">{current.error}</p>}
       {current.status.state === "failed" && (
         <p className="callout callout--error">Connection failed: {current.status.message}</p>
+      )}
+      {current.status.state === "needsAuth" && current.auth && (
+        // Not a failure banner. The agent works and has said how it will accept
+        // being let in; showing that instead of a stringified JSON-RPC error is
+        // the whole point of this screen.
+        <AuthPanel
+          agentName={current.agentInfo?.name ?? current.tab.agentId}
+          auth={current.auth}
+          terminals={current.terminals}
+          onAuthenticate={current.authenticate}
+          onTerminalInput={current.sendTerminalInput}
+          onTerminalResize={current.resizeTerminal}
+        />
       )}
       {current.status.state === "takenOver" && (
         // The agent is still running; it is just answering to another tab now.

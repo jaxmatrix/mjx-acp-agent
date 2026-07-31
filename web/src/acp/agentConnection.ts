@@ -11,10 +11,18 @@ import { createWebSocketStream } from "@agentclientprotocol/sdk/experimental/ws-
 
 import {
   agentCapabilitiesOf,
+  authMethodsOf,
   noCapabilities,
   type AgentCapabilities,
+  type AuthMethod,
 } from "./capabilities";
-import { decodeChunk, ext, websocketUrl, type ConnectOptions } from "./connection";
+import {
+  decodeChunk,
+  encodeChunk,
+  ext,
+  websocketUrl,
+  type ConnectOptions,
+} from "./connection";
 import { threadFromReplay } from "./replay";
 import {
   addTerminal,
@@ -35,6 +43,9 @@ import {
 import {
   emptyThread,
   type AgentInfo,
+  type AuthAttemptResult,
+  type AuthProgress,
+  type AuthState,
   type ElicitationAnswer,
   type ElicitationMode,
   type ElicitationState,
@@ -56,6 +67,8 @@ export interface ConnectionEvents {
   agentInfo(info: AgentInfo): void;
   /** What the agent said it can do, once the handshake has answered. */
   capabilities(capabilities: AgentCapabilities): void;
+  /** How this connection stands on authenticating its agent. */
+  auth(state: AuthState): void;
   /** Which session is being replayed by `session/load`, if one is. */
   replaying(sessionId?: string): void;
   /** A conversation this connection now has a thread for. */
@@ -104,6 +117,10 @@ export type ConnectionStatus =
   // No session id: a connection carries however many conversations the viewer
   // has open on it, and naming one of them here would name the wrong one.
   | { state: "ready" }
+  // The agent works, and will do nothing until it is authenticated. Distinct
+  // from `failed`, which is what this used to be reported as: nothing is
+  // broken, and there is something the user can do about it.
+  | { state: "needsAuth" }
   | { state: "failed"; message: string }
   /** Another tab attached to this agent, and this socket is being closed. */
   | { state: "takenOver" }
@@ -171,6 +188,16 @@ export class AgentConnection {
   #takenOver = false;
   /** What the agent said it can do, from the `initialize` response. */
   #capabilities: AgentCapabilities = noCapabilities();
+  /** How the agent will accept being authenticated, from the same response. */
+  #authMethods: AuthMethod[] = [];
+  /**
+   * How this connection stands on authenticating, as the server sees it.
+   *
+   * The server's view rather than one assembled here: it is the side that knows
+   * which provider would take each method and what is missing, and it is the
+   * side that must not send a value.
+   */
+  #auth?: AuthState;
   /** Where the session on screen is remembered across a reload. */
   #memory?: OpenSessions;
   /**
@@ -191,6 +218,16 @@ export class AgentConnection {
   /** The conversation this connection started with. */
   get anchor(): string | undefined {
     return this.#anchor;
+  }
+
+  /** How this connection stands on authenticating its agent. */
+  get auth(): AuthState | undefined {
+    return this.#auth;
+  }
+
+  /** What the agent advertised in `initialize`, whether or not it has refused. */
+  get authMethods(): AuthMethod[] {
+    return this.#authMethods;
   }
 
   /** Every conversation open on this connection. */
@@ -308,6 +345,11 @@ export class AgentConnection {
       this.#capabilities = agentCapabilitiesOf(initialized);
       this.#events.capabilities(this.#capabilities);
 
+      // What the agent will accept, read here rather than dropped. It is the
+      // difference between a panel that says which variable to set and a
+      // stringified JSON-RPC error.
+      this.#authMethods = authMethodsOf(initialized);
+
       // Read before anything writes it: `#openSession` below records the
       // session this connection came back with, which would otherwise be mixed
       // in with the ones the tab actually had open.
@@ -318,10 +360,23 @@ export class AgentConnection {
       // recording and lets every later one reach the agent — so asking once per
       // remembered conversation would leave a real, empty session behind for
       // each of them on every reload.
-      const session = await connection.agent.request(acp.methods.agent.session.new, {
-        cwd: options.cwd ?? "",
-        mcpServers: [],
-      });
+      let session;
+      try {
+        session = await connection.agent.request(acp.methods.agent.session.new, {
+          cwd: options.cwd ?? "",
+          mcpServers: [],
+        });
+      } catch (error) {
+        // An agent that wants authenticating is not a broken agent. Stop here
+        // rather than throwing: the connection is live, the server has told us
+        // what it offered, and the user has something to do about it.
+        const state = authStateOf(error);
+        if (!state) throw error;
+        this.#auth = state;
+        this.#events.auth(state);
+        this.#events.status({ state: "needsAuth" });
+        return;
+      }
 
       this.#anchor = session.sessionId;
       this.#openSession(session.sessionId);
@@ -403,6 +458,60 @@ export class AgentConnection {
       if (await this.#replay(agent, sessionId)) continue;
       this.#forget(sessionId);
     }
+  }
+
+  /**
+   * Authenticates with one of the methods the agent advertised.
+   *
+   * A method id and nothing else crosses the socket. Whatever the credential
+   * is, the server already has it — that is the arrangement, and it is what
+   * keeps a viewer with no authentication of its own from being a way to hand
+   * one over.
+   *
+   * The result may be `authenticated: false` and still be going well: a
+   * terminal login is answered as soon as its terminal exists, because it is
+   * waiting for keystrokes this answer unlocks. `_mjx/auth/progress` carries
+   * the outcome.
+   */
+  async authenticate(methodId: string): Promise<AuthAttemptResult> {
+    if (!this.#agent) {
+      return { authenticated: false, message: "Not connected." };
+    }
+    const result = (await this.#agent.request(ext.authAttempt, {
+      methodId,
+    })) as AuthAttemptResult;
+    if (result.terminalId) this.#markInteractive(result.terminalId);
+    return result;
+  }
+
+  /** Asks the server how this connection stands, after attaching to one. */
+  async refreshAuth(): Promise<AuthState | undefined> {
+    if (!this.#agent) return undefined;
+    const state = (await this.#agent.request(ext.authState, {})) as AuthState;
+    this.#auth = state;
+    this.#events.auth(state);
+    return state;
+  }
+
+  /**
+   * Sends keystrokes to a login terminal.
+   *
+   * Refused by the server on any terminal it did not open for a login. The
+   * check here is so the UI does not offer what would be refused; the one that
+   * matters is on the far side, where the terminal actually is.
+   */
+  async sendTerminalInput(terminalId: string, bytes: Uint8Array): Promise<void> {
+    if (!this.#agent) return;
+    await this.#agent.request(ext.terminalInput, {
+      terminalId,
+      bytes: encodeChunk(bytes),
+    });
+  }
+
+  /** Tells the server how large a terminal is being shown. */
+  async resizeTerminal(terminalId: string, rows: number, cols: number): Promise<void> {
+    if (!this.#agent) return;
+    await this.#agent.request(ext.terminalResize, { terminalId, rows, cols });
   }
 
   /** Lists the conversations the agent knows about. */
@@ -948,11 +1057,51 @@ export class AgentConnection {
       },
     );
 
+    app.onNotification(ext.authRequired, passthrough<AuthState>, (ctx) => {
+      // Beside the error rather than instead of it. The refusal belongs to the
+      // connection, so it reaches a browser that was not the one refused — one
+      // that reloaded, or that attached after the fact.
+      this.#auth = ctx.params;
+      this.#events.auth(ctx.params);
+    });
+
+    app.onNotification(ext.authProgress, passthrough<AuthProgress>, (ctx) => {
+      // A terminal login outlives the request that started it, so this is the
+      // only thing that says how it went.
+      this.#events.frame({
+        direction: "agentToClient",
+        method: ext.authProgress,
+        intercepted: true,
+        line: JSON.stringify(ctx.params),
+      });
+      if (ctx.params.authenticated === true) {
+        // Asking rather than assuming: the server knows which method settled
+        // it and what the panel should now say.
+        void this.refreshAuth();
+      }
+    });
+
     app.onNotification(
       ext.inspectorFrame,
       passthrough<Omit<InspectorEntry, "seq" | "at">>,
       (ctx) => this.#events.frame(ctx.params),
     );
+  }
+
+  /**
+   * Marks a terminal as one the user may type into.
+   *
+   * Set from the `_mjx/auth/attempt` result rather than from
+   * `_mjx/terminal/created`, because that notification is the same for every
+   * terminal — the agent's and this one's — and only the attempt knows which it
+   * asked for.
+   */
+  #markInteractive(terminalId: string): void {
+    this.#updateTerminals((terminals) => {
+      const terminal = terminals[terminalId];
+      if (!terminal) return terminals;
+      return { ...terminals, [terminalId]: { ...terminal, interactive: true } };
+    });
   }
 
   #update(sessionId: string, mutate: (thread: Thread) => Thread): void {
@@ -1030,6 +1179,51 @@ function toElicitationMode(params: acp.CreateElicitationRequest): { mode: Elicit
   }
   return null;
 }
+
+/**
+ * The auth detail a `-32000` carries, or `undefined` for any other failure.
+ *
+ * The SDK wraps a JSON-RPC error before it reaches us, and how deeply varies —
+ * so this looks for the code and the payload rather than for a particular
+ * wrapper. Everything here is untrusted: a `-32000` whose `data` is missing or
+ * malformed still counts as an auth refusal, because the *code* is the part the
+ * agent guaranteed, and an empty panel that says "authenticate" beats a
+ * stringified error object.
+ */
+function authStateOf(error: unknown): AuthState | undefined {
+  const found = findAuthError(error, 0);
+  if (!found) return undefined;
+  const data = found.data;
+  const methods =
+    typeof data === "object" && data !== null && Array.isArray((data as AuthState).methods)
+      ? (data as AuthState).methods
+      : [];
+  return {
+    required: true,
+    authenticated: false,
+    methods,
+    refusedMethod:
+      typeof data === "object" && data !== null
+        ? (data as AuthState).refusedMethod
+        : undefined,
+  };
+}
+
+/** Finds a `-32000` anywhere in a thrown value's first few layers. */
+function findAuthError(value: unknown, depth: number): { data?: unknown } | undefined {
+  if (depth > 3 || typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.code === AUTH_REQUIRED) return { data: record.data };
+  // The SDK may hand back an `Error` carrying the frame, or the frame itself.
+  for (const key of ["error", "cause", "data"]) {
+    const found = findAuthError(record[key], depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** ACP's "authenticate first". Mirrors `frame::AUTH_REQUIRED`. */
+const AUTH_REQUIRED = -32000;
 
 /** A human-readable message for anything thrown. */
 function describe(error: unknown): string {

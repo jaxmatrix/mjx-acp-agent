@@ -14,7 +14,24 @@ import "@xterm/xterm/css/xterm.css";
 
 import type { Terminal } from "../acp/types";
 
-export function TerminalView({ terminal }: { terminal: Terminal }) {
+export function TerminalView({
+  terminal,
+  onInput,
+  onResize,
+}: {
+  terminal: Terminal;
+  /**
+   * Where keystrokes go, for a terminal that takes them.
+   *
+   * Absent for every terminal the *agent* started, which is all of them bar a
+   * login this server opened: the agent owns those processes and ACP has no
+   * notion of a client typing into one. The server refuses the write either
+   * way; this is so the cursor does not invite it.
+   */
+  onInput?(bytes: Uint8Array): void;
+  /** Told the size the browser is showing, so a prompt lays out correctly. */
+  onResize?(rows: number, cols: number): void;
+}) {
   const host = useRef<HTMLDivElement>(null);
   const xterm = useRef<XTerm>(null);
   const fit = useRef<FitAddon>(null);
@@ -29,9 +46,8 @@ export function TerminalView({ terminal }: { terminal: Terminal }) {
       fontSize: 12,
       fontFamily: 'ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace',
       theme: { background: "#0c0e13", foreground: "#d8dce5" },
-      // Read-only: input would have nowhere to go, since the agent owns this
-      // process and ACP has no way for a client to type into it.
-      disableStdin: true,
+      // Read-only unless something is listening. See `onInput`.
+      disableStdin: !onInput,
       scrollback: 5000,
     });
     const fitAddon = new FitAddon();
@@ -43,9 +59,16 @@ export function TerminalView({ terminal }: { terminal: Terminal }) {
     fit.current = fitAddon;
     written.current = 0;
 
+    // The far end has to be told, or a login prompt laid out for the PTY's
+    // default 120 columns wraps into nonsense in a narrower pane.
+    const disposeInput = onInput
+      ? term.onData((data) => onInput(new TextEncoder().encode(data)))
+      : undefined;
+
     const resize = new ResizeObserver(() => {
       try {
         fitAddon.fit();
+        onResize?.(term.rows, term.cols);
       } catch {
         // Fitting a detached or zero-sized element throws; nothing to do.
       }
@@ -54,9 +77,13 @@ export function TerminalView({ terminal }: { terminal: Terminal }) {
 
     return () => {
       resize.disconnect();
+      disposeInput?.dispose();
       term.dispose();
       xterm.current = null;
     };
+    // The callbacks are read once, when the emulator is built. Re-running this
+    // would throw away the scrollback on every parent render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Write only what has arrived since the last render. Rewriting the whole

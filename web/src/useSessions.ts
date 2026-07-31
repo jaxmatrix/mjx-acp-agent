@@ -24,6 +24,7 @@ import type { Terminals } from "./acp/terminals";
 import {
   emptyThread,
   type AgentInfo,
+  type AuthState,
   type ElicitationAnswer,
   type InspectorEntry,
   type SessionInfo,
@@ -77,6 +78,8 @@ interface ConnectionState {
   status: ConnectionStatus;
   agentInfo?: AgentInfo;
   capabilities: AgentCapabilities;
+  /** How this connection stands on authenticating its agent, once it matters. */
+  auth?: AuthState;
   frames: InspectorEntry[];
   /** The conversations the agent knows about, once they have been asked for. */
   history: SessionInfo[];
@@ -128,6 +131,7 @@ export type Action =
   | { type: "status"; key: string; status: ConnectionStatus }
   | { type: "agentInfo"; key: string; info: AgentInfo }
   | { type: "capabilities"; key: string; capabilities: AgentCapabilities }
+  | { type: "auth"; key: string; auth: AuthState }
   | { type: "replaying"; key: string; sessionId?: string }
   | { type: "frame"; key: string; entry: InspectorEntry }
   | { type: "error"; key: string; message?: string }
@@ -184,6 +188,8 @@ export function reduce(state: State, action: Action): State {
       return patch(state, action.key, { agentInfo: action.info });
     case "capabilities":
       return patch(state, action.key, { capabilities: action.capabilities });
+    case "auth":
+      return patch(state, action.key, { auth: action.auth });
     case "replaying":
       return patch(state, action.key, { replayingSessionId: action.sessionId });
     case "error":
@@ -322,6 +328,17 @@ export interface TabState {
   answerElicitation(requestId: string | number, answer: ElicitationAnswer): void;
   /** Opens a new socket to this agent, taking it back from another tab. */
   reconnect(): void;
+  /** How this connection stands on authenticating its agent. */
+  auth?: AuthState;
+  /**
+   * Authenticates with one of the methods the agent advertised, and says what
+   * to show meanwhile. Only a method id crosses the socket.
+   */
+  authenticate(methodId: string): Promise<string>;
+  /** Sends keystrokes to a login terminal. */
+  sendTerminalInput(terminalId: string, bytes: Uint8Array): void;
+  /** Tells the server how large a terminal is being shown. */
+  resizeTerminal(terminalId: string, rows: number, cols: number): void;
 }
 
 /** The whole viewer. */
@@ -390,6 +407,7 @@ export function useSessions(): Viewer {
         thread: (sessionId, thread) => dispatch({ type: "thread", key, sessionId, thread }),
         terminals: (terminals) => dispatch({ type: "terminals", key, terminals }),
         capabilities: (capabilities) => dispatch({ type: "capabilities", key, capabilities }),
+        auth: (auth) => dispatch({ type: "auth", key, auth }),
         replaying: (sessionId) => dispatch({ type: "replaying", key, sessionId }),
         sessionOpened: (sessionId) => dispatch({ type: "sessionOpened", key, sessionId }),
         sessionClosed: (sessionId) => dispatch({ type: "sessionClosed", key, sessionId }),
@@ -637,6 +655,11 @@ function useCurrentTab(
     answerPermission: (toolCallId, optionId) => live.answerPermission(toolCallId, optionId),
     answerElicitation: (requestId, answer) => live.answerElicitation(requestId, answer),
     reconnect,
+    ...(connection.auth ? { auth: connection.auth } : {}),
+    authenticate: async (methodId) => (await live.authenticate(methodId)).message,
+    sendTerminalInput: (terminalId, bytes) => void live.sendTerminalInput(terminalId, bytes),
+    resizeTerminal: (terminalId, rows, cols) =>
+      void live.resizeTerminal(terminalId, rows, cols),
   };
 }
 
