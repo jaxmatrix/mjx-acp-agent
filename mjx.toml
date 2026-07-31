@@ -32,6 +32,16 @@ name = "Mock Agent"
 description = "Scripted agent. No credentials, no network. Exercises every UI surface."
 command = "target/debug/mjx-mock-agent"
 
+# The same binary, in the mode that demands authentication. Here so the auth
+# panel can be seen — and `web/scripts/auth-smoke.mjs` run — without a real
+# agent and a real credential. It authenticates with anything.
+[[agents]]
+id = "locked"
+name = "Locked Agent (demo)"
+description = "Scripted agent that refuses until authenticated. Exercises the auth panel."
+command = "target/debug/mjx-mock-agent"
+args = ["--needs-auth"]
+
 [[agents]]
 id = "kilo"
 name = "Kilo"
@@ -89,9 +99,12 @@ env = { MJX_MOCK_MCP_TOKEN = "not-a-real-token" }
 # in a PTY the browser can type into. It takes no `env` of its own: what runs is
 # never this file's choice, and never the browser's.
 #
-# [[auth_providers]]
-# name = "interactive"
-# kind = "terminal"
+# Uncommented, because the `locked` demo agent above offers a terminal login and
+# this is what makes it runnable from the browser. It applies to every agent, so
+# any agent offering an interactive login can be logged into from here.
+[[auth_providers]]
+name = "interactive"
+kind = "terminal"
 
 # claude-acp, gemini and codex-acp resolve from the registry:
 #

@@ -19,9 +19,28 @@ read files, write files, and execute commands.
   resolves the root it was asked for through the same `resolve_within` the
   filesystem jail uses, never follows a symlinked directory out of a root,
   returns at most 500 paths, and never returns a byte of a file's contents.
-- **No credential brokering for agents.** The server never handles an agent's API
-  keys. Real agents authenticate themselves the same way they do from a terminal
-  (`claude-acp` reuses the `claude` CLI's own session, etc.).
+- **An agent's credentials are the operator's, and travel outward only.** The
+  server can now hold them — `[[auth_providers]]` entries resolve `env_from` out
+  of the environment it was started in — but only in that direction. Every
+  browser attached acts as that one operator, and two rules keep this defensible
+  on a viewer with no authentication of its own:
+  1. **Values never reach the browser.** The auth panel is given names, whether
+     each is set, and why each provider passed; `ext::AuthMethodInfo` and
+     `ext::AuthSecret` have nowhere to put a value, exactly as
+     `ext::McpServerInfo` does not.
+  2. **`_mjx/auth/attempt` carries a method id and nothing else.** There is no
+     field on it for a credential, so there is no path by which a browser hands
+     this server one. A method whose variable is not set is answered with "set
+     it and reconnect", never with a password box.
+- **A login terminal runs the agent's own binary.** `AuthMethodTerminal` carries
+  *arguments to the agent binary*, not a command line, and the program comes from
+  the catalog. So the worst an agent can ask for is to be run with different
+  flags, and neither the agent nor the browser can name a program.
+- **Only a login terminal accepts input.** `_mjx/terminal/input` is refused with
+  `-32602` on any terminal the server did not open for an auth method — which is
+  every terminal `terminal/create` produces. The check is in `mjx-workspace`,
+  where the write half of the PTY is simply absent on a non-interactive terminal,
+  rather than in a policy the transport could be made to skip.
 - **An MCP credential never reaches the browser.** `[[mcp_servers]]` entries are
   merged into `session/new` by the server rather than sent by the browser, so an
   `env` or `headers` value travels server → agent only. The sidebar is told the

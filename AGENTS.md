@@ -26,7 +26,7 @@ ACP *client* role                   relay + capability host        claude-acp / 
   an ordinary ACP client and the agent an ordinary ACP agent. *Forward it* is the default for
   everything — a relay that only passes what it understands breaks the day either peer speaks a
   newer protocol version.
-- **Exactly five interceptions**, all in `mjx-acp-server`, and each one needs its reason written
+- **Exactly seven interceptions**, all in `mjx-acp-server`, and each one needs its reason written
   down here:
   1. Rewriting `initialize` to declare the capabilities the server provides.
   2. Answering `fs/*` and `terminal/*` itself, because the workspace is server-side.
@@ -43,6 +43,25 @@ ACP *client* role                   relay + capability host        claude-acp / 
      configured these are forwarded, so an agent that reaches for MCP-over-ACP uninvited meets a
      client that does not implement it rather than a server pretending to. That is why
      `method::is_mcp_over_acp` is separate from `is_server_provided_capability`.
+  6. Rewriting a `-32000` from the agent to carry what it offered and what this server can do
+     about it. Distinct from (1) in direction and in kind: this reads an agent-to-client
+     *response*. Rewritten rather than retried transparently — an interceptor sees only
+     agent-space ids, so it could not answer the browser's original request afterwards, and a
+     retry would park that request for the length of a login with no progress and no cancel.
+     The browser re-issues `session/new` itself, being an ordinary ACP client.
+  7. Sending `authenticate` on the browser's behalf, under a `mjx-auth-` string id claimed back
+     by prefix — the same trick `mcp_host` uses, because every id the relay mints is a number.
+     The browser names a method and never a credential; those are the operator's and stay
+     server-side. **Conditional**, like (5): an agent that advertises nothing sees none of it.
+- **Two interceptors, composed.** `relay::Chain` runs `WorkspaceInterceptor` then
+  `AuthInterceptor`. Order matters: the first rewrites `initialize` to add `fs` and `terminal`,
+  and the second must see that rewritten frame to add `auth` beside them rather than to a copy
+  that is thrown away. A rewrite carries forward; an intercept short-circuits.
+- **Agent credentials are the operator's.** `mjx-agent-auth` is the seam — one trait, providers
+  declared in `[[auth_providers]]`, and defaults that *refuse* so a provider that implements
+  nothing can never look as though it authenticated something. It is its own crate because
+  nothing in it is server-specific, and it does no I/O at all: a provider that wants a login run
+  says so and the server runs it, which keeps the policy about what may be spawned in one place.
 - **`_mjx/*` is ours, and never reaches an agent.** It carries what ACP has no vocabulary for
   because it only arises when the client is remote. Defined once in `mjx-acp-core::ext`.
 - **A connection carries several conversations, and the viewer several connections.**
@@ -97,6 +116,7 @@ mjx-acp-core            frames, method names, request↔method correlation, the 
   ├─ mjx-acp-thread     the thread model (a GPUI-free port of Zed's acp_thread)
   ├─ mjx-workspace      filesystem jail + PTY terminals
   └─ mjx-agent-catalog  ACP registry + command resolution   (depends on none of the above)
+        ├─ mjx-agent-auth   agent credentials: one trait, config-declared providers, no I/O
         └─ mjx-acp-server   the relay; the only crate that knows about all of them
 mjx-mock-agent          depends on mjx-acp-core only; it is a peer, not a layer
 ```
@@ -127,5 +147,6 @@ npm --prefix web run typecheck
 node web/scripts/smoke.mjs        # drive a running server over the browser's own code path
 node web/scripts/history-smoke.mjs     # the same, for session/list and session/load
 node web/scripts/sessions-smoke.mjs    # two conversations on one socket, and a reload that keeps both
+node web/scripts/auth-smoke.mjs        # a real -32000, a real PTY login, and the keystrokes that end it
 node web/scripts/capture-fixture.mjs   # re-record fixtures/session-updates.jsonl
 ```
