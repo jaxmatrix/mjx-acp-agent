@@ -1095,6 +1095,94 @@ async fn a_reload_gets_the_open_form_from_the_thread_and_from_the_socket() {
 }
 
 #[tokio::test]
+async fn a_browser_restoring_several_conversations_is_asked_the_parked_question_once() {
+    // The re-ask is triggered by `_mjx/session/replay`, and a browser with more
+    // than one conversation open sends one of those per conversation. Asking
+    // again for each would put the same question — carrying the agent's one id
+    // for it — to the browser two, three, four times. A client keys its pending
+    // requests by id, because that is what it answers them with, so every copy
+    // but the last would be orphaned and the form would be unanswerable.
+    let server = Server::start().await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let info = handshake_declaring(&mut first, elicitable()).await;
+    let connection_id = info["connectionId"].as_str().unwrap().to_string();
+    let new_session = json!({ "cwd": info["cwd"], "mcpServers": [] });
+
+    let parked = first
+        .request(method::agent::SESSION_NEW, new_session.clone())
+        .await["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A second conversation on the same socket, so the restore below really
+    // does replay more than once. This is the shape the viewer's tabs have.
+    let other = first
+        .request(method::agent::SESSION_NEW, new_session)
+        .await["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        other, parked,
+        "the second session/new was answered from the recording"
+    );
+
+    first
+        .start_request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": parked,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+    first
+        .wait_for_client_request(method::client::ELICITATION_CREATE)
+        .await;
+    drop(first);
+
+    // The reload, restoring both conversations.
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake_declaring(&mut second, elicitable()).await;
+    assert_eq!(info["resumed"], true, "started a new agent instead: {info}");
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+
+    second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": parked }))
+        .await;
+    second
+        .wait_for_client_request(method::client::ELICITATION_CREATE)
+        .await;
+
+    second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": other }))
+        .await;
+
+    // One more round trip, so a second re-ask has nowhere left to hide: the
+    // outbox is one ordered channel, and anything queued by the replay above
+    // reaches us before this answer does.
+    second
+        .request(ext::SESSION_REPLAY, json!({ "sessionId": "no-such-session" }))
+        .await;
+
+    let asked = second
+        .client_requests
+        .iter()
+        .filter(|method| *method == method::client::ELICITATION_CREATE)
+        .count();
+    assert_eq!(asked, 1, "the parked question was asked {asked} times");
+
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn a_cancelled_turn_stops_offering_the_question_it_asked() {
     // Nobody is going to answer a question whose turn is over. Left pending it
     // would be offered to every browser that ever attaches, and a replayed

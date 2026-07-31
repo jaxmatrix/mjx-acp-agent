@@ -11,6 +11,7 @@
 //! protocol version, so "forward it" is the default for everything.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{SinkExt, StreamExt};
 use mjx_acp_core::{
@@ -255,6 +256,18 @@ pub struct Relay<I: Interceptor> {
     /// answerable, since a browser cannot respond to a request the connection it
     /// is holding never received.
     unanswered: tokio::sync::Mutex<Vec<Frame>>,
+    /// Whether the browser now attached has already been put the list above.
+    ///
+    /// The re-ask is triggered by `_mjx/session/replay`, and a browser sends one
+    /// of those per conversation it is restoring — so without this a browser
+    /// with three open sessions would be asked the same question three times,
+    /// each carrying the agent's one id for it. A client that keys its pending
+    /// requests by id, as it must to answer them, would keep only the last
+    /// handler and orphan the rest.
+    ///
+    /// Per attachment rather than per relay: the *next* browser has heard none
+    /// of it and still has to be asked.
+    reasked: AtomicBool,
     /// Thread state, so a browser that reloads can be given the conversation
     /// back instead of an empty page.
     sessions: tokio::sync::Mutex<SessionStore>,
@@ -399,6 +412,7 @@ pub fn start<I: Interceptor>(
         mcp_servers,
         handshake: tokio::sync::Mutex::new(Handshake::default()),
         unanswered: tokio::sync::Mutex::new(Vec::new()),
+        reasked: AtomicBool::new(false),
         sessions: tokio::sync::Mutex::new(SessionStore::new()),
     });
 
@@ -469,6 +483,9 @@ impl<I: Interceptor> Connection<I> {
         // requests from one.
         self.relay.ids.lock().await.reattach();
         self.relay.handshake.lock().await.reattach();
+        // The browser arriving has heard none of the outstanding questions,
+        // however many times the one leaving was asked them.
+        self.relay.reasked.store(false, Ordering::SeqCst);
 
         // Take over from whoever is here. The second tab always wins: a browser
         // that reloads can open its new socket before the old one's close has
@@ -832,6 +849,11 @@ impl<I: Interceptor> Relay<I> {
     /// They keep the agent's own ids, so the answer correlates without the
     /// browser having to know it is answering something it never heard asked.
     async fn reask_unanswered(&self) {
+        // Once per attachment, however many conversations this browser is
+        // restoring. See [`Relay::reasked`].
+        if self.reasked.swap(true, Ordering::SeqCst) {
+            return;
+        }
         for frame in self.unanswered.lock().await.iter() {
             tracing::debug!(
                 method = frame.method(),
