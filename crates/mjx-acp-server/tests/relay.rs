@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use mjx_acp_core::{Frame, RequestId, ResponsePayload, acp, ext, method};
 use serde_json::{Value, json};
@@ -2406,5 +2407,256 @@ async fn an_agent_that_needs_nothing_is_untouched() {
         "an agent that asked for nothing must not produce an auth panel"
     );
 
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn authenticating_lets_the_session_open() {
+    let server = server_with_an_agent_that_needs_auth("").await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+    let info = handshake(&mut client).await;
+
+    client
+        .try_request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await
+        .expect_err("the agent must refuse first");
+
+    let result = client
+        .request(
+            ext::AUTH_ATTEMPT,
+            json!({ "methodId": "mock-agent-managed" }),
+        )
+        .await;
+    let result: ext::AuthAttemptResult = serde_json::from_value(result).unwrap();
+    // Not yet: the request is answered when the agent has been *asked*, and
+    // only the agent's own answer settles it.
+    assert!(!result.authenticated);
+
+    let progress = client.wait_for_ext(ext::AUTH_PROGRESS).await;
+    assert_eq!(progress["authenticated"], true, "{progress}");
+    assert_eq!(progress["methodId"], "mock-agent-managed");
+
+    // The browser re-issues `session/new` itself, being an ordinary ACP client.
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    assert!(session["sessionId"].is_string());
+
+    let state = client.request(ext::AUTH_STATE, json!({})).await;
+    let state: ext::AuthState = serde_json::from_value(state).unwrap();
+    assert!(state.authenticated);
+    assert!(
+        state
+            .methods
+            .iter()
+            .find(|m| m.id == "mock-agent-managed")
+            .is_some_and(|m| m.satisfied),
+        "the method that worked must be marked"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_authenticate_the_agent_refuses_is_reported_not_swallowed() {
+    // An agent rejecting a credential is saying the credential is wrong, which
+    // is the one thing the operator needs to hear. The `authenticate` was this
+    // server's request, so its failure has nowhere else to surface.
+    let server = Server::start_with(ServerOptions {
+        extra_config: format!(
+            r#"
+            [[agents]]
+            id = "locked"
+            name = "Locked Agent"
+            command = "{}"
+            args = ["--needs-auth"]
+            env = {{ MJX_MOCK_AUTH_REFUSE = "1" }}
+            "#,
+            mock_agent_binary().display(),
+        ),
+        ..Default::default()
+    })
+    .await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+    handshake(&mut client).await;
+
+    client
+        .request(
+            ext::AUTH_ATTEMPT,
+            json!({ "methodId": "mock-agent-managed" }),
+        )
+        .await;
+
+    let progress = client.wait_for_ext(ext::AUTH_PROGRESS).await;
+    assert_eq!(progress["authenticated"], false, "{progress}");
+    assert!(
+        progress["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("refused")),
+        "{progress}"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_method_the_agent_never_offered_is_refused_without_asking_it() {
+    let server = server_with_an_agent_that_needs_auth("").await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+    handshake(&mut client).await;
+
+    let result = client
+        .request(ext::AUTH_ATTEMPT, json!({ "methodId": "invented" }))
+        .await;
+    let result: ext::AuthAttemptResult = serde_json::from_value(result).unwrap();
+    assert!(!result.authenticated);
+    assert!(result.message.contains("invented"), "{result:?}");
+    assert!(result.terminal_id.is_none());
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_terminal_login_is_typed_into_and_then_authenticates() {
+    // The whole interactive path, end to end: the server starts the agent's own
+    // binary in a PTY, the browser types into it, and the clean exit is what
+    // makes `authenticate` worth sending.
+    let server = server_with_an_agent_that_needs_auth(
+        r#"
+        [[auth_providers]]
+        name = "interactive"
+        kind = "terminal"
+        "#,
+    )
+    .await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+    let info = handshake(&mut client).await;
+
+    let result = client
+        .request(
+            ext::AUTH_ATTEMPT,
+            json!({ "methodId": "mock-terminal-login" }),
+        )
+        .await;
+    let result: ext::AuthAttemptResult = serde_json::from_value(result).unwrap();
+    // Answered before the login has finished, or nobody could complete it: it
+    // is waiting for the very keystrokes this answer unlocks.
+    let terminal = result
+        .terminal_id
+        .expect("a terminal login must hand back a terminal to show");
+    assert!(!result.authenticated);
+
+    // The browser sees it as an ordinary terminal, through the stream it
+    // already renders.
+    let created = client.wait_for_ext(ext::TERMINAL_CREATED).await;
+    assert_eq!(created["terminalId"], terminal);
+
+    // Wait for the prompt, so the keystrokes do not race the program starting.
+    loop {
+        let chunk = client.wait_for_ext(ext::TERMINAL_OUTPUT).await;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(chunk["chunk"].as_str().unwrap())
+            .unwrap();
+        if String::from_utf8_lossy(&bytes).contains("Paste your code") {
+            break;
+        }
+        client
+            .ext_notifications
+            .retain(|(m, _)| m != ext::TERMINAL_OUTPUT);
+    }
+
+    client
+        .request(
+            ext::TERMINAL_INPUT,
+            json!({
+                "terminalId": terminal,
+                "bytes": base64::engine::general_purpose::STANDARD.encode("a-code\n"),
+            }),
+        )
+        .await;
+
+    // Resizing is allowed too, and is not input.
+    client
+        .request(
+            ext::TERMINAL_RESIZE,
+            json!({ "terminalId": terminal, "rows": 40, "cols": 100 }),
+        )
+        .await;
+
+    let progress = loop {
+        let progress = client.wait_for_ext(ext::AUTH_PROGRESS).await;
+        if progress["authenticated"] == json!(true) {
+            break progress;
+        }
+        assert_ne!(progress["authenticated"], json!(false), "{progress}");
+        client
+            .ext_notifications
+            .retain(|(m, _)| m != ext::AUTH_PROGRESS);
+    };
+    assert_eq!(progress["methodId"], "mock-terminal-login");
+
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    assert!(session["sessionId"].is_string());
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_terminal_the_agent_owns_cannot_be_typed_into() {
+    // The security boundary, over the wire. The agent starts terminals of its
+    // own during a turn, and a browser that could write to one would be a shell
+    // on a server SECURITY.md says has no authentication.
+    let server = Server::start().await;
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    let (_, session) = open_session(&mut client).await;
+
+    let id = client
+        .start_request(
+            method::agent::SESSION_PROMPT,
+            json!({
+                "sessionId": session,
+                "prompt": [{ "type": "text", "text": "fix the median bug" }]
+            }),
+        )
+        .await;
+
+    let created = client.wait_for_ext(ext::TERMINAL_CREATED).await;
+    let terminal = created["terminalId"].as_str().unwrap().to_string();
+
+    let refused = client
+        .try_request(
+            ext::TERMINAL_INPUT,
+            json!({
+                "terminalId": terminal,
+                "bytes": base64::engine::general_purpose::STANDARD.encode("whoami\n"),
+            }),
+        )
+        .await
+        .expect_err("a terminal the agent owns must not accept input");
+    // Refused, not absent: the terminal is right there, and asking again will
+    // not change the answer.
+    assert_eq!(refused.code, -32602, "{refused:?}");
+
+    // Size is not input, so it is allowed: the browser renders this terminal
+    // too, and the worst a wrong size does is make output wrap badly.
+    client
+        .request(
+            ext::TERMINAL_RESIZE,
+            json!({ "terminalId": terminal, "rows": 40, "cols": 100 }),
+        )
+        .await;
+
+    client.wait_for_response(&id).await;
     server.stop().await;
 }

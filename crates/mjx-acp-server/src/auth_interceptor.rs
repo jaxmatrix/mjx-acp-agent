@@ -24,22 +24,37 @@
 //! length of a device-code login, with no progress and no way to cancel, because
 //! ACP has no "still working" for a request in flight.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mjx_acp_core::{
-    Direction, Frame, JsonRpcError, MethodCorrelator, ResponsePayload, acp, ext, frame, method,
+    Direction, Frame, JsonRpcError, MethodCorrelator, RequestId, ResponsePayload, acp, ext, frame,
+    method,
 };
-use mjx_agent_auth::{AuthContext, AuthRegistry};
+use mjx_agent_auth::{AuthContext, AuthRegistry, LoginCommand, Outcome};
 use mjx_agent_catalog::AgentCommand;
+use mjx_workspace::Workspace;
 
 use crate::relay::{Disposition, Interceptor, Outbox};
 
-/// Reads `authMethods`, and explains `-32000`.
+/// Prefix of the request ids this module mints for the agent.
+///
+/// A string, and claimed by prefix, for the reason `mcp_host` gives: every id
+/// the relay mints is a number, so a string id cannot collide with a browser's
+/// — and these requests have no browser behind them to be answered to.
+const AGENT_ID_PREFIX: &str = "mjx-auth-";
+
+/// Reads `authMethods`, explains `-32000`, and authenticates when asked.
 pub struct AuthInterceptor {
     agent_id: String,
     agent_command: AgentCommand,
     registry: Arc<AuthRegistry>,
+    /// Shared with the workspace interceptor, so a login terminal is released
+    /// with the connection like every other.
+    workspace: Arc<Workspace>,
+    next_id: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -66,15 +81,25 @@ struct State {
     /// carries only an id. The relay keeps one of these too; this is a second
     /// because an interceptor is not given the relay's.
     correlator: MethodCorrelator,
+    /// `authenticate` requests we have put to the agent, and which auth method
+    /// each was for.
+    awaiting_agent: HashMap<RequestId, String>,
 }
 
 impl AuthInterceptor {
     /// An interceptor for `agent_id`, started with `agent_command`.
-    pub fn new(agent_id: String, agent_command: AgentCommand, registry: Arc<AuthRegistry>) -> Self {
+    pub fn new(
+        agent_id: String,
+        agent_command: AgentCommand,
+        registry: Arc<AuthRegistry>,
+        workspace: Arc<Workspace>,
+    ) -> Self {
         Self {
             agent_id,
             agent_command,
             registry,
+            workspace,
+            next_id: AtomicU64::new(1),
             state: Mutex::new(State::default()),
         }
     }
@@ -178,6 +203,232 @@ impl AuthInterceptor {
             data,
         })
     }
+
+    /// The method the agent advertised under `method_id`.
+    fn advertised(&self, method_id: &str) -> Option<acp::AuthMethod> {
+        self.state()
+            .methods
+            .iter()
+            .find(|method| mjx_agent_auth::method_id(method) == method_id)
+            .cloned()
+    }
+
+    /// Reserves an id for an `authenticate` this module is about to send.
+    ///
+    /// Separate from sending it because a terminal login sends its own later,
+    /// from a task that does not hold this interceptor — and an id that reached
+    /// the agent before it was on the list would have its answer claimed and
+    /// then dropped, silently.
+    fn reserve(&self, method_id: &str) -> RequestId {
+        let id = RequestId::String(format!(
+            "{AGENT_ID_PREFIX}{}",
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        ));
+        self.state()
+            .awaiting_agent
+            .insert(id.clone(), method_id.to_owned());
+        id
+    }
+
+    /// Puts `authenticate` to the agent, under an id of this module's own.
+    fn authenticate(&self, method_id: &str, outbox: &Outbox) {
+        outbox.to_agent(&authenticate_frame(self.reserve(method_id), method_id));
+    }
+
+    /// Whether `id` answers an `authenticate` this module sent.
+    ///
+    /// Claimed by prefix rather than by lookup, so an id of ours that is no
+    /// longer on the list — already answered, or the connection went away
+    /// underneath it — is still kept from the browser, which never asked.
+    fn claim_response(&self, id: &RequestId, payload: &ResponsePayload, outbox: &Outbox) -> bool {
+        let RequestId::String(text) = id else {
+            return false;
+        };
+        if !text.starts_with(AGENT_ID_PREFIX) {
+            return false;
+        }
+
+        let Some(method_id) = self.state().awaiting_agent.remove(id) else {
+            return true;
+        };
+        let message = match payload {
+            ResponsePayload::Result(_) => {
+                let mut state = self.state();
+                state.authenticated = true;
+                state.satisfied_by = Some(method_id.clone());
+                // Not `required = false`. It *was* required, and the panel
+                // showing "authenticated" is more useful than it showing
+                // nothing at all.
+                tracing::info!(agent = %self.agent_id, method = %method_id, "authenticated");
+                "Authenticated. Start a session.".to_owned()
+            }
+            // Reported, never swallowed. An agent that rejects a credential is
+            // saying the credential is wrong, and that is the one thing the
+            // operator needs to hear.
+            ResponsePayload::Error(error) => {
+                tracing::warn!(
+                    agent = %self.agent_id,
+                    method = %method_id,
+                    error = %error.message,
+                    "the agent refused to authenticate"
+                );
+                format!("The agent refused: {}", error.message)
+            }
+        };
+
+        let authenticated = self.state().authenticated;
+        outbox.notify_browser(
+            ext::AUTH_PROGRESS,
+            &ext::AuthProgress {
+                method_id,
+                message,
+                authenticated: Some(authenticated),
+            },
+        );
+        outbox.notify_browser(ext::AUTH_REQUIRED, &self.auth_state());
+        true
+    }
+
+    /// Answers `_mjx/auth/attempt`.
+    fn attempt(&self, method_id: &str, outbox: &Outbox) -> ext::AuthAttemptResult {
+        let Some(method) = self.advertised(method_id) else {
+            return ext::AuthAttemptResult {
+                authenticated: false,
+                message: format!("The agent never offered a method called `{method_id}`."),
+                terminal_id: None,
+            };
+        };
+
+        let resolution = self.registry.resolve(&AuthContext {
+            agent_id: &self.agent_id,
+            agent_command: &self.agent_command,
+            method: &method,
+        });
+
+        match resolution.outcome {
+            // A login has to run first, and it needs a person at the keyboard.
+            Outcome::RunLogin(login) => self.run_login(login, outbox),
+            // Everything else ends in the same place: ask the agent. Even where
+            // a provider said the operator must act, *trying* is right — an
+            // `agent` method is one the agent handles itself, so calling
+            // `authenticate` is literally the protocol, and if a credential is
+            // missing the agent says so with an authority no provider has.
+            _ => {
+                self.authenticate(method_id, outbox);
+                ext::AuthAttemptResult {
+                    authenticated: false,
+                    message: "Asked the agent to authenticate.".to_owned(),
+                    terminal_id: None,
+                }
+            }
+        }
+    }
+
+    /// Starts a login terminal and authenticates when it exits cleanly.
+    fn run_login(&self, login: LoginCommand, outbox: &Outbox) -> ext::AuthAttemptResult {
+        let terminal =
+            match self
+                .workspace
+                .create_login_terminal(&login.program, &login.args, &login.env)
+            {
+                Ok(terminal) => terminal,
+                Err(err) => {
+                    return ext::AuthAttemptResult {
+                        authenticated: false,
+                        message: format!("Could not start the login: {err}"),
+                        terminal_id: None,
+                    };
+                }
+            };
+
+        // The result goes back now, before the login has finished, so the
+        // browser can show the terminal and type into it. A login that blocked
+        // this request would be one nobody could complete: it is waiting for the
+        // very keystrokes the answer unlocks.
+        //
+        // The id is reserved *now*, before the task that will use it exists, so
+        // the agent's answer can never arrive before the list knows to expect it.
+        let watcher = LoginWatcher {
+            method_id: login.method_id.clone(),
+            authenticate_as: self.reserve(&login.method_id),
+        };
+        let workspace = self.workspace.clone();
+        let outbox = outbox.clone();
+        let watched = terminal.clone();
+        tokio::spawn(async move {
+            let status = workspace.wait_for_terminal_exit(&watched).await;
+            watcher.finished(status, &outbox);
+        });
+
+        ext::AuthAttemptResult {
+            authenticated: false,
+            message: "Complete the login in the terminal.".to_owned(),
+            terminal_id: Some(terminal),
+        }
+    }
+}
+
+/// Reports a login terminal's exit.
+///
+/// A type of its own only so the spawned task does not have to hold the
+/// interceptor: the task outlives the request that started it, and an
+/// interceptor kept alive by a login nobody finished would keep the connection's
+/// whole workspace with it.
+struct LoginWatcher {
+    method_id: String,
+    /// The id reserved for the `authenticate` this sends if the login succeeds.
+    authenticate_as: RequestId,
+}
+
+impl LoginWatcher {
+    fn finished(
+        &self,
+        status: Result<mjx_workspace::ExitStatus, mjx_workspace::WorkspaceError>,
+        outbox: &Outbox,
+    ) {
+        let message = match &status {
+            Ok(status) if status.exit_code == Some(0) => {
+                "The login finished. Authenticating.".to_owned()
+            }
+            Ok(status) => format!(
+                "The login exited with {}. Nothing was authenticated.",
+                status
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .or_else(|| status.signal.clone())
+                    .unwrap_or_else(|| "an unknown status".to_owned())
+            ),
+            Err(err) => format!("The login could not be watched: {err}"),
+        };
+        let succeeded = matches!(&status, Ok(status) if status.exit_code == Some(0));
+
+        outbox.notify_browser(
+            ext::AUTH_PROGRESS,
+            &ext::AuthProgress {
+                method_id: self.method_id.clone(),
+                message,
+                // Not yet: the login exiting cleanly means it is worth *asking*
+                // the agent, and only the agent's answer settles it.
+                authenticated: (!succeeded).then_some(false),
+            },
+        );
+
+        if succeeded {
+            outbox.to_agent(&authenticate_frame(
+                self.authenticate_as.clone(),
+                &self.method_id,
+            ));
+        }
+    }
+}
+
+/// An `authenticate` request for `method_id`, under `id`.
+fn authenticate_frame(id: RequestId, method_id: &str) -> Frame {
+    Frame::Request {
+        id,
+        method: method::agent::AUTHENTICATE.into(),
+        params: serde_json::value::to_raw_value(&serde_json::json!({ "methodId": method_id })).ok(),
+    }
 }
 
 impl Interceptor for AuthInterceptor {
@@ -205,6 +456,12 @@ impl Interceptor for AuthInterceptor {
         let Frame::Response { id, payload } = frame else {
             return Disposition::Forward;
         };
+
+        // The agent answering something *this module* asked it. The browser
+        // never saw the question and must not see the answer.
+        if self.claim_response(id, payload, outbox) {
+            return Disposition::Intercept;
+        }
 
         match payload {
             ResponsePayload::Result(result) => {
@@ -237,11 +494,24 @@ impl Interceptor for AuthInterceptor {
         let Frame::Request { id, method, .. } = frame else {
             return false;
         };
-        if method != ext::AUTH_STATE {
-            return false;
-        }
-        let reply = Frame::result(id.clone(), &self.auth_state())
-            .unwrap_or_else(|err| Frame::error(id.clone(), JsonRpcError::internal(err)));
+
+        let reply = match method.as_str() {
+            ext::AUTH_STATE => Frame::result(id.clone(), &self.auth_state()),
+            ext::AUTH_ATTEMPT => match frame.params_as::<ext::AuthAttemptRequest>() {
+                Ok(Some(request)) => {
+                    Frame::result(id.clone(), &self.attempt(&request.method_id, outbox))
+                }
+                Ok(None) => Ok(Frame::error(
+                    id.clone(),
+                    JsonRpcError::invalid_params("missing params"),
+                )),
+                Err(err) => Ok(Frame::error(id.clone(), JsonRpcError::invalid_params(err))),
+            },
+            _ => return false,
+        };
+
+        let reply =
+            reply.unwrap_or_else(|err| Frame::error(id.clone(), JsonRpcError::internal(err)));
         outbox.to_browser(&reply);
         true
     }
@@ -303,6 +573,13 @@ mod tests {
                 env: Default::default(),
             },
             Arc::new(AuthRegistry::default()),
+            // A workspace with no roots, since nothing here starts a login. The
+            // tests that do are end-to-end, against a real PTY.
+            Arc::new(Workspace::new(
+                Vec::new(),
+                std::env::temp_dir(),
+                tokio::sync::mpsc::unbounded_channel().0,
+            )),
         )
     }
 

@@ -581,14 +581,21 @@ async fn websocket(
             // The jail is the session's cwd plus every configured root, so an
             // agent can read a shared library directory while writing only its
             // own project.
-            let interceptor = Arc::new(Chain::new(
-                WorkspaceInterceptor::new(
-                    state.config.workspace_roots.clone(),
-                    cwd.clone(),
-                    &state.config.mcp_servers,
-                ),
-                AuthInterceptor::new(connect.agent.clone(), command.clone(), state.auth.clone()),
-            ));
+            let workspace_interceptor = WorkspaceInterceptor::new(
+                state.config.workspace_roots.clone(),
+                cwd.clone(),
+                &state.config.mcp_servers,
+            );
+            // One workspace, shared: a login terminal belongs in the same set as
+            // the agent's, or it would not be released when the connection ends
+            // and would outlive everything that could stop it.
+            let auth_interceptor = AuthInterceptor::new(
+                connect.agent.clone(),
+                command.clone(),
+                state.auth.clone(),
+                workspace_interceptor.workspace(),
+            );
+            let interceptor = Arc::new(Chain::new(workspace_interceptor, auth_interceptor));
 
             tracing::info!(connection = %id, agent = %info.agent_id, cwd = %info.cwd, "agent started");
             let pooled = Arc::new(Pooled {
