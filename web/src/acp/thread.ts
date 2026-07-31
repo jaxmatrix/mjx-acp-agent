@@ -19,7 +19,6 @@ import type {
   Entry,
   PermissionRequest,
   SessionConfigOption,
-  Terminal,
   Thread,
   ToolCall,
   ToolCallContent,
@@ -502,49 +501,5 @@ export function appendUserPrompt(thread: Thread, content: ContentBlock[]): Threa
         isOptimistic: true,
       },
     ],
-  };
-}
-
-/** Registers a terminal the server started for the agent. */
-export function addTerminal(thread: Thread, terminal: Omit<Terminal, "output" | "truncated">): Thread {
-  return {
-    ...thread,
-    terminals: {
-      ...thread.terminals,
-      [terminal.id]: { ...terminal, output: [], truncated: false },
-    },
-  };
-}
-
-/** Appends streamed bytes to a terminal. */
-export function appendTerminalOutput(
-  thread: Thread,
-  terminalId: string,
-  chunk: Uint8Array,
-  truncated: boolean,
-): Thread {
-  const terminal = thread.terminals[terminalId];
-  if (!terminal) return thread;
-  return {
-    ...thread,
-    terminals: {
-      ...thread.terminals,
-      [terminalId]: { ...terminal, output: [...terminal.output, chunk], truncated },
-    },
-  };
-}
-
-/** Records a terminal's exit. */
-export function setTerminalExit(
-  thread: Thread,
-  terminalId: string,
-  exitCode: number | null | undefined,
-  signal: string | null | undefined,
-): Thread {
-  const terminal = thread.terminals[terminalId];
-  if (!terminal) return thread;
-  return {
-    ...thread,
-    terminals: { ...thread.terminals, [terminalId]: { ...terminal, exitCode, signal } },
   };
 }

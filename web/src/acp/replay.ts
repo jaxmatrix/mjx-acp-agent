@@ -15,7 +15,6 @@
 import type { ContentBlock, ElicitationSchema, PlanEntry } from "@agentclientprotocol/sdk";
 
 import {
-  emptyThread,
   type AssistantChunk,
   type AvailableCommand,
   type Elicitation,
@@ -51,7 +50,6 @@ const STOP_REASONS: readonly string[] = [
 export function threadFromReplay(payload: unknown): Thread | null {
   if (!isRecord(payload)) return null;
 
-  const empty = emptyThread();
   return {
     entries: asArray(payload.entries)
       .map(toEntry)
@@ -69,10 +67,6 @@ export function threadFromReplay(payload: unknown): Thread | null {
     configOptions: asArray(payload.configOptions)
       .map(toConfigOption)
       .filter((option): option is SessionConfigOption => option !== null),
-    // Not recoverable. The scrollback of a terminal the agent ran lives in the
-    // workspace, not in the thread, so a resumed page shows the tool call
-    // without the output it produced.
-    terminals: empty.terminals,
   };
 }
 

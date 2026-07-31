@@ -14,10 +14,12 @@ import type { SessionInfo } from "../acp/types";
 export function SessionHistory({
   sessions,
   currentSessionId,
+  openSessionIds,
   workspaceCwd,
   capabilities,
   replayingSessionId,
   moreSessions,
+  onFocusSession,
   onLoad,
   onResume,
   onFork,
@@ -29,11 +31,15 @@ export function SessionHistory({
 }: {
   sessions: SessionInfo[];
   currentSessionId?: string;
+  /** Which of these are already open as tabs, this one included. */
+  openSessionIds: string[];
   /** The directory this connection was opened for. */
   workspaceCwd?: string;
   capabilities: AgentCapabilities;
   replayingSessionId?: string;
   moreSessions: boolean;
+  /** Brings a conversation already open to the front, rather than reloading it. */
+  onFocusSession(sessionId: string): void;
   onLoad(session: SessionInfo): void;
   onResume(session: SessionInfo): void;
   onFork(session: SessionInfo): void;
@@ -62,6 +68,10 @@ export function SessionHistory({
       <ol className="history__list">
         {sessions.map((session) => {
           const current = session.sessionId === currentSessionId;
+          // Already a tab, just not the one on screen. Loading it again would
+          // replay a conversation that is sitting right there, and leave two
+          // tabs pointed at one session.
+          const elsewhereOpen = !current && openSessionIds.includes(session.sessionId);
           // A session from another project can still be opened and read: the
           // request carries its own directory. But the *workspace* is this
           // connection's, so files it wants outside these roots will be
@@ -77,7 +87,9 @@ export function SessionHistory({
                 {session.title ?? session.sessionId}
               </p>
               <p className="dim history__meta">
-                {current && <span className="pill pill--completed">open</span>}{" "}
+                {(current || elsewhereOpen) && (
+                  <span className="pill pill--completed">open</span>
+                )}{" "}
                 {session.updatedAt ? ago(session.updatedAt) : "—"}
               </p>
               <p
@@ -93,9 +105,19 @@ export function SessionHistory({
               </p>
 
               <div className="history__buttons">
+                {elsewhereOpen && (
+                  <button
+                    type="button"
+                    className="link-button"
+                    title="Already open — bring it to the front"
+                    onClick={() => onFocusSession(session.sessionId)}
+                  >
+                    Show
+                  </button>
+                )}
                 {/* Loading the conversation already on screen would throw it
                     away and rebuild it, which is work for no change. */}
-                {capabilities.loadSession && !current && (
+                {capabilities.loadSession && !current && !elsewhereOpen && (
                   <button
                     type="button"
                     className="link-button"
@@ -105,7 +127,7 @@ export function SessionHistory({
                     {replayingSessionId === session.sessionId ? "Opening…" : "Open"}
                   </button>
                 )}
-                {capabilities.session.resume && !current && (
+                {capabilities.session.resume && !current && !elsewhereOpen && (
                   <button
                     type="button"
                     className="link-button"

@@ -61,7 +61,6 @@ describe("a replayed thread", () => {
     const thread = threadFromReplay({ entries: [], status: "idle" })!;
     expect(thread.plan).toEqual([]);
     expect(thread.availableCommands).toEqual([]);
-    expect(thread.terminals).toEqual({});
     expect(thread.stopReason).toBeUndefined();
     expect(thread.usage).toBeUndefined();
     expect(thread.modes).toBeUndefined();

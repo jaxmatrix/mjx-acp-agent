@@ -2,8 +2,6 @@ import { describe, expect, test } from "vitest";
 import type { ElicitationSchema, SessionNotification } from "@agentclientprotocol/sdk";
 
 import {
-  addTerminal,
-  appendTerminalOutput,
   appendUserPrompt,
   applyUpdate,
   attachElicitation,
@@ -11,7 +9,6 @@ import {
   cancelPendingElicitations,
   clearPermission,
   completeElicitation,
-  setTerminalExit,
   settleElicitation,
 } from "./thread";
 import {
@@ -562,29 +559,5 @@ describe("robustness", () => {
 
     expect(JSON.stringify(before)).toBe(snapshot);
     expect(after).not.toBe(before);
-  });
-});
-
-describe("terminals", () => {
-  test("output accumulates and exit is recorded", () => {
-    let thread = addTerminal(emptyThread(), {
-      id: "t1",
-      command: "node",
-      args: ["--test"],
-      cwd: "/w",
-    });
-    thread = appendTerminalOutput(thread, "t1", new Uint8Array([1, 2]), false);
-    thread = appendTerminalOutput(thread, "t1", new Uint8Array([3]), true);
-    thread = setTerminalExit(thread, "t1", 0, null);
-
-    const terminal = thread.terminals.t1;
-    expect(terminal?.output).toHaveLength(2);
-    expect(terminal?.truncated).toBe(true);
-    expect(terminal?.exitCode).toBe(0);
-  });
-
-  test("output for an unknown terminal is dropped without throwing", () => {
-    const thread = appendTerminalOutput(emptyThread(), "ghost", new Uint8Array([1]), false);
-    expect(thread.terminals).toEqual({});
   });
 });
