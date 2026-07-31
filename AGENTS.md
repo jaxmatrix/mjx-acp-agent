@@ -45,6 +45,22 @@ ACP *client* role                   relay + capability host        claude-acp / 
      `method::is_mcp_over_acp` is separate from `is_server_provided_capability`.
 - **`_mjx/*` is ours, and never reaches an agent.** It carries what ACP has no vocabulary for
   because it only arises when the client is remote. Defined once in `mjx-acp-core::ext`.
+- **A connection carries several conversations, and the viewer several connections.**
+  `SessionStore` was keyed by session id from the start and the browser has caught
+  up: `AgentConnection` holds a thread per session and folds an update into the
+  one it names, so a conversation nobody is looking at keeps running. A socket is
+  still bound to one agent and one directory, so two agents side by side is two
+  sockets — `useSessions` holds a map of them. Two consequences worth knowing:
+  a reload sends exactly **one** `session/new` per connection and then one
+  `_mjx/session/replay` per conversation, since every later `session/new` reaches
+  the agent and would leave an empty session behind; and threads are keyed by
+  connection *and* session, because session ids are the agent's and two agents may
+  choose the same one.
+- **A terminal belongs to the workspace, not to a thread.** `_mjx/terminal/*` carries
+  a terminal id and no session id, because a terminal id is already unique across the
+  workspace — there is nothing to route one by. Both thread models leave them out; the
+  browser holds them on the connection, so a replay does not take the scrollback with
+  the thread it replaces.
 - **One request kind is thread state: an elicitation.** Everything else the agent
   asks the browser — a permission prompt, `fs/*`, `terminal/*` — is a request in
   flight and nothing more. A structured question and its answer are part of the
@@ -59,8 +75,8 @@ ACP *client* role                   relay + capability host        claude-acp / 
   during the call rather than after it, so both thread models empty that
   session's thread before the request goes out — otherwise the replay doubles
   what was already there. The UI offers only the capabilities the agent named in
-  `initialize`, and the browser remembers which of an agent's sessions it is
-  looking at, because the relay's recorded `session/new` cannot know.
+  `initialize`, and the browser remembers which of an agent's sessions it has
+  open, because the relay's recorded `session/new` cannot know.
 - **Two thread models, held together by a fixture.** `crates/mjx-acp-thread` (Rust, server) and
   `web/src/acp/thread.ts` (TypeScript, browser) implement the same folding rules. Change one and you
   change both, then re-run `fixtures/session-updates.jsonl` through each. `MentionUri` is ported
@@ -110,5 +126,6 @@ npm --prefix web run typecheck
 ./scripts/demo.sh                 # build everything and open the viewer
 node web/scripts/smoke.mjs        # drive a running server over the browser's own code path
 node web/scripts/history-smoke.mjs     # the same, for session/list and session/load
+node web/scripts/sessions-smoke.mjs    # two conversations on one socket, and a reload that keeps both
 node web/scripts/capture-fixture.mjs   # re-record fixtures/session-updates.jsonl
 ```

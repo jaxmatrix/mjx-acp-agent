@@ -38,7 +38,10 @@ Pick **Mock Agent** and ask it anything. It scripts a full turn — a thought
 block, streaming text, a file read, a plan, a diff, a permission request, a live
 terminal, and a form to fill in — so every UI surface is exercised out of the
 box. It also starts with one conversation already behind it, so **History** has
-something to open before you have had a second one. It genuinely
+something to open before you have had a second one. Open a few at once — **+**
+in the tab strip adds another agent, **New** in the history adds another
+conversation to this one, and every tab keeps running whether or not it is the
+one on screen. It genuinely
 reads and rewrites `demo/workspace/stats.js` and genuinely runs `node --test`
 against it, so the green test run at the end is real, not staged.
 
@@ -155,16 +158,18 @@ times after the next load.
 
 Two smaller consequences:
 
-- **The tab remembers which conversation it is looking at.** A reload still has
-  its `session/new` answered from the recording made when the connection
-  started, which is what makes resuming transparent to an ordinary ACP client —
-  but that is no longer the session on screen once one has been opened from the
-  history, and the relay has no way to know. A remembered session the server has
-  no thread for falls back to the recorded one.
-- **`session/update` is filtered by session id in the browser.** A fork leaves
-  the original running, so more than one conversation can be live on a
-  connection, and folding all of them into the thread on screen would put one
-  conversation's messages in another.
+- **The tab remembers every conversation it has open.** A reload still has its
+  `session/new` answered from the recording made when the connection started,
+  which is what makes resuming transparent to an ordinary ACP client — but that
+  is only one of the conversations on screen, and the relay has no way to know
+  about the rest. So the browser sends exactly one `session/new` and then one
+  `_mjx/session/replay` per conversation it remembers: every later `session/new`
+  reaches the agent, and asking once per tab would leave a real, empty session
+  behind for each of them on every reload. One that the server has no thread for
+  has been deleted or reaped; it costs that tab and not the others.
+- **`session/update` is folded into the conversation it names.** A fork leaves
+  the original running, and the viewer keeps several open deliberately, so all of
+  them are live on one connection at once.
 
 A session belongs to the directory it was started in, and an agent's history
 spans every project it has been used in — so a load, resume or fork carries
@@ -331,11 +336,20 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 
 ## Known limitations
 
-- **A reload keeps the conversation, but not the terminal scrollback.** The
-  agent outlives the socket, so refreshing rejoins the same agent and the same
-  session, and a turn that was running carries on. What a terminal printed
-  before the reload is gone, though: that lives in the workspace rather than in
-  the thread the server folds.
+- **A reload keeps the conversations, but not the terminal scrollback.** The
+  agent outlives the socket, so refreshing rejoins the same agent and every
+  conversation that was open on it, and a turn that was running carries on. What
+  a terminal printed before the reload is gone, though: that lives in the
+  workspace rather than in the thread the server folds. Within one page it now
+  survives opening another conversation and coming back, which it did not before
+  — the scrollback is held by the connection rather than by a thread a replay
+  replaces.
+- **Conversations are tabs, not panes.** Several are open and live at once, one
+  is drawn at a time, and the strip marks the ones still working. Showing two
+  side by side is a window-manager job and is not done here.
+- **Nothing guarantees an agent works on two conversations at once.** The relay
+  forwards concurrent prompts and attributes the answers correctly, but an agent
+  is free to serialise them internally, and several do.
 - **A dropped connection is not reconnected for you.** A new socket can rejoin
   a running agent, but nothing retries automatically after a network blip —
   reload the page.
