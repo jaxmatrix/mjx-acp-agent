@@ -17,7 +17,11 @@ pub mod frame;
 pub mod method;
 
 pub use correlator::{Direction, MethodCorrelator};
-pub use frame::{AUTH_REQUIRED, Frame, FrameError, JsonRpcError, RequestId, ResponsePayload};
+// `AUTH_REQUIRED` is deliberately *not* re-exported here: `ext` has a method
+// name by that spelling, and the two reading alike at the crate root would be a
+// trap. Say `frame::AUTH_REQUIRED` for the code and `ext::AUTH_REQUIRED` for
+// the notification.
+pub use frame::{Frame, FrameError, JsonRpcError, RequestId, ResponsePayload};
 pub use method::Side;
 
 /// The ACP protocol schema, re-exported under the same name Zed uses so code
