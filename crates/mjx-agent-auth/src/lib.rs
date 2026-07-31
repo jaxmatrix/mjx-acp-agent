@@ -31,8 +31,10 @@ use mjx_acp_core::{acp, ext};
 use mjx_agent_catalog::AgentCommand;
 
 pub mod env_var;
+pub mod terminal;
 
 pub use env_var::EnvVarProvider;
+pub use terminal::TerminalLoginProvider;
 
 /// One thing that knows how to satisfy some auth methods.
 ///
