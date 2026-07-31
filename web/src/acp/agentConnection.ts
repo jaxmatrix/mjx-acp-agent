@@ -48,8 +48,8 @@ import {
 
 /** What the UI subscribes to. */
 export interface ConnectionEvents {
-  /** A new thread state. */
-  thread(next: Thread): void;
+  /** A new thread state, for the conversation it belongs to. */
+  thread(sessionId: string, next: Thread): void;
   /** New terminal state, for every terminal on this connection. */
   terminals(next: Terminals): void;
   /** Which agent the server connected us to. */
@@ -58,8 +58,10 @@ export interface ConnectionEvents {
   capabilities(capabilities: AgentCapabilities): void;
   /** Which session is being replayed by `session/load`, if one is. */
   replaying(sessionId?: string): void;
-  /** The session on screen changed — it was loaded, forked, or started fresh. */
-  sessionChanged(sessionId: string): void;
+  /** A conversation this connection now has a thread for. */
+  sessionOpened(sessionId: string): void;
+  /** A conversation the agent no longer has — deleted, or closed. */
+  sessionClosed(sessionId: string): void;
   /** A frame for the inspector. */
   frame(entry: Omit<InspectorEntry, "seq" | "at">): void;
   /** Connection lifecycle. */
@@ -95,7 +97,9 @@ export type TargetSession = string | { sessionId: string; cwd?: string };
 /** Where the connection is in its lifecycle. */
 export type ConnectionStatus =
   | { state: "connecting" }
-  | { state: "ready"; sessionId: string }
+  // No session id: a connection carries however many conversations the viewer
+  // has open on it, and naming one of them here would name the wrong one.
+  | { state: "ready" }
   | { state: "failed"; message: string }
   /** Another tab attached to this agent, and this socket is being closed. */
   | { state: "takenOver" }
@@ -105,8 +109,25 @@ export type ConnectionStatus =
 export class AgentConnection {
   #connection?: acp.ClientConnection;
   #agent?: acp.ClientContext;
-  #sessionId?: string;
-  #thread: Thread;
+  /**
+   * The conversation this connection started with.
+   *
+   * Not "the one on screen" — that is the viewer's business, and it may have
+   * several of these open at once. This is only the session `session/new`
+   * answered with, which is the one whose directory is ours to assume and the
+   * one a question with no session of its own is shown against.
+   */
+  #anchor?: string;
+  /**
+   * A thread per conversation.
+   *
+   * The server has held one of these per session all along — `SessionStore` is
+   * keyed by session id — and this is the browser catching up. Updates are
+   * folded into the thread they name rather than into "the current one", so a
+   * conversation the user is not looking at keeps running rather than going
+   * quiet until they look back.
+   */
+  #threads = new Map<string, Thread>();
   /**
    * Every terminal the server has started for this agent.
    *
@@ -116,14 +137,25 @@ export class AgentConnection {
   #terminals: Terminals = {};
   #events: ConnectionEvents;
   /** Resolvers for permission prompts the user hasn't answered yet. */
-  #pendingPermissions = new Map<string, (optionId: string | null) => void>();
+  #pendingPermissions = new Map<
+    string,
+    { sessionId: string; resolve: (optionId: string | null) => void }
+  >();
   /**
    * Resolvers for elicitations the user hasn't answered yet, keyed by request id.
    *
    * The request id and not the thread entry, because that is the one identity
    * the replayed copy of a question and the re-asked one share.
+   *
+   * The session travels alongside because an elicitation need not have one: the
+   * scope is a union, and its other arm is a question asked before any session
+   * exists. Only a session-scoped one belongs to a turn, and so only one of
+   * those is given up when a turn ends.
    */
-  #pendingElicitations = new Map<string, (response: acp.CreateElicitationResponse) => void>();
+  #pendingElicitations = new Map<
+    string,
+    { sessionId?: string; resolve: (response: acp.CreateElicitationResponse) => void }
+  >();
   /** Whether this socket rejoined an agent that was already running. */
   #resumed = false;
   /**
@@ -147,15 +179,24 @@ export class AgentConnection {
    */
   #cwd = "";
 
-  constructor(initial: Thread, events: ConnectionEvents, memory?: OpenSessions) {
-    this.#thread = initial;
+  constructor(events: ConnectionEvents, memory?: OpenSessions) {
     this.#events = events;
     this.#memory = memory;
   }
 
-  /** The current thread. */
-  get thread(): Thread {
-    return this.#thread;
+  /** The conversation this connection started with. */
+  get anchor(): string | undefined {
+    return this.#anchor;
+  }
+
+  /** Every conversation open on this connection. */
+  get sessions(): string[] {
+    return [...this.#threads.keys()];
+  }
+
+  /** One conversation's thread, empty if this connection has no such session. */
+  thread(sessionId: string): Thread {
+    return this.#threads.get(sessionId) ?? emptyThread();
   }
 
   /** The terminals running on this connection. */
@@ -166,11 +207,6 @@ export class AgentConnection {
   /** What the connected agent supports. */
   get capabilities(): AgentCapabilities {
     return this.#capabilities;
-  }
-
-  /** The conversation on screen. */
-  get sessionId(): string | undefined {
-    return this.#sessionId;
   }
 
   /**
@@ -192,12 +228,11 @@ export class AgentConnection {
       .client({ name: "mjx-acp-viewer" })
       .onNotification(acp.methods.client.session.update, (ctx) => {
         this.#record(ctx.params, acp.methods.client.session.update);
-        // One connection can have more than one session on it — a fork leaves
-        // the original running, and an agent may keep talking about a session
-        // this tab has moved on from. Folding those into the thread on screen
-        // would put one conversation's messages in another.
-        if (ctx.params.sessionId !== this.#sessionId) return;
-        this.#update((thread) => applyUpdate(thread, ctx.params));
+        // Into the thread this update names. One connection carries several
+        // conversations — a fork leaves the original running, and the viewer
+        // keeps more than one open deliberately — and each of them is somewhere
+        // on screen, so none of this is ours to drop.
+        this.#update(ctx.params.sessionId, (thread) => applyUpdate(thread, ctx.params));
       })
       .onRequest(acp.methods.client.session.requestPermission, (ctx) =>
         this.#requestPermission(ctx.params),
@@ -269,18 +304,24 @@ export class AgentConnection {
       this.#capabilities = agentCapabilitiesOf(initialized);
       this.#events.capabilities(this.#capabilities);
 
-      // Read before anything writes it: `#setSessionId` below records the
+      // Read before anything writes it: `#openSession` below records the
       // session this connection came back with, which would overwrite the one
       // the tab was actually looking at.
       const remembered = this.#memory?.get();
 
+      // Exactly one, however many conversations this browser is restoring. The
+      // relay answers the *first* `session/new` of an attachment from its
+      // recording and lets every later one reach the agent — so asking once per
+      // remembered conversation would leave a real, empty session behind for
+      // each of them on every reload.
       const session = await connection.agent.request(acp.methods.agent.session.new, {
         cwd: options.cwd ?? "",
         mcpServers: [],
       });
 
-      this.#setSessionId(session.sessionId);
-      this.#applySessionState(session);
+      this.#anchor = session.sessionId;
+      this.#openSession(session.sessionId);
+      this.#applySessionState(session.sessionId, session);
 
       // On a resumed connection neither of those requests reached the agent:
       // the server answered both from what the agent said the first time, so
@@ -290,7 +331,7 @@ export class AgentConnection {
         await this.#resumeThread(connection.agent, session.sessionId, remembered);
       }
 
-      this.#events.status({ state: "ready", sessionId: this.#sessionId ?? session.sessionId });
+      this.#events.status({ state: "ready" });
     } catch (error) {
       this.#events.status({ state: "failed", message: describe(error) });
       throw error;
@@ -312,7 +353,7 @@ export class AgentConnection {
     try {
       const replayed: unknown = await agent.request(ext.sessionReplay, { sessionId });
       const thread = threadFromReplay(replayed);
-      if (thread) this.#update(() => thread);
+      if (thread) this.#update(sessionId, () => thread);
       return thread !== null;
     } catch (error) {
       this.#events.frame({
@@ -346,11 +387,14 @@ export class AgentConnection {
     remembered: string | undefined,
   ): Promise<void> {
     if (remembered && remembered !== recorded) {
-      this.#setSessionId(remembered);
+      this.#openSession(remembered);
       if (await this.#replay(agent, remembered)) return;
 
-      this.#memory?.clear();
-      this.#setSessionId(recorded);
+      // Gone: deleted, or on a connection that has since been reaped. Drop the
+      // thread we opened for it and come back to the one this connection
+      // started with, which is still there.
+      this.#forget(remembered);
+      this.#memory?.set(recorded);
     }
     await this.#replay(agent, recorded);
   }
@@ -368,24 +412,25 @@ export class AgentConnection {
   }
 
   /**
-   * Opens a past conversation, replacing the one on screen.
+   * Opens a past conversation, and returns the id it is now under.
    *
    * `session/load` streams the whole history back as `session/update`
    * notifications, and those arrive *during* this call — the response is not
-   * the start of the replay, it is the end of it. So the thread is emptied and
-   * the session switched *before* the request goes out; anything else would
-   * fold the first few updates into the conversation being replaced, or drop
-   * them for naming a session this client had not moved to yet.
+   * the start of the replay, it is the end of it. So the thread is opened
+   * *before* the request goes out; anything else would drop the first few
+   * updates for naming a session this client did not yet have.
    *
-   * A load that fails costs nothing: the thread it replaced comes back.
+   * A load that fails costs nothing: the thread it opened is dropped again,
+   * unless the conversation was already open, in which case it was never ours
+   * to drop.
    */
-  async loadSession(session: TargetSession): Promise<void> {
-    if (!this.#agent) return;
+  async loadSession(session: TargetSession): Promise<string> {
     const { sessionId, cwd } = this.#target(session);
-    const previous = { thread: this.#thread, sessionId: this.#sessionId };
+    if (!this.#agent) return sessionId;
+    const wasOpen = this.#threads.has(sessionId);
 
-    this.#setSessionId(sessionId);
-    this.#update(() => emptyThread());
+    this.#openSession(sessionId);
+    this.#update(sessionId, () => emptyThread());
     this.#events.replaying(sessionId);
     try {
       const loaded = await this.#agent.request(acp.methods.agent.session.load, {
@@ -393,10 +438,10 @@ export class AgentConnection {
         cwd,
         mcpServers: [],
       });
-      this.#applySessionState(loaded);
+      this.#applySessionState(sessionId, loaded);
+      return sessionId;
     } catch (error) {
-      this.#update(() => previous.thread);
-      if (previous.sessionId) this.#setSessionId(previous.sessionId);
+      if (!wasOpen) this.#forget(sessionId);
       throw error;
     } finally {
       this.#events.replaying(undefined);
@@ -411,17 +456,18 @@ export class AgentConnection {
    * thread comes from the server's fold — which is the same thing a reload
    * does — rather than from the agent.
    */
-  async resumeSession(session: TargetSession): Promise<void> {
-    if (!this.#agent) return;
+  async resumeSession(session: TargetSession): Promise<string> {
     const { sessionId, cwd } = this.#target(session);
+    if (!this.#agent) return sessionId;
     const resumed = await this.#agent.request(acp.methods.agent.session.resume, {
       sessionId,
       cwd,
     });
-    this.#setSessionId(sessionId);
-    this.#update(() => emptyThread());
-    this.#applySessionState(resumed);
+    this.#openSession(sessionId);
+    this.#update(sessionId, () => emptyThread());
+    this.#applySessionState(sessionId, resumed);
     await this.#replay(this.#agent, sessionId);
+    return sessionId;
   }
 
   /**
@@ -438,9 +484,9 @@ export class AgentConnection {
       sessionId,
       cwd,
     });
-    this.#setSessionId(forked.sessionId);
-    this.#update(() => emptyThread());
-    this.#applySessionState(forked);
+    this.#openSession(forked.sessionId);
+    this.#update(forked.sessionId, () => emptyThread());
+    this.#applySessionState(forked.sessionId, forked);
     return forked.sessionId;
   }
 
@@ -449,7 +495,7 @@ export class AgentConnection {
     if (!this.#agent) return;
     const { sessionId } = this.#target(session);
     await this.#agent.request(acp.methods.agent.session.delete, { sessionId });
-    await this.#leaveIfCurrent(sessionId);
+    this.#forget(sessionId);
   }
 
   /** Frees a conversation's resources, leaving it in the list. */
@@ -457,7 +503,7 @@ export class AgentConnection {
     if (!this.#agent) return;
     const { sessionId } = this.#target(session);
     await this.#agent.request(acp.methods.agent.session.close, { sessionId });
-    await this.#leaveIfCurrent(sessionId);
+    this.#forget(sessionId);
   }
 
   /**
@@ -474,22 +520,10 @@ export class AgentConnection {
       cwd: this.#cwd,
       mcpServers: [],
     });
-    this.#setSessionId(session.sessionId);
-    this.#update(() => emptyThread());
-    this.#applySessionState(session);
+    this.#openSession(session.sessionId);
+    this.#update(session.sessionId, () => emptyThread());
+    this.#applySessionState(session.sessionId, session);
     return session.sessionId;
-  }
-
-  /**
-   * Moves off a session the agent has just deleted or closed.
-   *
-   * Leaving the composer pointed at one would send a prompt to a session that
-   * no longer accepts them, and the failure would arrive with no explanation.
-   */
-  async #leaveIfCurrent(sessionId: string): Promise<void> {
-    if (this.#sessionId !== sessionId) return;
-    this.#memory?.clear();
-    await this.newSession();
   }
 
   /**
@@ -504,17 +538,40 @@ export class AgentConnection {
   }
 
   /**
-   * Records which conversation is on screen, here and across a reload.
+   * Gives a conversation a thread, and says so.
    *
-   * The memory is written every time, even when the id has not changed: an
-   * agent may hand back the same session — reopening the one already on screen
-   * — and that must still leave it remembered.
+   * Idempotent, because every way of arriving at a session goes through here
+   * and an agent may hand back one that is already open — a load of the
+   * conversation already on screen, or a resume of one in another tab. Opening
+   * it twice would replace a live thread with an empty one.
    */
-  #setSessionId(sessionId: string): void {
-    const changed = this.#sessionId !== sessionId;
-    this.#sessionId = sessionId;
+  #openSession(sessionId: string): void {
     this.#memory?.set(sessionId);
-    if (changed) this.#events.sessionChanged(sessionId);
+    if (this.#threads.has(sessionId)) return;
+    this.#threads.set(sessionId, emptyThread());
+    this.#events.sessionOpened(sessionId);
+  }
+
+  /**
+   * Drops a conversation the agent no longer has.
+   *
+   * Anything of its still waiting on a human goes with it: the session is gone,
+   * so an answer would have nowhere to land, and the agent is no longer
+   * listening for one.
+   */
+  #forget(sessionId: string): void {
+    if (!this.#threads.delete(sessionId)) return;
+    for (const [key, pending] of this.#pendingElicitations) {
+      if (pending.sessionId !== sessionId) continue;
+      pending.resolve({ action: "cancel" });
+      this.#pendingElicitations.delete(key);
+    }
+    for (const [key, pending] of this.#pendingPermissions) {
+      if (pending.sessionId !== sessionId) continue;
+      pending.resolve(null);
+      this.#pendingPermissions.delete(key);
+    }
+    this.#events.sessionClosed(sessionId);
   }
 
   /**
@@ -523,17 +580,20 @@ export class AgentConnection {
    * `session/new`, `session/load`, `session/resume` and `session/fork` all
    * carry the same two, which is why this is not written out four times.
    */
-  #applySessionState(response: {
-    modes?: { currentModeId: string; availableModes: SessionMode[] } | null;
-    configOptions?: unknown[] | null;
-  }): void {
+  #applySessionState(
+    sessionId: string,
+    response: {
+      modes?: { currentModeId: string; availableModes: SessionMode[] } | null;
+      configOptions?: unknown[] | null;
+    },
+  ): void {
     if (response.configOptions) {
       const configOptions = response.configOptions as SessionConfigOption[];
-      this.#update((thread) => ({ ...thread, configOptions }));
+      this.#update(sessionId, (thread) => ({ ...thread, configOptions }));
     }
     if (response.modes) {
       const modes = response.modes;
-      this.#update((thread) => ({
+      this.#update(sessionId, (thread) => ({
         ...thread,
         modes: {
           currentModeId: modes.currentModeId,
@@ -550,38 +610,35 @@ export class AgentConnection {
    * text and `resource_link` blocks, and the optimistic copy on screen has to
    * be the same blocks the agent will echo back.
    */
-  async prompt(prompt: ContentBlock[]): Promise<void> {
-    if (!this.#agent || !this.#sessionId) throw new Error("not connected");
+  async prompt(sessionId: string, prompt: ContentBlock[]): Promise<void> {
+    if (!this.#agent) throw new Error("not connected");
 
-    this.#update((thread) => appendUserPrompt(thread, prompt));
+    this.#update(sessionId, (thread) => appendUserPrompt(thread, prompt));
     try {
       const response = await this.#agent.request(acp.methods.agent.session.prompt, {
-        sessionId: this.#sessionId,
+        sessionId,
         prompt,
       });
-      this.#update((thread) => this.#endTurn(thread, response.stopReason as StopReason));
+      this.#update(sessionId, (thread) =>
+        this.#endTurn(sessionId, thread, response.stopReason as StopReason),
+      );
     } catch (error) {
-      this.#update((thread) => this.#endTurn(thread, thread.stopReason));
+      this.#update(sessionId, (thread) => this.#endTurn(sessionId, thread, thread.stopReason));
       throw error;
     }
   }
 
-  /** Asks the agent to abandon the current turn. */
-  async cancel(): Promise<void> {
-    if (!this.#agent || !this.#sessionId) return;
-    await this.#agent.notify(acp.methods.agent.session.cancel, {
-      sessionId: this.#sessionId,
-    });
+  /** Asks the agent to abandon one conversation's turn. */
+  async cancel(sessionId: string): Promise<void> {
+    if (!this.#agent) return;
+    await this.#agent.notify(acp.methods.agent.session.cancel, { sessionId });
   }
 
-  /** Switches the session mode. */
-  async setMode(modeId: string): Promise<void> {
-    if (!this.#agent || !this.#sessionId) return;
-    await this.#agent.request(acp.methods.agent.session.setMode, {
-      sessionId: this.#sessionId,
-      modeId,
-    });
-    this.#update((thread) =>
+  /** Switches a session's mode. */
+  async setMode(sessionId: string, modeId: string): Promise<void> {
+    if (!this.#agent) return;
+    await this.#agent.request(acp.methods.agent.session.setMode, { sessionId, modeId });
+    this.#update(sessionId, (thread) =>
       thread.modes ? { ...thread, modes: { ...thread.modes, currentModeId: modeId } } : thread,
     );
   }
@@ -594,32 +651,46 @@ export class AgentConnection {
    * the whole refreshed set, because setting one option can change another's
    * available values, so the agent's answer replaces what we had.
    */
-  async setConfigOption(configId: string, value: string | boolean): Promise<void> {
-    if (!this.#agent || !this.#sessionId) return;
+  async setConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string | boolean,
+  ): Promise<void> {
+    if (!this.#agent) return;
     const response = await this.#agent.request(acp.methods.agent.session.setConfigOption, {
-      sessionId: this.#sessionId,
+      sessionId,
       configId,
       // A select value goes untyped: the schema reads an absent `type` as a
       // value id, which is what a select is.
       ...(typeof value === "boolean" ? { type: "boolean" as const, value } : { value }),
     });
     const configOptions = (response.configOptions ?? []) as SessionConfigOption[];
-    this.#update((thread) => ({ ...thread, configOptions }));
+    this.#update(sessionId, (thread) => ({ ...thread, configOptions }));
   }
 
-  /** Answers an outstanding permission prompt. */
+  /**
+   * Answers an outstanding permission prompt.
+   *
+   * The conversation it belongs to comes from the pending entry rather than
+   * from the caller: the card the user pressed knows the tool call, and the
+   * tool call is what the agent asked about.
+   */
   answerPermission(toolCallId: string, optionId: string | null): void {
-    this.#pendingPermissions.get(toolCallId)?.(optionId);
+    const pending = this.#pendingPermissions.get(toolCallId);
+    if (!pending) return;
+    pending.resolve(optionId);
     this.#pendingPermissions.delete(toolCallId);
-    this.#update((thread) => clearPermission(thread, toolCallId));
+    this.#update(pending.sessionId, (thread) => clearPermission(thread, toolCallId));
   }
 
   /** Answers an outstanding elicitation. */
   answerElicitation(requestId: string | number, answer: ElicitationAnswer): void {
     const key = String(requestId);
-    this.#pendingElicitations.get(key)?.(toElicitationResponse(answer));
+    const pending = this.#pendingElicitations.get(key);
+    if (!pending) return;
+    pending.resolve(toElicitationResponse(answer));
     this.#pendingElicitations.delete(key);
-    this.#update((thread) =>
+    this.#update(pending.sessionId ?? this.#anchor ?? "", (thread) =>
       settleElicitation(
         thread,
         requestId,
@@ -633,12 +704,12 @@ export class AgentConnection {
   close(): void {
     // Anything still waiting on a human will never be answered now; reject it
     // so the agent isn't left blocked on a dead socket.
-    for (const resolve of this.#pendingPermissions.values()) resolve(null);
+    for (const { resolve } of this.#pendingPermissions.values()) resolve(null);
     this.#pendingPermissions.clear();
     // An elicitation is cancelled rather than declined: nobody refused it, the
     // socket simply went away, and `decline` would tell the agent the user said
     // no to something they were never shown the end of.
-    for (const resolve of this.#pendingElicitations.values()) resolve({ action: "cancel" });
+    for (const { resolve } of this.#pendingElicitations.values()) resolve({ action: "cancel" });
     this.#pendingElicitations.clear();
     this.#connection?.close();
   }
@@ -654,9 +725,10 @@ export class AgentConnection {
     params: acp.RequestPermissionRequest,
   ): Promise<acp.RequestPermissionResponse> {
     const toolCallId = params.toolCall.toolCallId;
+    const sessionId = params.sessionId;
     this.#record(params, acp.methods.client.session.requestPermission);
 
-    this.#update((thread) =>
+    this.#update(sessionId, (thread) =>
       attachPermission(
         thread,
         toolCallId,
@@ -666,12 +738,15 @@ export class AgentConnection {
     );
 
     return new Promise((resolve) => {
-      this.#pendingPermissions.set(toolCallId, (optionId) => {
-        resolve(
-          optionId
-            ? { outcome: { outcome: "selected", optionId } }
-            : { outcome: { outcome: "cancelled" } },
-        );
+      this.#pendingPermissions.set(toolCallId, {
+        sessionId,
+        resolve: (optionId) => {
+          resolve(
+            optionId
+              ? { outcome: { outcome: "selected", optionId } }
+              : { outcome: { outcome: "cancelled" } },
+          );
+        },
       });
     });
   }
@@ -683,8 +758,15 @@ export class AgentConnection {
    * nowhere to go: the agent has stopped listening. The server does the same to
    * its own copy of the thread, so a reload agrees with what was on screen.
    */
-  #endTurn(thread: Thread, stopReason: StopReason | undefined): Thread {
-    this.#pendingElicitations.clear();
+  #endTurn(sessionId: string, thread: Thread, stopReason: StopReason | undefined): Thread {
+    for (const [key, pending] of this.#pendingElicitations) {
+      // Only this conversation's, and only the ones that have a conversation.
+      // Another session's turn is still running, and a request-scoped question
+      // belongs to no turn at all — it was asked outside one, so no turn ending
+      // is the end of it.
+      if (pending.sessionId !== sessionId) continue;
+      this.#pendingElicitations.delete(key);
+    }
     return { ...cancelPendingElicitations(thread), status: "idle", stopReason };
   }
 
@@ -706,7 +788,14 @@ export class AgentConnection {
     const mode = toElicitationMode(params);
     if (!mode) return Promise.resolve({ action: "decline" });
 
-    this.#update((thread) =>
+    // A question asked outside any session — during auth, or configuration —
+    // has no conversation of its own to appear in. It is shown against the one
+    // this connection started with, which is the only thread that is certainly
+    // there, and it is answerable wherever it is shown.
+    const sessionId = sessionOf(params);
+    const shownIn = sessionId ?? this.#anchor ?? "";
+
+    this.#update(shownIn, (thread) =>
       attachElicitation(thread, {
         // Numbered by position, the way every other minted entry id is. A
         // replayed copy of this question is renumbered the same way, so the two
@@ -721,7 +810,10 @@ export class AgentConnection {
     );
 
     return new Promise((resolve) => {
-      this.#pendingElicitations.set(String(requestId), resolve);
+      this.#pendingElicitations.set(String(requestId), {
+        ...(sessionId ? { sessionId } : {}),
+        resolve,
+      });
     });
   }
 
@@ -735,19 +827,24 @@ export class AgentConnection {
    */
   #completeElicitation(elicitationId: string): void {
     // Which request to answer is in the thread, on the entry this notification
-    // names — no second index to keep in step with it.
-    const asked = this.#thread.entries.find(
-      (entry) =>
-        entry.type === "elicitation" &&
-        entry.elicitation.mode.mode === "url" &&
-        entry.elicitation.mode.elicitationId === elicitationId,
-    );
-    if (asked?.type === "elicitation") {
+    // names — no second index to keep in step with it. The notification names
+    // no session either, so every conversation is looked through; the id is the
+    // agent's and unique across all of them.
+    for (const [sessionId, thread] of this.#threads) {
+      const asked = thread.entries.find(
+        (entry) =>
+          entry.type === "elicitation" &&
+          entry.elicitation.mode.mode === "url" &&
+          entry.elicitation.mode.elicitationId === elicitationId,
+      );
+      if (asked?.type !== "elicitation") continue;
+
       const key = String(asked.elicitation.requestId);
-      this.#pendingElicitations.get(key)?.({ action: "accept" });
+      this.#pendingElicitations.get(key)?.resolve({ action: "accept" });
       this.#pendingElicitations.delete(key);
+      this.#update(sessionId, (next) => completeElicitation(next, elicitationId));
+      return;
     }
-    this.#update((thread) => completeElicitation(thread, elicitationId));
   }
 
   /**
@@ -776,7 +873,14 @@ export class AgentConnection {
         // the response to `session/prompt`, and that response was owed to the
         // browser that sent it — so without this the thread would sit at
         // "generating" for a turn that finished minutes ago.
-        this.#update((thread) => this.#endTurn(thread, ctx.params.stopReason as StopReason));
+        //
+        // The conversation it names, and no other: the connection may well
+        // have another turn running, and ending that one would leave an agent
+        // working against a thread that says it is idle.
+        const { sessionId } = ctx.params;
+        this.#update(sessionId, (thread) =>
+          this.#endTurn(sessionId, thread, ctx.params.stopReason as StopReason),
+        );
       },
     );
 
@@ -833,9 +937,10 @@ export class AgentConnection {
     );
   }
 
-  #update(mutate: (thread: Thread) => Thread): void {
-    this.#thread = mutate(this.#thread);
-    this.#events.thread(this.#thread);
+  #update(sessionId: string, mutate: (thread: Thread) => Thread): void {
+    const next = mutate(this.#threads.get(sessionId) ?? emptyThread());
+    this.#threads.set(sessionId, next);
+    this.#events.thread(sessionId, next);
   }
 
   #updateTerminals(mutate: (terminals: Terminals) => Terminals): void {
@@ -876,6 +981,20 @@ function toElicitationResponse(answer: ElicitationAnswer): acp.CreateElicitation
 function toolCallOf(params: acp.CreateElicitationRequest): string | undefined {
   const scoped = params as { toolCallId?: string | null };
   return typeof scoped.toolCallId === "string" ? scoped.toolCallId : undefined;
+}
+
+/**
+ * The conversation an elicitation belongs to, if it belongs to one.
+ *
+ * The scope is a union with two arms, flattened onto the request the way
+ * `toolCallId` above is: a session-scoped question carries `sessionId`, and a
+ * request-scoped one carries only `requestId` — that is how an agent asks
+ * something during auth or configuration, before any session exists. The server
+ * makes exactly this distinction when it folds one into a thread.
+ */
+function sessionOf(params: acp.CreateElicitationRequest): string | undefined {
+  const scoped = params as { sessionId?: string | null };
+  return typeof scoped.sessionId === "string" ? scoped.sessionId : undefined;
 }
 
 /**

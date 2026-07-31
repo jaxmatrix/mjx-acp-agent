@@ -85,6 +85,14 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
   const session = useRef<AgentConnection>(null);
   const nextSeq = useRef(0);
+  /**
+   * Which conversation this view is showing.
+   *
+   * A ref as well as state because the connection's callbacks fire outside
+   * React and have to know, synchronously, whether an update belongs to the
+   * conversation on screen. The connection itself holds all of them.
+   */
+  const showing = useRef<string>(undefined);
 
   useEffect(() => {
     if (!agentId) return;
@@ -101,6 +109,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
     setSessionId(undefined);
     setReplayingSessionId(undefined);
     nextSeq.current = 0;
+    showing.current = undefined;
 
     const memory = {
       get: () => sessions.get(agentId, cwd ?? ""),
@@ -108,12 +117,32 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
       clear: () => sessions.clear(agentId, cwd ?? ""),
     };
 
-    const active = new AgentConnection(emptyThread(), {
-      thread: setThread,
+    const show = (sessionId: string) => {
+      showing.current = sessionId;
+      setSessionId(sessionId);
+      setThread(active.thread(sessionId));
+    };
+
+    const active = new AgentConnection({
+      // Only the conversation on screen reaches React. The others are still
+      // being folded — that is the point of the connection holding them — they
+      // just have nowhere to be drawn until this view shows more than one.
+      thread: (sessionId, next) => {
+        if (sessionId === showing.current) setThread(next);
+      },
       terminals: setTerminals,
       capabilities: setCapabilities,
       replaying: setReplayingSessionId,
-      sessionChanged: setSessionId,
+      sessionOpened: show,
+      sessionClosed: (sessionId) => {
+        // Leaving the composer pointed at a session the agent has just dropped
+        // would send a prompt that fails with no explanation. Somewhere else is
+        // anywhere else it has, and a fresh conversation if it has none.
+        if (sessionId !== showing.current) return;
+        const somewhere = active.sessions[0];
+        if (somewhere) show(somewhere);
+        else void active.newSession();
+      },
       agentInfo: (info) => {
         // Keep the handle to come back with. The server mints a new id when it
         // could not honour the one we sent, so writing back whatever it says
@@ -154,21 +183,23 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
   }, [agentId, cwd, attempt]);
 
   const prompt = useCallback((blocks: ContentBlock[]) => {
-    session.current?.prompt(blocks).catch((cause: unknown) => {
+    const on = showing.current;
+    if (!on) return;
+    session.current?.prompt(on, blocks).catch((cause: unknown) => {
       setError(cause instanceof Error ? cause.message : String(cause));
     });
   }, []);
 
   const cancel = useCallback(() => {
-    void session.current?.cancel();
+    if (showing.current) void session.current?.cancel(showing.current);
   }, []);
 
   const setMode = useCallback((modeId: string) => {
-    void session.current?.setMode(modeId);
+    if (showing.current) void session.current?.setMode(showing.current, modeId);
   }, []);
 
   const setConfigOption = useCallback((configId: string, value: string | boolean) => {
-    void session.current?.setConfigOption(configId, value);
+    if (showing.current) void session.current?.setConfigOption(showing.current, configId, value);
   }, []);
 
   const answerPermission = useCallback((toolCallId: string, optionId: string | null) => {
