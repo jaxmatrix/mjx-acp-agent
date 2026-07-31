@@ -17,7 +17,7 @@ pub mod frame;
 pub mod method;
 
 pub use correlator::{Direction, MethodCorrelator};
-pub use frame::{Frame, FrameError, JsonRpcError, RequestId, ResponsePayload};
+pub use frame::{AUTH_REQUIRED, Frame, FrameError, JsonRpcError, RequestId, ResponsePayload};
 pub use method::Side;
 
 /// The ACP protocol schema, re-exported under the same name Zed uses so code

@@ -50,7 +50,30 @@ pub struct JsonRpcError {
     pub data: Option<Box<RawValue>>,
 }
 
+/// ACP's code for "authenticate first".
+///
+/// An agent answers `session/new` with this until one of the methods it
+/// advertised in `initialize` has been used. It is the one error code the relay
+/// must recognise rather than forward untouched: everything else is between the
+/// agent and the browser, but this one has an answer the server knows how to
+/// help with.
+pub const AUTH_REQUIRED: i64 = -32000;
+
 impl JsonRpcError {
+    /// [`AUTH_REQUIRED`]: the agent will do nothing until it is authenticated.
+    pub fn auth_required(detail: impl fmt::Display) -> Self {
+        Self {
+            code: AUTH_REQUIRED,
+            message: detail.to_string(),
+            data: None,
+        }
+    }
+
+    /// Whether this is [`AUTH_REQUIRED`].
+    pub fn is_auth_required(&self) -> bool {
+        self.code == AUTH_REQUIRED
+    }
+
     /// `-32601 Method not found`.
     pub fn method_not_found(method: &str) -> Self {
         Self {
@@ -246,7 +269,9 @@ impl Frame {
 
     /// Deserializes the payload of a request or notification into a typed
     /// message. Returns `Ok(None)` when there is no payload at all.
-    pub fn params_as<T: serde::de::DeserializeOwned>(&self) -> Result<Option<T>, serde_json::Error> {
+    pub fn params_as<T: serde::de::DeserializeOwned>(
+        &self,
+    ) -> Result<Option<T>, serde_json::Error> {
         self.params()
             .map(|raw| serde_json::from_str(raw.get()))
             .transpose()
@@ -344,8 +369,10 @@ mod tests {
 
     #[test]
     fn parses_a_request() {
-        let frame = Frame::parse(r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1"}}"#)
-            .unwrap();
+        let frame = Frame::parse(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1"}}"#,
+        )
+        .unwrap();
         assert_eq!(frame.method(), Some("session/prompt"));
         assert_eq!(frame.id(), Some(&RequestId::Number(1)));
         assert!(matches!(frame, Frame::Request { .. }));
@@ -353,8 +380,8 @@ mod tests {
 
     #[test]
     fn parses_a_notification() {
-        let frame =
-            Frame::parse(r#"{"jsonrpc":"2.0","method":"session/update","params":{"a":1}}"#).unwrap();
+        let frame = Frame::parse(r#"{"jsonrpc":"2.0","method":"session/update","params":{"a":1}}"#)
+            .unwrap();
         assert!(matches!(frame, Frame::Notification { .. }));
         assert_eq!(frame.id(), None);
     }
@@ -442,8 +469,48 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"result":{"ok":true}}"#
         );
 
-        let frame = Frame::error(RequestId::String("a".into()), JsonRpcError::method_not_found("x"));
+        let frame = Frame::error(
+            RequestId::String("a".into()),
+            JsonRpcError::method_not_found("x"),
+        );
         assert!(frame.to_line().contains(r#""code":-32601"#));
+    }
+
+    #[test]
+    fn auth_required_is_the_code_acp_gives_it() {
+        let error = JsonRpcError::auth_required("authenticate first");
+        assert_eq!(error.code, AUTH_REQUIRED);
+        assert_eq!(
+            AUTH_REQUIRED, -32000,
+            "the number is the protocol's, not ours"
+        );
+        assert!(error.is_auth_required());
+
+        let frame = Frame::error(RequestId::Number(1), error);
+        assert!(frame.to_line().contains(r#""code":-32000"#));
+    }
+
+    #[test]
+    fn an_agents_own_auth_error_is_recognised() {
+        // The one that matters: this arrives off the wire from an agent, not
+        // from our constructor, and carries detail we must not lose.
+        let frame = Frame::parse(
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"AuthRequired","data":{"why":"no token"}}}"#,
+        )
+        .unwrap();
+        let Frame::Response {
+            payload: ResponsePayload::Error(error),
+            ..
+        } = frame
+        else {
+            panic!("expected an error response");
+        };
+        assert!(error.is_auth_required());
+        assert_eq!(error.data.unwrap().get(), r#"{"why":"no token"}"#);
+
+        // Every other code is somebody else's business.
+        assert!(!JsonRpcError::internal("boom").is_auth_required());
+        assert!(!JsonRpcError::resource_not_found("gone").is_auth_required());
     }
 
     #[test]
