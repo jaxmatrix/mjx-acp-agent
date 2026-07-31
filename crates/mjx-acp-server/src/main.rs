@@ -375,7 +375,10 @@ async fn list_files(
     Query(query): Query<FilesQuery>,
 ) -> Response {
     let root = query.root.as_ref().map(PathBuf::from);
-    let limit = query.limit.unwrap_or(FILES_LIMIT_DEFAULT).min(FILES_LIMIT_MAX);
+    let limit = query
+        .limit
+        .unwrap_or(FILES_LIMIT_DEFAULT)
+        .min(FILES_LIMIT_MAX);
 
     let listing = match mjx_workspace::fs::list_within(
         &state.config.workspace_roots,
@@ -558,7 +561,12 @@ async fn websocket(
             let pooled = Arc::new(Pooled {
                 agent_id: connect.agent.clone(),
                 cwd: cwd.clone(),
-                connection: relay::start(interceptor, agent, info, state.config.mcp_servers.clone()),
+                connection: relay::start(
+                    interceptor,
+                    agent,
+                    info,
+                    state.config.mcp_servers.clone(),
+                ),
                 idle_since: std::sync::Mutex::new(Some(Instant::now())),
             });
             // With resuming turned off there is nothing to come back to, so the

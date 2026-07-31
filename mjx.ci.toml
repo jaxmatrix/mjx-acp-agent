@@ -1,0 +1,53 @@
+# The configuration the smoke checks run against, in CI and locally.
+#
+# `mjx.toml` is the demo's configuration: a fixed port, the live registry, and
+# whatever agents you have installed. None of that is what a check wants. This
+# file differs from it in exactly three ways, and each one is a property the
+# checks depend on.
+#
+# Run it with `scripts/ci-smoke.sh`, which seeds the cache below before starting
+# the server.
+
+[server]
+# Port 0: the OS picks. A CI runner may already have something on 4321, and two
+# checks running at once must not collide. The server logs the address it
+# actually bound; `scripts/ci-smoke.sh` reads it back from that line.
+bind = "127.0.0.1:0"
+
+# resume-smoke.mjs needs an agent to outlive the socket that started it.
+resume_ttl_secs = 300
+
+[workspace]
+# Reset from `demo/pristine` before every phase: the mock agent really edits
+# `stats.js` and really runs `node --test` against it, so on an already-patched
+# workspace the turn goes down its failure path and the assertions describe a
+# turn nobody meant to test.
+roots = ["demo/workspace"]
+
+[registry]
+# A dead port and a pre-seeded cache, the same trick
+# `crates/mjx-acp-server/tests/relay.rs` uses. The catalog is then byte-identical
+# every run and a check never fails because a CDN was slow or its contents moved.
+#
+# A separate cache_dir from `mjx.toml`'s `.mjx-cache` on purpose: running these
+# checks locally must not overwrite a contributor's real registry cache with the
+# fixture.
+url = "http://127.0.0.1:1/unreachable.json"
+cache_dir = ".mjx-cache-ci"
+
+# The mock agent is the only agent CI can use. Every other one needs credentials.
+[[agents]]
+id = "mock"
+name = "Mock Agent"
+description = "Scripted agent. No credentials, no network. Exercises every UI surface."
+command = "target/debug/mjx-mock-agent"
+
+# smoke.mjs asserts this token never reaches the browser, which is the whole
+# point of hosting an `acp` MCP server here rather than letting the agent spawn
+# it.
+[[mcp_servers]]
+name = "mock-mcp"
+transport = "acp"
+command = "target/debug/mjx-mock-agent"
+args = ["--mcp"]
+env = { MJX_MOCK_MCP_TOKEN = "not-a-real-token" }

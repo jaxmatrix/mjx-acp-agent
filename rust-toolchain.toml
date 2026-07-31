@@ -1,0 +1,11 @@
+# Pinned so a contributor's `cargo fmt` and CI's `cargo fmt --check` agree.
+#
+# Without a pin they do not: rustfmt's output drifts between releases, so a
+# newer local toolchain reformats files the committed tree never touched and
+# `--check` fails on a change that touched nothing. Bumping this is a
+# deliberate act, followed by a `style:` commit that reformats the tree.
+#
+# `channel` must stay >= the workspace `rust-version` in Cargo.toml.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

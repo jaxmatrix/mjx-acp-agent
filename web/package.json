@@ -12,6 +12,7 @@
     "typecheck": "tsc -b --noEmit",
     "smoke": "node scripts/smoke.mjs",
     "smoke:resume": "node scripts/resume-smoke.mjs",
+    "smoke:browser": "node scripts/browser-smoke.mjs",
     "capture-fixture": "node scripts/capture-fixture.mjs"
   },
   "dependencies": {
@@ -30,6 +31,7 @@
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "playwright": "^1.62.1",
     "typescript": "^5.9.0",
     "vite": "^7.1.0",
     "vitest": "^3.2.0",

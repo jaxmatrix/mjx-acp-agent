@@ -66,6 +66,9 @@ export function AgentPicker({
               <button
                 type="button"
                 className="agent-card"
+                data-testid="agent-card"
+                data-agent-id={agent.id}
+                data-availability={agent.availability.state}
                 disabled={!available || !cwd}
                 onClick={() => cwd && onConnect(agent.id, cwd)}
               >

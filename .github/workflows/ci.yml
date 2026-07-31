@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+# A push to a branch with an open PR fires both `push` and `pull_request`, and
+# both build the same commit. Keying on the *branch name* — which
+# `head.ref` and `ref_name` both resolve to — puts them in one group, so the
+# second cancels the first instead of doubling the bill. (Keying on
+# `github.ref` does not: a push gives `refs/heads/<branch>` and a pull_request
+# gives `refs/pull/N/merge`, which are two groups and two full runs.)
+#
+# Runs on main are never cancelled: they are the record of what is green.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Playwright's postinstall would otherwise fetch chromium, firefox and webkit
+  # — some 400 MB — in every job, including the two that never open a browser.
+  # The smoke job installs the one browser it needs, explicitly.
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+
+jobs:
+  rust:
+    name: cargo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # No version here: rust-toolchain.toml pins it, so this job and a
+      # contributor's machine cannot disagree about what rustfmt does.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with the smoke job, which would otherwise cold-build.
+          shared-key: workspace
+          # Only main writes the cache; branches racing to save a multi-gigabyte
+          # target directory is pure cost.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The mock agent's terminal step shells out to `node --test`, inheriting
+      # the server's PATH, so `cargo test` needs a node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace --locked
+
+      # Includes the Rust half of the fixture-parity guard
+      # (crates/mjx-acp-thread/tests/fixture.rs), and the end-to-end relay test,
+      # which starts a real server and drives a real PTY.
+      - name: cargo test (includes the fixture-parity guard)
+        run: cargo test --workspace
+
+  web:
+    name: npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm --prefix web ci
+      - run: npm --prefix web run typecheck
+
+      # Includes the TypeScript half of the fixture-parity guard
+      # (web/src/acp/fixture.test.ts): it folds the same
+      # fixtures/session-updates.jsonl and compares the result against the
+      # thread the Rust model produced, so the two cannot drift apart quietly.
+      - name: vitest (includes the fixture-parity guard)
+        run: npm --prefix web test
+
+  smoke:
+    name: smoke (protocol + browser)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Gated on both: there is nothing to learn from a browser run when the
+    # workspace does not compile, and this is the expensive job.
+    needs: [rust, web]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+          save-if: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm --prefix web ci
+
+      - name: cache chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('web/package-lock.json') }}
+
+      # --with-deps: the runner image does not carry every shared library
+      # headless chromium links against, and the failure without them is an
+      # unhelpful loader error at launch.
+      - name: install chromium
+        run: npx --prefix web playwright install --with-deps chromium
+
+      # web/dist is git-ignored, and the server only serves it if it exists —
+      # without this the browser check gets an empty page.
+      - run: npm --prefix web run build
+      - run: cargo build --workspace --locked
+
+      - run: scripts/ci-smoke.sh
+
+      - name: server logs and failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-artifacts
+          path: .ci-smoke/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -137,7 +137,8 @@ impl SessionStore {
     /// removed from the agent it belonged to.
     fn forget(&mut self, session_id: &str) {
         self.threads.remove(session_id);
-        self.pending_prompts.retain(|_, pending| pending != session_id);
+        self.pending_prompts
+            .retain(|_, pending| pending != session_id);
         self.pending_config_options
             .retain(|_, pending| pending != session_id);
         self.pending_elicitations
@@ -378,7 +379,8 @@ impl SessionStore {
                 {
                     thread.finish_turn(acp::StopReason::Cancelled);
                 }
-                self.pending_session_creations.retain(|pending| pending != id);
+                self.pending_session_creations
+                    .retain(|pending| pending != id);
                 self.pending_config_options.remove(id);
                 self.pending_session_states.remove(id);
                 // A refused delete is a session that still exists. Forgetting
@@ -872,7 +874,13 @@ mod tests {
 
         assert_eq!(current_model(&store), "opus");
         assert_eq!(
-            store.thread("s1").unwrap().modes.as_ref().unwrap().current_mode_id,
+            store
+                .thread("s1")
+                .unwrap()
+                .modes
+                .as_ref()
+                .unwrap()
+                .current_mode_id,
             "ask"
         );
     }

@@ -9,6 +9,13 @@
 # Cached ACP agent registry + downloaded agent binaries
 /.mjx-cache
 
+# Seeded from fixtures/registry.json by scripts/ci-smoke.sh. Kept apart from
+# /.mjx-cache so running the checks locally does not overwrite the real one.
+/.mjx-cache-ci
+
+# Server logs and failure artefacts from scripts/ci-smoke.sh.
+/.ci-smoke
+
 # Generated from demo/pristine by scripts/demo.sh. The demo agent really edits
 # it, so it is a working copy, not a source file.
 /demo/workspace

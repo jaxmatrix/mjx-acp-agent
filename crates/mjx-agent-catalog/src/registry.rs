@@ -169,13 +169,10 @@ fn bounded_npm_package_spec(package_spec: &str) -> String {
 /// build metadata. Enough to tell a version from a dist-tag such as `latest`,
 /// which is all the caller needs.
 fn is_semver(v: &str) -> bool {
-    let core = v
-        .split_once(['-', '+'])
-        .map_or(v, |(core, _)| core);
+    let core = v.split_once(['-', '+']).map_or(v, |(core, _)| core);
     let mut parts = core.split('.');
-    let valid = |p: Option<&str>| {
-        p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    };
+    let valid =
+        |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
     valid(parts.next()) && valid(parts.next()) && valid(parts.next()) && parts.next().is_none()
 }
 
@@ -280,10 +277,9 @@ mod tests {
 
     #[test]
     fn npx_wins_when_an_agent_offers_both() {
-        let dist: Distribution = serde_json::from_str(
-            r#"{"npx":{"package":"a@1.0.0"},"uvx":{"package":"a==1.0.0"}}"#,
-        )
-        .unwrap();
+        let dist: Distribution =
+            serde_json::from_str(r#"{"npx":{"package":"a@1.0.0"},"uvx":{"package":"a==1.0.0"}}"#)
+                .unwrap();
         assert_eq!(dist.to_command().unwrap().program, "npx");
     }
 

@@ -134,6 +134,7 @@ export function Composer({
       <div className="composer__row">
         <textarea
           ref={input}
+          data-testid="composer-input"
           rows={2}
           value={text}
           placeholder={placeholder}
@@ -176,11 +177,22 @@ export function Composer({
           }}
         />
         {busy ? (
-          <button type="button" className="button button--stop" onClick={onCancel}>
+          <button
+            type="button"
+            className="button button--stop"
+            data-testid="composer-stop"
+            onClick={onCancel}
+          >
             Stop
           </button>
         ) : (
-          <button type="button" className="button" onClick={send} disabled={!canSend}>
+          <button
+            type="button"
+            className="button"
+            data-testid="composer-send"
+            onClick={send}
+            disabled={!canSend}
+          >
             Send
           </button>
         )}

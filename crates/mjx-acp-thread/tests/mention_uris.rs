@@ -52,7 +52,10 @@ fn shape(mention: &MentionUri) -> Value {
             ..
         } => {
             object.insert("absPath".into(), path_value(abs_path));
-            object.insert("lineRange".into(), json!([line_range.start(), line_range.end()]));
+            object.insert(
+                "lineRange".into(),
+                json!([line_range.start(), line_range.end()]),
+            );
         }
         MentionUri::Selection {
             abs_path,
@@ -63,7 +66,10 @@ fn shape(mention: &MentionUri) -> Value {
                 "absPath".into(),
                 abs_path.as_deref().map_or(Value::Null, path_value),
             );
-            object.insert("lineRange".into(), json!([line_range.start(), line_range.end()]));
+            object.insert(
+                "lineRange".into(),
+                json!([line_range.start(), line_range.end()]),
+            );
             object.insert("column".into(), json!(column));
         }
         MentionUri::Thread { id, .. } => {

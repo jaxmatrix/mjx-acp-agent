@@ -110,5 +110,7 @@ npm --prefix web run typecheck
 ./scripts/demo.sh                 # build everything and open the viewer
 node web/scripts/smoke.mjs        # drive a running server over the browser's own code path
 node web/scripts/history-smoke.mjs     # the same, for session/list and session/load
+node web/scripts/browser-smoke.mjs     # the same again, in an actual headless Chromium
+scripts/ci-smoke.sh                    # every check above, against a server it starts itself
 node web/scripts/capture-fixture.mjs   # re-record fixtures/session-updates.jsonl
 ```

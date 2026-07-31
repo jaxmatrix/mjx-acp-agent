@@ -1,5 +1,7 @@
 # mjx-acp-viewer
 
+[![CI](https://github.com/jaxmatrix/mjx-acp-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/jaxmatrix/mjx-acp-agent/actions/workflows/ci.yml)
+
 **A web transport for the [Agent Client Protocol](https://agentclientprotocol.com).**
 
 ACP standardises how a coding agent talks to the editor driving it — streaming
