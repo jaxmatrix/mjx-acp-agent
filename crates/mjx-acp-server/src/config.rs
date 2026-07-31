@@ -32,6 +32,9 @@ pub struct Config {
     pub agents: Vec<AgentOverride>,
     /// MCP servers offered to every agent this server starts.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// How agents get their own credentials, in the order they are tried.
+    #[allow(dead_code, reason = "read by the auth provider registry")]
+    pub auth_providers: Vec<AuthProviderConfig>,
     /// How long an agent keeps running with no browser attached, before it is
     /// reaped. Zero turns resuming off: an agent then dies with its socket.
     pub resume_ttl: Duration,
@@ -128,6 +131,69 @@ impl McpServerConfig {
     }
 }
 
+/// One `[[auth_providers]]` entry, resolved: every `env_from` indirection
+/// looked up in this server's environment.
+///
+/// The values are here, secrets included. This is the type the browser must
+/// never be given — the same rule [`McpServerConfig`] follows, and for the same
+/// reason: the server holding credentials is precisely why the browser does not
+/// have to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthProviderConfig {
+    /// How this provider is named in logs and in the auth panel.
+    pub name: String,
+    /// Which built-in does the work: `env` or `terminal`.
+    pub kind: AuthProviderKind,
+    /// Agent ids this applies to. Empty means every agent.
+    pub agents: Vec<String>,
+    /// Auth method ids this applies to. Empty means whichever it can handle.
+    pub methods: Vec<String>,
+    /// Resolved values, secrets included. Never send this to the browser.
+    pub env: Vec<(String, String)>,
+    /// Why this provider cannot do anything, if it cannot. Kept registered
+    /// rather than dropped, so the panel can say *which* variable is missing
+    /// instead of the list quietly being shorter.
+    pub unavailable: Option<String>,
+}
+
+/// Which built-in provider an entry configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthProviderKind {
+    /// Supplies environment variables, at spawn time.
+    Env,
+    /// Runs the agent's own binary as an interactive login.
+    Terminal,
+}
+
+#[allow(dead_code, reason = "read by the auth provider registry")]
+impl AuthProviderConfig {
+    /// The wire spelling of the kind, which is also what the panel shows.
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            AuthProviderKind::Env => "env",
+            AuthProviderKind::Terminal => "terminal",
+        }
+    }
+
+    /// The names — not the values — of the variables this provider carries.
+    pub fn secret_names(&self) -> Vec<String> {
+        self.env.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    /// Whether this entry applies to `agent_id`.
+    ///
+    /// No `agents` key means every agent, which is the useful default: an
+    /// operator setting one API key usually means it for whatever they run.
+    pub fn covers_agent(&self, agent_id: &str) -> bool {
+        self.agents.is_empty() || self.agents.iter().any(|id| id == agent_id)
+    }
+
+    /// Whether this entry applies to the auth method `method_id`.
+    pub fn covers_method(&self, method_id: &str) -> bool {
+        self.methods.is_empty() || self.methods.iter().any(|id| id == method_id)
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -141,6 +207,29 @@ struct RawConfig {
     agents: Vec<AgentOverride>,
     #[serde(default)]
     mcp_servers: Vec<RawMcpServer>,
+    #[serde(default)]
+    auth_providers: Vec<RawAuthProvider>,
+}
+
+/// An `[[auth_providers]]` entry as written.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuthProvider {
+    name: String,
+    /// `env` or `terminal`.
+    kind: String,
+    /// Agent ids this applies to. Absent means all of them.
+    #[serde(default)]
+    agents: Vec<String>,
+    /// Auth method ids this applies to. Absent means whichever it can handle.
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    /// Variable name → the environment variable to read it from, so a
+    /// credential need not be written into a file that gets committed.
+    #[serde(default)]
+    env_from: BTreeMap<String, String>,
 }
 
 /// An `[[mcp_servers]]` entry as written. Which fields are allowed depends on
@@ -261,10 +350,34 @@ impl Config {
             mcp_servers.push(server);
         }
 
+        let mut auth_providers: Vec<AuthProviderConfig> =
+            Vec::with_capacity(raw.auth_providers.len());
+        for (index, raw_provider) in raw.auth_providers.into_iter().enumerate() {
+            let provider = auth_provider(raw_provider)
+                .with_context(|| format!("`auth_providers[{index}]` is not usable"))?;
+            // Order is dispatch order, so two entries with one name is an
+            // ambiguity in the logs and the panel rather than in the behaviour —
+            // but it is still not what the author meant.
+            if auth_providers
+                .iter()
+                .any(|other| other.name == provider.name)
+            {
+                anyhow::bail!(
+                    "two `auth_providers` entries are both named `{}`; names must be unique",
+                    provider.name
+                );
+            }
+            if let Some(reason) = &provider.unavailable {
+                tracing::warn!(provider = %provider.name, %reason, "an auth provider is not usable");
+            }
+            auth_providers.push(provider);
+        }
+
         Ok(Self {
             bind,
             workspace_roots,
             mcp_servers,
+            auth_providers,
             registry_url: raw
                 .registry
                 .url
@@ -300,6 +413,54 @@ impl Config {
                 .is_ok_and(|root| candidate.starts_with(root))
         })
     }
+}
+
+/// Turns one `[[auth_providers]]` entry into a resolved [`AuthProviderConfig`].
+///
+/// The same split [`mcp_server`] makes: an unusable *shape* is an error, because
+/// the file does not say what its author thought; a missing `env_from` variable
+/// is not, because one absent credential should not stop the server starting for
+/// every other agent. The entry stays, marked unavailable and naming the
+/// variable, so the panel can say what to set rather than showing a shorter list
+/// with no explanation.
+fn auth_provider(raw: RawAuthProvider) -> Result<AuthProviderConfig> {
+    if raw.name.trim().is_empty() {
+        anyhow::bail!("`name` is required and cannot be blank");
+    }
+    let kind = match raw.kind.as_str() {
+        "env" => AuthProviderKind::Env,
+        "terminal" => AuthProviderKind::Terminal,
+        other => anyhow::bail!("`kind` must be `env` or `terminal`, not `{other}`"),
+    };
+
+    // A terminal login runs the agent's own binary, so it has nothing to read
+    // out of the environment on the operator's behalf. Silently ignoring the
+    // keys would leave an operator believing a credential was being passed.
+    if kind == AuthProviderKind::Terminal && !(raw.env.is_empty() && raw.env_from.is_empty()) {
+        anyhow::bail!(
+            "a `terminal` provider takes no `env` or `env_from`: it runs the agent's own \
+             binary, and the environment for that comes from the auth method the agent \
+             advertised"
+        );
+    }
+
+    let mut unavailable = None;
+    let env = resolve_secrets(raw.env, raw.env_from, "env", &mut unavailable)?;
+
+    // An `env` provider with nothing to contribute would decline every method
+    // for a reason nobody could act on. Say so at load time instead.
+    if kind == AuthProviderKind::Env && env.is_empty() && unavailable.is_none() {
+        anyhow::bail!("an `env` provider needs at least one `env` or `env_from` entry");
+    }
+
+    Ok(AuthProviderConfig {
+        name: raw.name,
+        kind,
+        agents: raw.agents,
+        methods: raw.methods,
+        env,
+        unavailable,
+    })
 }
 
 /// Turns one `[[mcp_servers]]` entry into a resolved [`McpServerConfig`].
@@ -442,6 +603,130 @@ mod tests {
             toml::from_str(toml_text).unwrap(),
             PathBuf::from("/project"),
         )
+    }
+
+    #[test]
+    fn auth_providers_are_read_in_the_order_they_are_written() {
+        // Order is dispatch order: the first provider that can handle a method
+        // is the one that does, so the file's order is a decision.
+        let config = parse(
+            r#"
+            [[auth_providers]]
+            name = "anthropic"
+            kind = "env"
+            agents = ["claude-acp"]
+            methods = ["api-key"]
+            env = { ANTHROPIC_API_KEY = "sk-not-a-real-key" }
+
+            [[auth_providers]]
+            name = "interactive"
+            kind = "terminal"
+            "#,
+        )
+        .unwrap();
+
+        let [first, second] = &config.auth_providers[..] else {
+            panic!("{:?}", config.auth_providers);
+        };
+        assert_eq!(first.name, "anthropic");
+        assert_eq!(first.kind_name(), "env");
+        assert!(first.covers_agent("claude-acp"));
+        assert!(!first.covers_agent("gemini"));
+        assert!(first.covers_method("api-key"));
+        assert!(!first.covers_method("oauth"));
+        // Names, never values. This is what the panel is given.
+        assert_eq!(first.secret_names(), ["ANTHROPIC_API_KEY"]);
+        assert!(first.unavailable.is_none());
+
+        // No filters means everything, which is the useful default: an operator
+        // who configures one login usually means it for whatever they run.
+        assert_eq!(second.kind_name(), "terminal");
+        assert!(second.covers_agent("anything"));
+        assert!(second.covers_method("anything"));
+    }
+
+    #[test]
+    fn an_auth_credential_is_read_from_the_environment_and_a_missing_one_is_reported() {
+        // Unique names: tests share a process, and so an environment.
+        // SAFETY: single-threaded here, and the names are not read elsewhere.
+        unsafe { std::env::set_var("MJX_TEST_AUTH_KEY", "sk-hh") };
+
+        let config = parse(
+            r#"
+            [[auth_providers]]
+            name = "present"
+            kind = "env"
+            env_from = { OPENAI_API_KEY = "MJX_TEST_AUTH_KEY" }
+
+            [[auth_providers]]
+            name = "absent"
+            kind = "env"
+            env_from = { OPENAI_API_KEY = "MJX_TEST_AUTH_NOT_SET" }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.auth_providers[0].env,
+            [("OPENAI_API_KEY".to_string(), "sk-hh".to_string())]
+        );
+
+        // Kept and marked, not dropped and not fatal. One missing credential
+        // must not stop the server starting for every other agent, and the
+        // panel has to be able to say *which* variable to set.
+        let reason = config.auth_providers[1]
+            .unavailable
+            .as_deref()
+            .expect("a missing variable must be reported");
+        assert!(reason.contains("MJX_TEST_AUTH_NOT_SET"), "{reason}");
+    }
+
+    #[test]
+    fn an_auth_provider_that_could_never_work_is_refused_at_load() {
+        // Each of these is a file that does not say what its author thought.
+        // Better to fail at startup, where somebody is looking, than to decline
+        // every method later for a reason nobody can act on.
+        let unusable = [
+            // Nothing to contribute.
+            r#"[[auth_providers]]
+               name = "empty"
+               kind = "env""#,
+            // A terminal login runs the agent's own binary; these would be
+            // silently ignored, and the operator would believe otherwise.
+            r#"[[auth_providers]]
+               name = "confused"
+               kind = "terminal"
+               env = { TOKEN = "x" }"#,
+            // Not a provider this server has.
+            r#"[[auth_providers]]
+               name = "oauth"
+               kind = "oauth""#,
+            r#"[[auth_providers]]
+               name = ""
+               kind = "terminal""#,
+            // Two entries with one name is an ambiguity in the logs and the
+            // panel, even though dispatch would still be deterministic.
+            r#"[[auth_providers]]
+               name = "twice"
+               kind = "terminal"
+               [[auth_providers]]
+               name = "twice"
+               kind = "terminal""#,
+        ];
+        for text in unusable {
+            assert!(parse(text).is_err(), "should have been refused:\n{text}");
+        }
+
+        // A key nothing reads is refused too, which is what
+        // `deny_unknown_fields` buys: a misspelled `agents` would otherwise
+        // quietly widen the provider to every agent. Checked against `RawConfig`
+        // because this one fails in the TOML parse, before `from_raw` runs.
+        assert!(
+            toml::from_str::<RawConfig>(
+                "[[auth_providers]]\nname = \"typo\"\nkind = \"terminal\"\nagent = [\"c\"]"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -699,6 +984,7 @@ mod tests {
             cache_dir: temp.clone(),
             agents: vec![],
             mcp_servers: vec![],
+            auth_providers: vec![],
             resume_ttl: DEFAULT_RESUME_TTL,
         };
 

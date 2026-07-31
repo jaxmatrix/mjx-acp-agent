@@ -65,6 +65,34 @@ env = { MJX_MOCK_MCP_TOKEN = "not-a-real-token" }
 # url = "https://api.githubcopilot.com/mcp/"
 # headers_from = { Authorization = "GITHUB_MCP_TOKEN" }
 
+# How agents get their *own* credentials. Distinct from anything above: this is
+# the agent authenticating itself to whatever it talks to, not this server
+# authenticating anybody.
+#
+# Order is dispatch order — the first provider that can handle an auth method is
+# the one that does. `agents` and `methods` narrow an entry; leaving either out
+# means "all of them". An `env_from` variable that is not set leaves the provider
+# configured but unavailable, and the auth panel says which one to set.
+#
+# These credentials are the *operator's*. They come from the environment this
+# server was started in and from this file, and every browser attached acts as
+# that one operator. Values never travel to the browser — only names and
+# reasons. See SECURITY.md.
+#
+# [[auth_providers]]
+# name = "anthropic"
+# kind = "env"
+# agents = ["claude-acp"]
+# env_from = { ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY" }
+#
+# `terminal` runs the agent's own binary with the arguments the agent asked for,
+# in a PTY the browser can type into. It takes no `env` of its own: what runs is
+# never this file's choice, and never the browser's.
+#
+# [[auth_providers]]
+# name = "interactive"
+# kind = "terminal"
+
 # claude-acp, gemini and codex-acp resolve from the registry:
 #
 #   claude-acp  npx -y @agentclientprotocol/claude-agent-acp@<pinned>
