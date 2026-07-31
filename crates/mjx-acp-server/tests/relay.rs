@@ -2660,3 +2660,99 @@ async fn a_terminal_the_agent_owns_cannot_be_typed_into() {
     client.wait_for_response(&id).await;
     server.stop().await;
 }
+
+#[tokio::test]
+async fn a_reload_after_authenticating_does_not_ask_the_agent_again() {
+    // The auth state is the *agent's*, and the interceptor holding it is built
+    // once when the agent starts — so it survives every socket, and a browser
+    // that reloads inherits an authenticated connection rather than starting
+    // the whole exchange over.
+    let server = server_with_an_agent_that_needs_auth("").await;
+    let mut first = Client::connect(&server.ws("agent=locked")).await;
+    let info = handshake(&mut first).await;
+    let connection = info["connectionId"].as_str().unwrap().to_string();
+
+    first
+        .request(
+            ext::AUTH_ATTEMPT,
+            json!({ "methodId": "mock-agent-managed" }),
+        )
+        .await;
+    first.wait_for_ext(ext::AUTH_PROGRESS).await;
+    let session = first
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    let session = session["sessionId"].as_str().unwrap().to_string();
+    drop(first);
+
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=locked&resume={connection}"))).await;
+    let info = handshake(&mut second).await;
+    assert_eq!(info["resumed"], true);
+
+    let state = second.request(ext::AUTH_STATE, json!({})).await;
+    let state: ext::AuthState = serde_json::from_value(state).unwrap();
+    assert!(state.authenticated, "the agent is still authenticated");
+    // The methods came from the recorded `initialize`, which the agent was
+    // never asked a second time.
+    assert_eq!(state.methods.len(), 3);
+
+    // The recorded `session/new` is replayed, so this is the same conversation
+    // rather than a second one beside it.
+    let rejoined = second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    assert_eq!(rejoined["sessionId"].as_str().unwrap(), session);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_reload_before_authenticating_meets_the_same_refusal() {
+    // The other half. A failed `session/new` is never recorded — the handshake
+    // keeps results, not errors — so the reattaching browser really does reach
+    // the agent, and must get the same explanation rather than a bare error.
+    let server = server_with_an_agent_that_needs_auth("").await;
+    let mut first = Client::connect(&server.ws("agent=locked")).await;
+    let info = handshake(&mut first).await;
+    let connection = info["connectionId"].as_str().unwrap().to_string();
+    first
+        .try_request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await
+        .expect_err("the agent must refuse");
+    drop(first);
+
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=locked&resume={connection}"))).await;
+    let info = handshake(&mut second).await;
+
+    // The refusal outlived the socket that provoked it, so a browser arriving
+    // now knows why before it asks anything.
+    let state = second.request(ext::AUTH_STATE, json!({})).await;
+    let state: ext::AuthState = serde_json::from_value(state).unwrap();
+    assert!(state.required);
+    assert!(!state.authenticated);
+
+    let error = second
+        .try_request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await
+        .expect_err("the agent must refuse the second browser too");
+    assert!(error.is_auth_required());
+    let detail: ext::AuthState =
+        serde_json::from_str(error.data.as_ref().expect("still explained").get()).unwrap();
+    assert_eq!(detail.methods.len(), 3);
+
+    server.stop().await;
+}
