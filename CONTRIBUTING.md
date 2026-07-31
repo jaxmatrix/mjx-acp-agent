@@ -44,6 +44,22 @@ item. `node web/scripts/smoke.mjs` drives a running server over the browser's ex
 socket, and coming back to it — and `node web/scripts/history-smoke.mjs` for the session
 lifecycle: listing an agent's conversations, loading one, and forking, closing and deleting it.
 
+Those three run *the browser's code* but not *a browser*. `node web/scripts/browser-smoke.mjs` runs
+an actual headless Chromium against the built app: it clicks the agent card, types a mention and
+accepts the completion, answers the permission and the form, waits for the terminal to render text,
+opens the collapsed diff and reloads — and fails on any console error, uncaught exception, failed
+request or WebSocket error. All three of the bugs above are things only this can see. It needs a
+browser downloaded once:
+
+```sh
+npx --prefix web playwright install chromium
+```
+
+`scripts/ci-smoke.sh` runs every one of them against a server it starts and stops itself, on a
+workspace reset from `demo/pristine`, with the registry seeded from `fixtures/registry.json` so
+nothing touches the network. That is exactly what CI runs, so running it is how you reproduce a CI
+failure. It builds nothing: `cargo build --workspace` and `npm --prefix web run build` first.
+
 ## Adding support for a new part of the protocol
 
 1. Add the shape to the mock agent's script (`crates/mjx-mock-agent/src/script.rs`) and assert it
@@ -66,13 +82,17 @@ JSON by hand for the same reason the ACP script does.
 ## Required checks (must be green before every commit)
 
 ```sh
-cargo fmt --all
+cargo fmt --all -- --check
 cargo build  --workspace
 cargo test   --workspace
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 npm --prefix web run typecheck
 npm --prefix web test
 ```
+
+`.github/workflows/ci.yml` runs all six on every push, plus `scripts/ci-smoke.sh`. The toolchain is
+pinned in `rust-toolchain.toml` so `cargo fmt` here and `--check` there cannot disagree; bumping it
+is a deliberate act, followed by a `style:` commit that reformats the tree.
 
 ## Git & commit conventions
 
