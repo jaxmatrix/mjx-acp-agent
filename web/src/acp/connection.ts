@@ -45,7 +45,20 @@ export const ext = {
   sessionReplay: "_mjx/session/replay",
   sessionTurnEnded: "_mjx/session/turn_ended",
   connectionTakenOver: "_mjx/connection/taken_over",
+  authRequired: "_mjx/auth/required",
+  authState: "_mjx/auth/state",
+  authAttempt: "_mjx/auth/attempt",
+  authProgress: "_mjx/auth/progress",
+  terminalInput: "_mjx/terminal/input",
+  terminalResize: "_mjx/terminal/resize",
 } as const;
+
+/** Encodes keystrokes the way `_mjx/terminal/input` wants them. */
+export function encodeChunk(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
 
 /** Decodes a base64 terminal chunk into the bytes xterm.js wants. */
 export function decodeChunk(base64: string): Uint8Array {

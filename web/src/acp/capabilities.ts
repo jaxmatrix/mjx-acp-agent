@@ -62,6 +62,88 @@ export function agentCapabilitiesOf(response: unknown): AgentCapabilities {
   };
 }
 
+/** One way an agent will accept being authenticated. */
+export interface AuthMethod {
+  /** The `methodId` to pass to `authenticate`. */
+  id: string;
+  name: string;
+  description?: string;
+  /** `envVar`, `terminal`, or `agent` for a method the agent handles itself. */
+  kind: "envVar" | "terminal" | "agent";
+  /** For an `envVar` method: the variables it wants. */
+  vars: AuthEnvVar[];
+  /** Documentation the agent pointed at. */
+  link?: string;
+}
+
+/** One variable an `envVar` method wants. */
+export interface AuthEnvVar {
+  name: string;
+  label?: string;
+  /** Whether the login works without it. */
+  optional: boolean;
+}
+
+/**
+ * Reads `authMethods` off an `initialize` response.
+ *
+ * A sibling of {@link agentCapabilitiesOf} rather than part of it, because
+ * `authMethods` sits at the top of the result and not under `agentCapabilities`.
+ *
+ * Defensive in the same way as everything else here, and in one way particular
+ * to this shape: the schema says a method with no `type` *is* an `agent` method,
+ * so an unfamiliar `type` is read the same way rather than dropped. Dropping it
+ * would hide a choice the agent really offered; showing it as "the agent handles
+ * this itself" is true of every method we cannot classify. An entry that is not
+ * an object at all, or has no usable `id`, is skipped — it names nothing we
+ * could pass to `authenticate`.
+ */
+export function authMethodsOf(response: unknown): AuthMethod[] {
+  const advertised = record(response).authMethods;
+  if (!Array.isArray(advertised)) return [];
+
+  const methods: AuthMethod[] = [];
+  for (const entry of advertised) {
+    const method = record(entry);
+    const id = text(method.id);
+    const name = text(method.name);
+    if (!id) continue;
+
+    const kind =
+      method.type === "env_var" ? "envVar" : method.type === "terminal" ? "terminal" : "agent";
+    methods.push({
+      id,
+      // A method with no name is still selectable; its id is the honest label.
+      name: name ?? id,
+      description: text(method.description),
+      kind,
+      vars: kind === "envVar" ? envVars(method.vars) : [],
+      link: text(method.link),
+    });
+  }
+  return methods;
+}
+
+function envVars(value: unknown): AuthEnvVar[] {
+  if (!Array.isArray(value)) return [];
+  const vars: AuthEnvVar[] = [];
+  for (const entry of value) {
+    const variable = record(entry);
+    const name = text(variable.name);
+    if (!name) continue;
+    // `optional` defaults to false, per the schema: a variable is required
+    // unless it says otherwise, and guessing the other way would tell the user
+    // they can skip something they cannot.
+    vars.push({ name, label: text(variable.label), optional: variable.optional === true });
+  }
+  return vars;
+}
+
+/** A non-empty string, or `undefined` for anything else. */
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 /** Whether a capability object says "supported". */
 function offered(capability: unknown): boolean {
   return typeof capability === "object" && capability !== null && !Array.isArray(capability);
