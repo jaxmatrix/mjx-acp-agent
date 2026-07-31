@@ -62,6 +62,11 @@ function keyOf({ agentId, cwd }: Connection): string {
   return `${agentId}\u0000${cwd}`;
 }
 
+/** A tab's identity, for a React key or a lookup. Unique for the same reason. */
+export function tabKey(tab: Tab): string {
+  return `${keyOf(tab)}\u0000${tab.sessionId}`;
+}
+
 function connectionOf(key: string): Connection {
   const [agentId = "", cwd = ""] = key.split("\u0000");
   return { agentId, cwd };
@@ -328,6 +333,13 @@ export interface Viewer {
   focus(tab: Tab): void;
   /** Whether a conversation is mid-turn, for the tab strip. */
   busy(tab: Tab): boolean;
+  /**
+   * What to call a tab: the conversation's own title where the agent has given
+   * one, since several tabs on one agent are otherwise the same word repeated.
+   */
+  nameOf(tab: Tab): string;
+  /** The agent behind a tab, for when more than one is open to confuse it with. */
+  agentNameOf(tab: Tab): string;
   /** Opens a connection to an agent, and a first conversation on it. */
   connect(agentId: string, cwd: string): void;
   /** Starts another conversation on a connection already open. */
@@ -485,6 +497,24 @@ export function useSessions(): Viewer {
     [state.threads],
   );
 
+  const agentNameOf = useCallback(
+    (tab: Tab) => state.connections[keyOf(tab)]?.agentInfo?.name ?? tab.agentId,
+    [state.connections],
+  );
+
+  const nameOf = useCallback(
+    (tab: Tab) => {
+      // The agent's own title for the conversation, out of the history it
+      // listed. Absent until that has been asked for, and for a conversation
+      // too new to have been titled — the agent's name is the honest fallback.
+      const titled = state.connections[keyOf(tab)]?.history.find(
+        (one) => one.sessionId === tab.sessionId,
+      )?.title;
+      return titled || agentNameOf(tab);
+    },
+    [state.connections, agentNameOf],
+  );
+
   const current = useCurrentTab(state, connections, dispatch, open);
 
   return {
@@ -493,6 +523,8 @@ export function useSessions(): Viewer {
     ...(current ? { current } : {}),
     focus,
     busy,
+    nameOf,
+    agentNameOf,
     connect: connectTo,
     newTab,
     closeTab,
@@ -511,12 +543,22 @@ function useCurrentTab(
   const sessionId = tab?.sessionId ?? "";
   const live = connections.current.get(key);
 
-  /** Runs one lifecycle call, and refreshes the list it just changed. */
+  /**
+   * Runs one lifecycle call, moves to the conversation it opened, and refreshes
+   * the list it just changed.
+   *
+   * Moving is the point of the call. Opening, forking or resuming from the
+   * history is someone asking to be taken somewhere — unlike a conversation
+   * that opens on its own, which must not pull the page out from under them.
+   */
   const lifecycle = useCallback(
-    (run: (connection: AgentConnection) => Promise<unknown>, listAgain = true) => {
+    (run: (connection: AgentConnection) => Promise<string | undefined | void>, listAgain = true) => {
       if (!live) return;
       run(live)
-        .then(async () => {
+        .then(async (opened) => {
+          if (typeof opened === "string") {
+            dispatch({ type: "focus", tab: { ...connectionOf(key), sessionId: opened } });
+          }
           if (!listAgain) return;
           // The list is the agent's, not ours: a fork adds an entry, a delete
           // removes one, and a prompt can retitle a session. Asking again is

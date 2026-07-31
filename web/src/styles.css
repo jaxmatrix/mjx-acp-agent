@@ -90,8 +90,116 @@ button {
   background: var(--panel);
 }
 
-.topbar > :nth-child(2) {
+/* The pill sits at the boundary: what is on the left describes this
+   conversation, what is on the right is a tool for reading the protocol. */
+.topbar .pill {
   margin-right: auto;
+}
+
+/* ------------------------------------------------------------------ tabs */
+
+.tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 0.25rem;
+  padding: 0.35rem 0.6rem 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 7px 7px 0 0;
+  background: var(--panel-2);
+}
+
+/* The one on screen joins the topbar below it rather than sitting on it. */
+.tab--on {
+  background: var(--panel);
+  border-color: var(--accent);
+}
+
+.tab__pick {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  min-width: 0;
+  padding: 0.4rem 0.3rem 0.4rem 0.7rem;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+.tab__name,
+.tab__cwd {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab__name {
+  max-width: 12rem;
+}
+
+.tab__cwd {
+  max-width: 8rem;
+  font-size: 0.85em;
+}
+
+/* An agent working in a conversation nobody is watching. */
+.tab__busy {
+  color: var(--accent);
+  font-size: 0.6em;
+  line-height: 1;
+  animation: tab-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes tab-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab__busy {
+    animation: none;
+  }
+}
+
+.tab__close {
+  padding: 0.4rem 0.55rem;
+  background: none;
+  border: 0;
+  color: var(--dim);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.tab__close:hover {
+  color: var(--removed);
+}
+
+.tab__add {
+  align-self: center;
+  padding: 0.25rem 0.6rem;
+  margin-left: 0.15rem;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.tab__add:hover {
+  border-color: var(--border);
+  color: var(--text);
 }
 
 /* ---------------------------------------------------------------- picker */

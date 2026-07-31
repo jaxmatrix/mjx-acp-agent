@@ -7,7 +7,9 @@ import { Composer } from "./components/Composer";
 import { Inspector } from "./components/Inspector";
 import { SessionHistory } from "./components/SessionHistory";
 import { Sidebar } from "./components/Sidebar";
+import { TabStrip } from "./components/TabStrip";
 import { ThreadView } from "./components/ThreadView";
+import type { ConnectionStatus } from "./acp/agentConnection";
 import { useSessions, type TabState, type Viewer } from "./useSessions";
 
 export function App() {
@@ -56,6 +58,11 @@ function Conversation({
   // is not known until the handshake has answered.
   const canList = capabilities.session.list;
 
+  // The history is one agent's, so the tabs it can point at are that agent's.
+  const onThisConnection = viewer.tabs.filter(
+    (tab) => tab.agentId === current.tab.agentId && tab.cwd === current.tab.cwd,
+  );
+
   useEffect(() => {
     if (canList) refreshSessions();
   }, [canList, refreshSessions]);
@@ -66,10 +73,18 @@ function Conversation({
         showHistory ? "app--with-history" : ""
       }`}
     >
+      <TabStrip
+        tabs={viewer.tabs}
+        focused={viewer.focused}
+        nameOf={viewer.nameOf}
+        agentNameOf={viewer.agentNameOf}
+        busy={viewer.busy}
+        onFocus={viewer.focus}
+        onClose={viewer.closeTab}
+        onAdd={onAdd}
+      />
+
       <header className="topbar">
-        <button type="button" className="link-button" onClick={onAdd}>
-          + Agent
-        </button>
         {canList && (
           <button
             type="button"
@@ -80,7 +95,7 @@ function Conversation({
             History ({current.sessions.length})
           </button>
         )}
-        <StatusPill current={current} />
+        <StatusPill status={current.status} />
         <button
           type="button"
           className="link-button"
@@ -117,6 +132,11 @@ function Conversation({
           <SessionHistory
             sessions={current.sessions}
             currentSessionId={current.tab.sessionId}
+            openSessionIds={onThisConnection.map((tab) => tab.sessionId)}
+            onFocusSession={(sessionId) => {
+              const open = onThisConnection.find((tab) => tab.sessionId === sessionId);
+              if (open) viewer.focus(open);
+            }}
             workspaceCwd={current.tab.cwd}
             capabilities={current.capabilities}
             replayingSessionId={current.replayingSessionId}
@@ -160,45 +180,21 @@ function Conversation({
         {showInspector && <Inspector frames={current.frames} />}
       </div>
 
-      {/* Every conversation is live; this is the one place to switch between
-          them until the tab strip lands. */}
-      {viewer.tabs.length > 1 && (
-        <nav className="tabs-fallback">
-          {viewer.tabs.map((tab) => (
-            <button
-              key={`${tab.agentId} ${tab.cwd} ${tab.sessionId}`}
-              type="button"
-              className="link-button"
-              aria-pressed={tab.sessionId === current.tab.sessionId}
-              onClick={() => viewer.focus(tab)}
-            >
-              {tab.agentId}
-              {viewer.busy(tab) ? " •" : ""}
-            </button>
-          ))}
-        </nav>
-      )}
     </div>
   );
 }
 
 /**
- * Whether this connection is reachable, and whether its agent is working.
+ * Whether the socket behind the conversation on screen is up.
  *
- * Two questions rather than one, now that a connection carries several
- * conversations — the socket is the connection's and the turn is one
- * conversation's. They still share a pill until the tab strip has somewhere to
- * show the second per tab.
+ * Only that. Whether an *agent* is working is a per-conversation question now
+ * that a connection carries several, and the tab strip answers it for all of
+ * them at once rather than for whichever one happens to be on screen.
  */
-function StatusPill({ current }: { current: TabState }) {
-  const { status, thread } = current;
+function StatusPill({ status }: { status: ConnectionStatus }) {
   if (status.state === "connecting") return <span className="pill">connecting…</span>;
   if (status.state === "failed") return <span className="pill pill--failed">disconnected</span>;
   if (status.state === "takenOver") return <span className="pill pill--failed">other tab</span>;
   if (status.state === "closed") return <span className="pill pill--failed">closed</span>;
-  return (
-    <span className={`pill pill--${thread.status === "generating" ? "in_progress" : "completed"}`}>
-      {thread.status === "generating" ? "working" : "ready"}
-    </span>
-  );
+  return <span className="pill pill--completed">connected</span>;
 }
