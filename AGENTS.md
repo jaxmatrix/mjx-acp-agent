@@ -26,12 +26,23 @@ ACP *client* role                   relay + capability host        claude-acp / 
   an ordinary ACP client and the agent an ordinary ACP agent. *Forward it* is the default for
   everything — a relay that only passes what it understands breaks the day either peer speaks a
   newer protocol version.
-- **Exactly three interceptions**, all in `mjx-acp-server`: rewriting `initialize` to declare the
-  capabilities the server provides; answering `fs/*` and `terminal/*` itself because the workspace
-  is server-side; and answering a *repeat* `initialize` or `session/new` from what the agent said
-  the first time, because both are once-per-agent and an agent now outlives the socket that started
-  it — a browser that reloads asks them again, and a second `session/new` reaching the agent is
-  precisely the bug that resuming exists to fix. Adding a fourth needs a reason written down.
+- **Exactly five interceptions**, all in `mjx-acp-server`, and each one needs its reason written
+  down here:
+  1. Rewriting `initialize` to declare the capabilities the server provides.
+  2. Answering `fs/*` and `terminal/*` itself, because the workspace is server-side.
+  3. Answering a *repeat* `initialize` or `session/new` from what the agent said the first time,
+     because both are once-per-agent and an agent now outlives the socket that started it — a
+     browser that reloads asks them again, and a second `session/new` reaching the agent is
+     precisely the bug that resuming exists to fix.
+  4. Adding the configured MCP servers to `session/new`, `session/load`, `session/fork` and
+     `session/resume`. The browser is the ACP client, so this is nominally its field to fill — but
+     the servers are configured in `mjx.toml`, their paths resolve against it, and their credentials
+     must not travel to a browser to be sent straight back. Merge, never replace.
+  5. Answering `mcp/*` for a server configured `transport = "acp"`, because a browser cannot spawn
+     an MCP server any more than it can open a PTY. **Conditional**, unlike (2): with nothing
+     configured these are forwarded, so an agent that reaches for MCP-over-ACP uninvited meets a
+     client that does not implement it rather than a server pretending to. That is why
+     `method::is_mcp_over_acp` is separate from `is_server_provided_capability`.
 - **`_mjx/*` is ours, and never reaches an agent.** It carries what ACP has no vocabulary for
   because it only arises when the client is remote. Defined once in `mjx-acp-core::ext`.
 - **One request kind is thread state: an elicitation.** Everything else the agent

@@ -53,6 +53,16 @@ lifecycle: listing an agent's conversations, loading one, and forking, closing a
 3. Fold it in **both** thread models and update both fixture tests.
 4. Render it. An update the server understands and the UI drops is not done.
 
+Not everything the protocol adds is a `session/update`. A capability the *server*
+provides on the browser's behalf — `fs/*`, `terminal/*`, `mcp/*` — has no fixture to record: it is
+answered in `crates/mjx-acp-server`, proved in `crates/mjx-acp-server/tests/relay.rs` against the
+mock agent, and its reason goes in AGENTS.md's list of interceptions. Keeping the proof out of
+`session/update` is deliberate — the mock reports what it was handed in the response's `_meta`, so
+the parity fixture never has to be re-recorded for it.
+
+`mjx-mock-agent --mcp` is a scripted **MCP** server, for the MCP-over-ACP path. It writes its wire
+JSON by hand for the same reason the ACP script does.
+
 ## Required checks (must be green before every commit)
 
 ```sh

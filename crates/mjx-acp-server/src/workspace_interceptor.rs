@@ -1,8 +1,10 @@
 //! Answers the client methods the browser cannot.
 //!
 //! The browser is the ACP client, but the workspace is on the server, so
-//! `fs/*` and `terminal/*` are handled here and never forwarded. Two
-//! consequences follow, and both are handled below:
+//! `fs/*` and `terminal/*` are handled here and never forwarded. `mcp/*` joins
+//! them when an `acp`-transport server is configured, for the same reason: a
+//! browser cannot spawn an MCP server either. Two consequences follow, and both
+//! are handled below:
 //!
 //! * The browser's `initialize` has to be rewritten to declare capabilities it
 //!   does not itself implement, or the agent would never call them.
@@ -17,25 +19,37 @@ use mjx_acp_core::{Frame, JsonRpcError, RequestId, acp, ext, method};
 use mjx_workspace::{Workspace, WorkspaceError, WorkspaceEvent};
 use serde_json::json;
 
+use crate::config::McpServerConfig;
+use crate::mcp_host::McpHost;
 use crate::relay::{Disposition, Interceptor, Outbox};
 
-/// Serves the filesystem and terminal capabilities for one connection.
+/// Serves the filesystem, terminal and MCP capabilities for one connection.
 pub struct WorkspaceInterceptor {
     workspace: Arc<Workspace>,
     /// Taken by [`Interceptor::start`], which turns workspace events into
     /// `_mjx/*` notifications.
     events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<WorkspaceEvent>>>,
+    /// The MCP servers held here rather than by the agent. Idle unless something
+    /// in `mjx.toml` asked for it.
+    mcp: Arc<McpHost>,
 }
 
 impl WorkspaceInterceptor {
     /// Builds an interceptor over `roots`, with `cwd` as the default working
-    /// directory for terminals.
-    pub fn new(roots: Vec<PathBuf>, cwd: PathBuf) -> Self {
+    /// directory for terminals and for any MCP server hosted here.
+    pub fn new(roots: Vec<PathBuf>, cwd: PathBuf, mcp_servers: &[McpServerConfig]) -> Self {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
-            workspace: Arc::new(Workspace::new(roots, cwd, tx)),
+            workspace: Arc::new(Workspace::new(roots, cwd.clone(), tx)),
             events: std::sync::Mutex::new(Some(rx)),
+            mcp: Arc::new(McpHost::new(mcp_servers, cwd)),
         }
+    }
+
+    /// Whether this frame is MCP-over-ACP traffic we have undertaken to answer.
+    fn is_ours(&self, method: &str) -> bool {
+        method::is_server_provided_capability(method)
+            || (method::is_mcp_over_acp(method) && self.mcp.is_configured())
     }
 }
 
@@ -62,10 +76,31 @@ impl Interceptor for WorkspaceInterceptor {
     }
 
     fn on_agent_frame(&self, frame: &Frame, outbox: &Outbox) -> Disposition {
+        match frame {
+            // A one-way MCP message. There is nothing to answer, so it is
+            // delivered here and goes no further: the browser has no MCP server
+            // to give it to.
+            Frame::Notification { method, params } if self.is_ours(method) => {
+                let params: serde_json::Value = params
+                    .as_deref()
+                    .and_then(|params| serde_json::from_str(params.get()).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                self.mcp.notify(&params);
+                return Disposition::Intercept;
+            }
+            // The agent answering something this server asked *it* — an MCP
+            // server's own request, forwarded on. The browser never saw the
+            // question and must not see the answer.
+            Frame::Response { id, payload } if self.mcp.claim_response(id, payload) => {
+                return Disposition::Intercept;
+            }
+            _ => {}
+        }
+
         let Frame::Request { id, method, .. } = frame else {
             return Disposition::Forward;
         };
-        if !method::is_server_provided_capability(method) {
+        if !self.is_ours(method) {
             return Disposition::Forward;
         }
 
@@ -73,6 +108,7 @@ impl Interceptor for WorkspaceInterceptor {
         // long as the command runs, and the relay must keep pumping frames
         // meanwhile — not least so the agent can be cancelled.
         let workspace = self.workspace.clone();
+        let mcp = self.mcp.clone();
         let outbox = outbox.clone();
         let id = id.clone();
         let method = method.clone();
@@ -84,9 +120,10 @@ impl Interceptor for WorkspaceInterceptor {
                 method: method.clone(),
                 params,
             };
-            let reply = match handle(&workspace, &method, &frame).await {
-                Ok(result) => Frame::result(id, &result)
-                    .unwrap_or_else(|err| Frame::error(RequestId::Null, JsonRpcError::internal(err))),
+            let reply = match run(&workspace, &mcp, &method, &frame, &outbox).await {
+                Ok(result) => Frame::result(id, &result).unwrap_or_else(|err| {
+                    Frame::error(RequestId::Null, JsonRpcError::internal(err))
+                }),
                 Err(error) => {
                     tracing::debug!(%method, error = %error.message, "refused a client request");
                     Frame::error(id, error)
@@ -102,7 +139,32 @@ impl Interceptor for WorkspaceInterceptor {
         // Redundant with `Workspace`'s own Drop, but the interceptor may outlive
         // the connection by a moment and a stray build should not.
         self.workspace.release_all_terminals();
+
+        // An MCP server outliving the agent that asked for it would be a leaked
+        // subprocess holding whatever it holds. Spawned rather than awaited
+        // because `stop` cannot block: it is called from the relay's shutdown
+        // path, which the reaper drives.
+        let mcp = self.mcp.clone();
+        tokio::spawn(async move { mcp.shutdown_all().await });
     }
+}
+
+/// Runs one client request against whichever of the two owns it.
+async fn run(
+    workspace: &Workspace,
+    mcp: &Arc<McpHost>,
+    method: &str,
+    frame: &Frame,
+    outbox: &Outbox,
+) -> Result<serde_json::Value, JsonRpcError> {
+    if method::is_mcp_over_acp(method) {
+        let params: serde_json::Value = frame
+            .params()
+            .and_then(|params| serde_json::from_str(params.get()).ok())
+            .unwrap_or(serde_json::Value::Null);
+        return mcp.handle(method, &params, outbox).await;
+    }
+    handle(workspace, method, frame).await
 }
 
 /// Runs one client request against the workspace.
@@ -438,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_the_server_provided_methods_are_intercepted() {
-        let interceptor = WorkspaceInterceptor::new(vec![], PathBuf::from("/tmp"));
+        let interceptor = WorkspaceInterceptor::new(vec![], PathBuf::from("/tmp"), &[]);
         let (outbox, _rx) = crate::relay::Outbox::for_test();
 
         // These the browser cannot do; they must be intercepted.
@@ -480,8 +542,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_is_only_ours_when_something_is_configured_to_be_hosted_here() {
+        let (outbox, _rx) = crate::relay::Outbox::for_test();
+        let mcp_methods = [
+            method::client::MCP_CONNECT,
+            method::client::MCP_DISCONNECT,
+            method::client::MCP_MESSAGE,
+        ];
+
+        // Nothing configured: forwarded, exactly as before this existed. An agent
+        // reaching for MCP-over-ACP uninvited should meet a client that does not
+        // implement it, not a server pretending to.
+        let bare = WorkspaceInterceptor::new(vec![], PathBuf::from("/tmp"), &[]);
+        for method in mcp_methods {
+            let frame = request(method, json!({}));
+            assert!(
+                matches!(bare.on_agent_frame(&frame, &outbox), Disposition::Forward),
+                "{method} must be forwarded when nothing is hosted here"
+            );
+        }
+
+        let hosted = WorkspaceInterceptor::new(
+            vec![],
+            PathBuf::from("/tmp"),
+            &[crate::config::McpServerConfig {
+                name: "private".into(),
+                kind: crate::config::McpServerKind::Acp(crate::config::McpLaunch {
+                    command: "/bin/true".into(),
+                    args: vec![],
+                    env: vec![],
+                }),
+                unavailable: None,
+            }],
+        );
+        for method in mcp_methods {
+            let frame = request(method, json!({ "serverId": "private" }));
+            assert!(
+                matches!(
+                    hosted.on_agent_frame(&frame, &outbox),
+                    Disposition::Intercept
+                ),
+                "{method} must be answered here when a server is hosted"
+            );
+        }
+
+        // A one-way MCP message has nothing to answer, and the browser has no
+        // MCP server to give it to — so it stops here rather than being
+        // forwarded to something that would ignore it.
+        let note = Frame::notification(
+            method::client::MCP_MESSAGE,
+            &json!({ "connectionId": "mcp-1", "method": "notifications/cancelled" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            hosted.on_agent_frame(&note, &outbox),
+            Disposition::Intercept
+        ));
+        assert!(matches!(
+            bare.on_agent_frame(&note, &outbox),
+            Disposition::Forward
+        ));
+    }
+
+    #[tokio::test]
     async fn initialize_is_rewritten_to_declare_what_the_server_provides() {
-        let interceptor = WorkspaceInterceptor::new(vec![], PathBuf::from("/tmp"));
+        let interceptor = WorkspaceInterceptor::new(vec![], PathBuf::from("/tmp"), &[]);
         let (outbox, _rx) = crate::relay::Outbox::for_test();
 
         let frame = request(

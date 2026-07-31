@@ -91,12 +91,16 @@ struct ServerOptions {
     /// `[server] resume_ttl_secs`. Long by default, so a test that is not about
     /// reaping never races the reaper.
     resume_ttl_secs: u64,
+    /// Appended to the generated `mjx.toml` verbatim, for a test that needs a
+    /// section this harness does not otherwise write.
+    extra_config: String,
 }
 
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
             resume_ttl_secs: 300,
+            extra_config: String::new(),
         }
     }
 }
@@ -150,9 +154,12 @@ impl Server {
                 id = "mock"
                 name = "Mock Agent"
                 command = "{}"
+
+                {}
                 "#,
                 options.resume_ttl_secs,
                 mock_agent_binary().display(),
+                options.extra_config,
             ),
         )
         .unwrap();
@@ -250,6 +257,9 @@ struct Client {
     ext_notifications: Vec<(String, Value)>,
     /// Client methods the agent called on us.
     client_requests: Vec<String>,
+    /// Every line this client was sent, verbatim. Kept so a test can assert
+    /// something never reached the browser at all, which no parsed view can.
+    received: Vec<String>,
 }
 
 impl Client {
@@ -263,6 +273,7 @@ impl Client {
             updates: Vec::new(),
             ext_notifications: Vec::new(),
             client_requests: Vec::new(),
+            received: Vec::new(),
         }
     }
 
@@ -281,6 +292,7 @@ impl Client {
                 .expect("the socket closed mid-turn")
                 .expect("the socket errored");
             if let Message::Text(text) = message {
+                self.received.push(text.to_string());
                 return Frame::parse(&text)
                     .unwrap_or_else(|e| panic!("server sent a bad frame: {e}\n{text}"));
             }
@@ -1362,7 +1374,11 @@ async fn an_abandoned_connection_is_reaped_and_its_agent_killed() {
     // An agent that outlives its socket has to be ended by something. An
     // orphan holding a subprocess and a PTY forever is worse than losing the
     // session it was keeping.
-    let server = Server::start_with(ServerOptions { resume_ttl_secs: 3 }).await;
+    let server = Server::start_with(ServerOptions {
+        resume_ttl_secs: 3,
+        ..Default::default()
+    })
+    .await;
 
     let mut client = Client::connect(&server.ws("agent=mock")).await;
     open_session(&mut client).await;
@@ -1608,6 +1624,397 @@ async fn a_deleted_session_leaves_neither_a_listing_nor_a_thread() {
         .request(ext::SESSION_REPLAY, json!({ "sessionId": session_id }))
         .await;
     assert!(thread.is_null(), "{thread:#}");
+
+    server.stop().await;
+}
+
+/// A token that must never appear on the browser's socket.
+///
+/// The passthrough hands the agent credentials the browser has no business
+/// seeing: the server injects them on the way past, so a value only ever travels
+/// server → agent.
+const MCP_ENV_VALUE: &str = "sh-hh-only-the-agent-sees-this";
+
+/// Servers of every transport, for the tests below.
+///
+/// `feed` is an SSE server and the mock agent declares `sse: false`, so it is
+/// the one that must be dropped — a configuration that is passed through whole
+/// would look identical without it.
+fn configured_mcp_servers() -> String {
+    format!(
+        r#"
+        [[mcp_servers]]
+        name = "git"
+        command = "npx"
+        args = ["-y", "@modelcontextprotocol/server-git"]
+        env = {{ TOKEN = "{MCP_ENV_VALUE}" }}
+
+        [[mcp_servers]]
+        name = "docs"
+        transport = "http"
+        url = "https://example.test/mcp"
+        headers = {{ Authorization = "Bearer {MCP_ENV_VALUE}" }}
+
+        [[mcp_servers]]
+        name = "feed"
+        transport = "sse"
+        url = "https://example.test/sse"
+        "#
+    )
+}
+
+/// What the agent says it was opened with: name → transport.
+fn offered_mcp_servers(response: &Value) -> Vec<(String, String)> {
+    response["_meta"]["mjx.mcpServers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the agent reported no MCP servers at all: {response:#}"))
+        .iter()
+        .map(|server| {
+            (
+                server["name"].as_str().unwrap_or_default().to_string(),
+                server["transport"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_configured_mcp_servers_reach_the_agent_and_their_secrets_do_not_reach_the_browser() {
+    // The point of the feature: an agent behind this transport has the tools it
+    // would have in an editor, without the browser — which is the ACP client and
+    // would normally send `mcpServers` — having to know any of them.
+    let server = Server::start_with(ServerOptions {
+        extra_config: configured_mcp_servers(),
+        ..Default::default()
+    })
+    .await;
+
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    let info = handshake(&mut client).await;
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            // Empty, exactly as the browser sends it.
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+
+    let offered = offered_mcp_servers(&session);
+    assert_eq!(
+        offered,
+        [
+            ("git".to_string(), "stdio".to_string()),
+            ("docs".to_string(), "http".to_string()),
+        ],
+        "`feed` is SSE and this agent declared `sse: false`, so it must be dropped"
+    );
+
+    // Nothing the browser was sent carries the credential. Checked over the raw
+    // lines rather than a parsed view, because a leak would be in whatever shape
+    // we failed to anticipate.
+    let leaked: Vec<&String> = client
+        .received
+        .iter()
+        .filter(|line| line.contains(MCP_ENV_VALUE))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "a credential reached the browser: {leaked:#?}"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn every_way_of_opening_a_session_carries_the_configured_servers() {
+    // `mcpServers` is on all four session-opening methods and documented as the
+    // complete resulting list. The browser sends it on `session/new` and
+    // `session/load` only — so a fork or a resume that was not rewritten would
+    // silently leave that conversation with no tools at all.
+    let server = Server::start_with(ServerOptions {
+        extra_config: configured_mcp_servers(),
+        ..Default::default()
+    })
+    .await;
+
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    let info = handshake(&mut client).await;
+    let cwd = info["cwd"].clone();
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": cwd, "mcpServers": [] }),
+        )
+        .await;
+    let session_id = session["sessionId"].as_str().unwrap().to_string();
+
+    let expected = offered_mcp_servers(&session);
+    assert_eq!(expected.len(), 2, "{session:#}");
+
+    // A load and a fork as the browser sends them, with the key present but
+    // empty; a resume as it sends that, with the key absent entirely.
+    for (method, params) in [
+        (
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+        ),
+        (
+            method::agent::SESSION_FORK,
+            json!({ "sessionId": session_id, "cwd": cwd }),
+        ),
+        (
+            method::agent::SESSION_RESUME,
+            json!({ "sessionId": session_id, "cwd": cwd }),
+        ),
+    ] {
+        let response = client.request(method, params).await;
+        assert_eq!(
+            offered_mcp_servers(&response),
+            expected,
+            "{method} arrived without the configured servers"
+        );
+    }
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_server_the_client_declared_itself_is_not_offered_twice() {
+    // The merge is by name, so a client that configures its own `git` keeps its
+    // own — and the agent is never handed two servers with one name, which no
+    // MCP host can make sense of.
+    let server = Server::start_with(ServerOptions {
+        extra_config: configured_mcp_servers(),
+        ..Default::default()
+    })
+    .await;
+
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    let info = handshake(&mut client).await;
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            json!({
+                "cwd": info["cwd"],
+                "mcpServers": [
+                    { "name": "git", "command": "/usr/bin/its-own-git", "args": [], "env": [] }
+                ],
+            }),
+        )
+        .await;
+
+    let offered = offered_mcp_servers(&session);
+    assert_eq!(
+        offered,
+        [
+            ("git".to_string(), "stdio".to_string()),
+            ("docs".to_string(), "http".to_string()),
+        ],
+        "the client's own `git` should have been left alone, not doubled"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_reattached_browser_still_reaches_the_configured_servers() {
+    // A reattachment's first `session/new` is answered from the recording and so
+    // is never rewritten — right, because the agent still running was given
+    // these servers when the first browser opened it. Its `session/load` does
+    // reach the agent, and has to carry them.
+    let server = Server::start_with(ServerOptions {
+        extra_config: configured_mcp_servers(),
+        ..Default::default()
+    })
+    .await;
+
+    let mut first = Client::connect(&server.ws("agent=mock")).await;
+    let (connection_id, session_id) = open_session(&mut first).await;
+    drop(first);
+
+    let mut second =
+        Client::connect(&server.ws(&format!("agent=mock&resume={connection_id}"))).await;
+    let info = handshake(&mut second).await;
+    assert_eq!(info["resumed"], true);
+    second
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+
+    let loaded = second
+        .request(
+            method::agent::SESSION_LOAD,
+            json!({ "sessionId": session_id, "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    assert_eq!(offered_mcp_servers(&loaded).len(), 2, "{loaded:#}");
+
+    server.stop().await;
+}
+
+/// A credential only the server and the MCP child it spawns ever see.
+const HOSTED_MCP_TOKEN: &str = "hosted-token-the-agent-never-learns";
+
+/// An `acp`-transport server: the mock agent binary, in its MCP mode.
+fn hosted_mcp_server() -> String {
+    format!(
+        r#"
+        [[mcp_servers]]
+        name = "private"
+        transport = "acp"
+        command = "{}"
+        args = ["--mcp"]
+        env = {{ MJX_MOCK_MCP_TOKEN = "{HOSTED_MCP_TOKEN}" }}
+        "#,
+        mock_agent_binary().display(),
+    )
+}
+
+#[tokio::test]
+async fn a_tool_from_a_server_this_process_holds_reaches_the_agent() {
+    // MCP-over-ACP end to end: the server spawns the MCP child and holds it, the
+    // agent reaches it entirely through `mcp/connect` and `mcp/message`, and the
+    // credential the child needs never leaves this process.
+    let server = Server::start_with(ServerOptions {
+        extra_config: hosted_mcp_server(),
+        ..Default::default()
+    })
+    .await;
+
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    let info = handshake(&mut client).await;
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+
+    // Offered as `acp`, by name — never as a command.
+    assert_eq!(
+        offered_mcp_servers(&session),
+        [("private".to_string(), "acp".to_string())],
+        "{session:#}"
+    );
+
+    let report = &session["_meta"]["mjx.mcp"];
+    assert!(
+        report["error"].is_null(),
+        "the agent could not use the hosted server: {report:#}"
+    );
+    assert_eq!(report["serverId"], "private");
+    assert_eq!(report["initialize"]["serverInfo"]["name"], "mjx-mock-mcp");
+    // The return path: the MCP server asked *its* client for the roots, the
+    // server put that to the agent as an `mcp/message` request with an id no
+    // browser is waiting on, and the answer found its way back. Asked
+    // mid-handshake, so this is a fact rather than a race.
+    assert_eq!(
+        report["initialize"]["_meta"]["mjx.rootsAnswered"], true,
+        "a request from the hosted server never got an answer: {report:#}"
+    );
+    assert_eq!(report["tools"]["tools"][0]["name"], "mock_stat");
+
+    // The tool really ran, in the child, with the credential this process gave
+    // it — which is the whole claim of the transport.
+    let text = report["called"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the tool call answered nothing readable: {report:#}"));
+    assert!(text.contains("credential present: true"), "{text}");
+    // And letting go worked, so the child is not left behind for the life of the
+    // connection.
+    assert_eq!(report["disconnected"], true, "{report:#}");
+
+    // What the *agent* was handed: a name and an id, and nothing it could run.
+    // The whole purpose of the transport is that the command and its environment
+    // stay here, and the receiving end is the only place that can say they did.
+    let fields = session["_meta"]["mjx.mcpServers"][0]["fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the agent did not report what it was handed: {session:#}"));
+    let fields: Vec<&str> = fields.iter().filter_map(|f| f.as_str()).collect();
+    assert_eq!(
+        fields,
+        ["name", "serverId", "type"],
+        "the agent was handed more than an id"
+    );
+
+    // The browser is shown the command — that is what the sidebar is for — but
+    // never the credential, which is the one value that must not travel.
+    let leaked: Vec<&String> = client
+        .received
+        .iter()
+        .filter(|line| line.contains(HOSTED_MCP_TOKEN))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "a credential reached the browser: {leaked:#?}"
+    );
+
+    // What the server said unprompted got through too: `mcp/message` carries a
+    // server-initiated notification the other way, and nothing else would have
+    // told the agent its tool list had changed.
+    let seen = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let loaded = client
+                .request(
+                    method::agent::SESSION_LOAD,
+                    json!({
+                        "sessionId": session["sessionId"],
+                        "cwd": info["cwd"],
+                        "mcpServers": []
+                    }),
+                )
+                .await;
+            // Read from a later request on purpose: the notification races the
+            // response to the call that triggered it, and the point is only that
+            // it arrives at all.
+            let _ = loaded;
+            let session = client
+                .request(
+                    method::agent::SESSION_NEW,
+                    json!({ "cwd": info["cwd"], "mcpServers": [] }),
+                )
+                .await;
+            if session["_meta"]["mjx.mcp"]["notifications"]
+                .as_i64()
+                .unwrap_or(0)
+                > 0
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        seen.is_ok(),
+        "the agent was never told what the MCP server said unprompted"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_over_acp_is_forwarded_when_nothing_is_hosted_here() {
+    // With no `acp` server configured the server must not answer `mcp/*` at all.
+    // An agent that asked anyway is talking to a browser that does not implement
+    // it, and gets `method not found` — which is the truth, and is what makes
+    // the capability gating above meaningful rather than decorative.
+    let server = Server::start().await;
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+    let (_, _) = open_session(&mut client).await;
+
+    // Nothing was offered over ACP, so the agent never tried: the proof is that
+    // the client was asked no `mcp/*` question and the session opened cleanly.
+    assert!(
+        !client
+            .client_requests
+            .iter()
+            .any(|method| method.starts_with("mcp/")),
+        "the agent asked for MCP over ACP uninvited: {:?}",
+        client.client_requests
+    );
 
     server.stop().await;
 }

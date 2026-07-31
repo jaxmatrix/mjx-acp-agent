@@ -19,11 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use mjx_acp_core::{Frame, JsonRpcError, RequestId, ResponsePayload, method};
+use mjx_acp_core::{Frame, JsonRpcError, RequestId, ResponsePayload, acp, method};
 use serde_json::{Value, json, value::RawValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
+mod mcp;
 mod script;
 
 /// Wall-clock pacing. Tests set `MJX_MOCK_SPEED=0` to run the script instantly;
@@ -67,6 +68,12 @@ pub struct Agent {
     elicitation_form: AtomicBool,
     /// Whether the client said it can send the user to a URL.
     elicitation_url: AtomicBool,
+    /// How many `mcp/message` notifications the client has sent us.
+    ///
+    /// A hosted MCP server speaks unprompted — `notifications/tools/list_changed`
+    /// after its handshake — and the only proof that reached the agent is that
+    /// something here counted it.
+    mcp_notifications: AtomicI64,
     /// Every conversation this agent has, so it can list one and load it back.
     ///
     /// A `std::sync::Mutex` rather than tokio's, because [`Agent::update`] is
@@ -304,6 +311,92 @@ impl Agent {
         listed
     }
 
+    /// Connects to a server the *client* is holding, and reports what it found.
+    ///
+    /// This is the agent half of MCP-over-ACP: connect by the id we were offered,
+    /// run the MCP handshake, list the tools and call one — every message wrapped
+    /// in `mcp/message` and carried by whoever is holding the server. `None` when
+    /// no server was offered that way, which is the ordinary case.
+    ///
+    /// Failures are reported rather than raised: a test looking at this wants to
+    /// read what went wrong, not watch `session/new` fail with no detail.
+    async fn use_hosted_mcp(&self, meta: &Value) -> Option<Value> {
+        let server_id = meta["mjx.mcpServers"]
+            .as_array()?
+            .iter()
+            .find(|server| server["transport"] == "acp")?["serverId"]
+            .as_str()?
+            .to_string();
+
+        let connected = match self
+            .request(
+                method::client::MCP_CONNECT,
+                json!({ "serverId": server_id }),
+            )
+            .await
+        {
+            Ok(result) => serde_json::from_str::<Value>(result.get()).unwrap_or(Value::Null),
+            Err(error) => return Some(json!({ "error": error.message })),
+        };
+        let Some(connection_id) = connected["connectionId"].as_str().map(str::to_owned) else {
+            return Some(json!({ "error": "mcp/connect answered without a connectionId" }));
+        };
+
+        let mut report = json!({ "serverId": server_id, "connectionId": connection_id });
+
+        // The MCP handshake, and then the two calls that prove a tool is really
+        // reachable: what is offered, and what happens when it is used.
+        for (key, method, params) in [
+            (
+                "initialize",
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "mjx-mock-agent", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            ),
+            ("tools", "tools/list", json!({})),
+            (
+                "called",
+                "tools/call",
+                json!({ "name": "mock_stat", "arguments": { "path": "." } }),
+            ),
+        ] {
+            let message = json!({
+                "connectionId": connection_id,
+                "method": method,
+                "params": params
+            });
+            match self.request(method::client::MCP_MESSAGE, message).await {
+                Ok(result) => {
+                    report[key] = serde_json::from_str(result.get()).unwrap_or(Value::Null);
+                }
+                Err(error) => {
+                    report[key] = json!({ "error": error.message });
+                    return Some(report);
+                }
+            }
+        }
+
+        // Read before letting go, so anything the server said unprompted during
+        // the exchange above has had its chance to arrive.
+        report["notifications"] = self.mcp_notifications.load(Ordering::Relaxed).into();
+
+        // Done with it. A real agent would hold the connection for the session;
+        // this one lets go immediately, so a client that leaks the child it
+        // spawned has somewhere to be caught.
+        report["disconnected"] = self
+            .request(
+                method::client::MCP_DISCONNECT,
+                json!({ "connectionId": connection_id }),
+            )
+            .await
+            .is_ok()
+            .into();
+        Some(report)
+    }
+
     async fn resolve(&self, id: &RequestId, reply: Reply) {
         if let Some(tx) = self.pending.lock().await.remove(id) {
             let _ = tx.send(reply);
@@ -324,6 +417,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // The same binary answers two protocols, so the tests need only one thing
+    // built: `--mcp` makes it an MCP server rather than an ACP agent.
+    if std::env::args().any(|arg| arg == "--mcp") {
+        return mcp::serve().await;
+    }
+
     let (outbox, mut outbox_rx) = mpsc::unbounded_channel::<Frame>();
     let agent = Arc::new(Agent {
         outbox,
@@ -333,6 +432,7 @@ async fn main() -> Result<()> {
         config: Mutex::new(HashMap::new()),
         elicitation_form: AtomicBool::new(false),
         elicitation_url: AtomicBool::new(false),
+        mcp_notifications: AtomicI64::new(0),
         sessions: std::sync::Mutex::new(HashMap::new()),
     });
     seed_yesterdays_conversation(&agent).await;
@@ -377,6 +477,13 @@ async fn dispatch(agent: Arc<Agent>, frame: Frame) {
             agent.resolve(&id, reply).await;
         }
         Frame::Notification { method, params } => {
+            // A hosted MCP server talking to us unprompted, carried over ACP.
+            // Counted rather than acted on: this agent has no use for a tool
+            // list that changed, but a test needs to know it arrived.
+            if method == method::agent::MCP_MESSAGE {
+                agent.mcp_notifications.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if method == method::agent::SESSION_CANCEL {
                 let session_id = params
                     .as_deref()
@@ -440,7 +547,12 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                     // would quietly offer none of this.
                     "sessionCapabilities": {
                         "list": {}, "delete": {}, "fork": {}, "resume": {}, "close": {}
-                    }
+                    },
+                    // Plain booleans, unlike `sessionCapabilities` above: in this
+                    // version of the schema `McpCapabilities` is three `bool`s.
+                    // `sse` is false on purpose, so a client that ignores what
+                    // was declared here can be caught doing it.
+                    "mcpCapabilities": { "http": true, "sse": false, "acp": true }
                 },
                 // No auth methods: this agent is the whole point of "works out
                 // of the box".
@@ -456,10 +568,19 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                 .await
                 .insert(session_id.clone(), default_config_values());
             agent.open_session(&session_id, cwd_of(&params).as_str(), None, &[]);
+            let mut meta = mcp_servers_meta(&params)?;
+            // A server offered over ACP is one the *client* is holding, so using
+            // it is the only way to find out whether it works. A real agent would
+            // do this to get its tools; this one does it so a test can see that
+            // the whole path carries them.
+            if let Some(report) = agent.use_hosted_mcp(&meta).await {
+                meta["mjx.mcp"] = report;
+            }
             Ok(json!({
                 "sessionId": session_id,
                 "modes": modes(),
-                "configOptions": config_options(&default_config_values())
+                "configOptions": config_options(&default_config_values()),
+                "_meta": meta
             }))
         }
 
@@ -494,7 +615,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
 
             Ok(json!({
                 "modes": modes(),
-                "configOptions": agent.config_options(&session_id).await
+                "configOptions": agent.config_options(&session_id).await,
+                "_meta": mcp_servers_meta(&params)?
             }))
         }
 
@@ -510,7 +632,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             // from a load.
             Ok(json!({
                 "modes": modes(),
-                "configOptions": agent.config_options(&session_id).await
+                "configOptions": agent.config_options(&session_id).await,
+                "_meta": mcp_servers_meta(&params)?
             }))
         }
 
@@ -558,7 +681,8 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             Ok(json!({
                 "sessionId": fork_id,
                 "modes": modes(),
-                "configOptions": config_options(&values)
+                "configOptions": config_options(&values),
+                "_meta": mcp_servers_meta(&params)?
             }))
         }
 
@@ -623,11 +747,96 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
 
         m::AUTHENTICATE => Ok(json!({})),
 
+        // The other direction of MCP-over-ACP: a server the client is holding has
+        // something to ask, and this agent is its MCP client. Answered as an MCP
+        // client answers — the response is the bare inner result, with no
+        // envelope, because `MessageMcpResponse` is transparent.
+        m::MCP_MESSAGE => match params["method"].as_str() {
+            Some("roots/list") => Ok(json!({ "roots": [] })),
+            Some(other) => Err(JsonRpcError::method_not_found(other)),
+            None => Err(JsonRpcError::invalid_params("`method` is required")),
+        },
+
         other => Err(JsonRpcError::method_not_found(other)),
     }
 }
 
 /// The `sessionId` a lifecycle request names.
+/// What this agent was told it can reach, echoed back for the tests.
+///
+/// A real agent would connect to these. This one reports them, in `_meta` rather
+/// than in a `session/update`, so proving the passthrough works costs no change
+/// to the recorded thread fixture.
+///
+/// Deserialized as `Vec<acp::McpServer>` rather than through
+/// `NewSessionRequest`: the request type deserializes `mcpServers` with
+/// `VecSkipError`, so an entry whose shape we got wrong would silently vanish
+/// and a test that only checked the parse succeeded would pass on nothing. The
+/// count is checked too, for the same reason.
+fn mcp_servers_meta(params: &Value) -> Result<Value, JsonRpcError> {
+    let entries = match &params["mcpServers"] {
+        // Absent is legal on a fork and a resume, and means no servers.
+        Value::Null => Vec::new(),
+        Value::Array(entries) => entries.clone(),
+        other => {
+            return Err(JsonRpcError::invalid_params(format!(
+                "`mcpServers` must be an array, not {other}"
+            )));
+        }
+    };
+
+    let parsed: Vec<acp::McpServer> = serde_json::from_value(Value::Array(entries.clone()))
+        .map_err(|err| {
+            JsonRpcError::invalid_params(format!("`mcpServers` is not the schema's shape: {err}"))
+        })?;
+    if parsed.len() != entries.len() {
+        return Err(JsonRpcError::invalid_params(format!(
+            "{} of {} MCP servers were dropped while parsing",
+            entries.len() - parsed.len(),
+            entries.len()
+        )));
+    }
+
+    let described: Vec<Value> = parsed
+        .iter()
+        .zip(entries.iter())
+        .map(|(server, raw)| {
+            let mut described = describe(server);
+            // Which keys this agent was actually handed. The point of the `acp`
+            // transport is that a command and its environment are *not* among
+            // them, and only the receiving end can say so.
+            if let Some(object) = raw.as_object() {
+                let mut fields: Vec<String> = object.keys().cloned().collect();
+                fields.sort();
+                described["fields"] = json!(fields);
+            }
+            described
+        })
+        .collect();
+
+    // Names and transports only. A value out of `env` or `headers` echoed here
+    // would travel back to the browser, which is exactly what an `acp`-transport
+    // server exists to prevent.
+    Ok(json!({ "mjx.mcpServers": described }))
+}
+
+/// One offered server, as this agent understood it.
+fn describe(server: &acp::McpServer) -> Value {
+    match server {
+        acp::McpServer::Stdio(stdio) => json!({ "name": stdio.name, "transport": "stdio" }),
+        acp::McpServer::Http(http) => json!({ "name": http.name, "transport": "http" }),
+        acp::McpServer::Sse(sse) => json!({ "name": sse.name, "transport": "sse" }),
+        acp::McpServer::Acp(over_acp) => json!({
+            "name": over_acp.name,
+            "transport": "acp",
+            "serverId": over_acp.server_id.0.as_ref(),
+        }),
+        // The enum is `#[non_exhaustive]`, and a transport we have never heard
+        // of is still worth reporting rather than hiding.
+        _ => json!({ "transport": "unknown" }),
+    }
+}
+
 fn session_id_of(params: &Value) -> Result<String, JsonRpcError> {
     params["sessionId"]
         .as_str()
@@ -963,6 +1172,40 @@ fn short_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mcp_transport_is_understood_and_reported() {
+        let meta = mcp_servers_meta(&json!({
+            "mcpServers": [
+                { "name": "git", "command": "/usr/bin/npx", "args": ["-y", "s"], "env": [] },
+                { "type": "http", "name": "docs", "url": "https://h/mcp", "headers": [] },
+                { "type": "sse", "name": "feed", "url": "https://h/sse", "headers": [] },
+                { "type": "acp", "name": "private", "serverId": "private" },
+            ]
+        }))
+        .unwrap();
+
+        let servers = meta["mjx.mcpServers"].as_array().unwrap();
+        let transports: Vec<&str> = servers
+            .iter()
+            .map(|server| server["transport"].as_str().unwrap())
+            .collect();
+        assert_eq!(transports, ["stdio", "http", "sse", "acp"]);
+        assert_eq!(servers[0]["name"], "git");
+        assert_eq!(servers[3]["serverId"], "private");
+
+        // Absent is legal on a fork or a resume; anything that is not an array
+        // is a client bug worth reporting rather than ignoring.
+        assert!(
+            mcp_servers_meta(&json!({})).unwrap()["mjx.mcpServers"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(mcp_servers_meta(&json!({ "mcpServers": "all" })).is_err());
+        // A stdio entry with no command matches no variant, tagged or untagged.
+        assert!(mcp_servers_meta(&json!({ "mcpServers": [{ "name": "x" }] })).is_err());
+    }
 
     #[test]
     fn timestamps_are_iso_8601_in_utc() {

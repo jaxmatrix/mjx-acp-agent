@@ -1,6 +1,7 @@
 /** The plan, session controls and usage — everything that isn't the timeline. */
 
 import type { SessionStatus } from "../acp/session";
+import { mcpServersOf } from "../acp/mcp";
 import type { AgentInfo, Thread } from "../acp/types";
 import { ConfigOptions } from "./ConfigOptions";
 
@@ -23,6 +24,9 @@ export function Sidebar({
   onSetMode(modeId: string): void;
   onSetConfigOption(configId: string, value: string | boolean): void;
 }) {
+  // Normalized here rather than trusted: `_mjx/agent/info` is cast, not parsed.
+  const mcpServers = mcpServersOf(agentInfo?.mcpServers);
+
   return (
     <aside className="sidebar">
       <section className="sidebar__section">
@@ -41,6 +45,35 @@ export function Sidebar({
           <p className="dim">{status.state === "connecting" ? "Connecting…" : "—"}</p>
         )}
       </section>
+
+      {mcpServers.length > 0 && (
+        <section className="sidebar__section">
+          <h2>MCP servers</h2>
+          <ul className="sidebar__mcp">
+            {mcpServers.map((server) => (
+              <li
+                key={server.name}
+                // Shown rather than hidden when the agent did not get it: a
+                // configured server missing from this list would look like a
+                // typo in the config, and the reason is the useful part.
+                className={server.unavailable ? "sidebar__mcp-item is-unavailable" : "sidebar__mcp-item"}
+              >
+                <span className="sidebar__mcp-name">{server.name}</span>
+                <span className="sidebar__mcp-transport">{server.transport}</span>
+                <code className="sidebar__mcp-target" title={server.target}>
+                  {server.target}
+                </code>
+                {/* Names only. The server never sends the values, so there is
+                    nothing here to leak — see `acp/mcp.ts`. */}
+                {server.secrets.length > 0 && (
+                  <span className="dim">carries {server.secrets.join(", ")}</span>
+                )}
+                {server.unavailable && <span className="dim">not offered: {server.unavailable}</span>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {thread.modes && thread.modes.availableModes.length > 0 && (
         <section className="sidebar__section">

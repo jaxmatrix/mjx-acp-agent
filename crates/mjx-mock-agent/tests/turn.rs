@@ -737,6 +737,15 @@ async fn the_agent_offers_the_session_lifecycle_it_implements() {
         );
     }
 
+    // The MCP transports, which are booleans in this version of the schema and
+    // so are spelled the opposite way round from the objects above. Parsed with
+    // the schema's own type, because getting this wrong means a client offers a
+    // transport the agent cannot use — or offers none at all.
+    let mcp: acp::McpCapabilities = serde_json::from_value(capabilities["mcpCapabilities"].clone())
+        .expect("mcpCapabilities must be the schema's shape");
+    assert!(mcp.http, "http is claimed");
+    assert!(!mcp.sse, "sse is deliberately not, so gating can be seen");
+
     driver.shutdown().await;
 }
 

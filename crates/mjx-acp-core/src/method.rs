@@ -151,6 +151,21 @@ pub fn is_server_provided_capability(method: &str) -> bool {
     )
 }
 
+/// Whether `method` is part of MCP-over-ACP.
+///
+/// Kept apart from [`is_server_provided_capability`] on purpose. `fs/*` and
+/// `terminal/*` are always ours — a browser cannot do them at all — whereas
+/// these are ours only when an `acp`-transport server is configured. With none
+/// configured the relay forwards them, which is what an agent that reached for
+/// MCP-over-ACP uninvited should get: a client that plainly does not implement
+/// it, rather than a server pretending to.
+pub fn is_mcp_over_acp(method: &str) -> bool {
+    matches!(
+        method,
+        client::MCP_CONNECT | client::MCP_DISCONNECT | client::MCP_MESSAGE
+    )
+}
+
 /// Whether `method` is an ACP extension. Extensions are namespaced by a leading
 /// underscore, which is how this project's `_mjx/*` methods coexist with the
 /// protocol.
@@ -197,5 +212,14 @@ mod tests {
         assert!(!is_server_provided_capability("session/request_permission"));
         assert!(!is_server_provided_capability("elicitation/create"));
         assert!(!is_server_provided_capability("session/update"));
+
+        // And these are conditional, so they are not on that list either: the
+        // server answers `mcp/*` only when an `acp`-transport server is
+        // configured, and forwards them otherwise.
+        for method in ["mcp/connect", "mcp/disconnect", "mcp/message"] {
+            assert!(is_mcp_over_acp(method), "{method}");
+            assert!(!is_server_provided_capability(method), "{method}");
+        }
+        assert!(!is_mcp_over_acp("fs/read_text_file"));
     }
 }

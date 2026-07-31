@@ -29,6 +29,8 @@ use serde::{Deserialize, Serialize};
 mod agent_process;
 mod config;
 mod id_bridge;
+mod mcp;
+mod mcp_host;
 mod relay;
 mod sessions;
 mod workspace_interceptor;
@@ -536,9 +538,11 @@ async fn websocket(
                 command: command.display(),
                 cwd: cwd.display().to_string(),
                 connection_id: id.clone(),
-                // Set per attachment by the relay, which is what knows whether
-                // it answered the handshake from a recording.
+                // Both set per attachment by the relay: it is what knows whether
+                // it answered the handshake from a recording, and what the agent
+                // said it could reach.
                 resumed: false,
+                mcp_servers: Vec::new(),
             };
 
             // The jail is the session's cwd plus every configured root, so an
@@ -547,13 +551,14 @@ async fn websocket(
             let interceptor = Arc::new(WorkspaceInterceptor::new(
                 state.config.workspace_roots.clone(),
                 cwd.clone(),
+                &state.config.mcp_servers,
             ));
 
             tracing::info!(connection = %id, agent = %info.agent_id, cwd = %info.cwd, "agent started");
             let pooled = Arc::new(Pooled {
                 agent_id: connect.agent.clone(),
                 cwd: cwd.clone(),
-                connection: relay::start(interceptor, agent, info),
+                connection: relay::start(interceptor, agent, info, state.config.mcp_servers.clone()),
                 idle_since: std::sync::Mutex::new(Some(Instant::now())),
             });
             // With resuming turned off there is nothing to come back to, so the

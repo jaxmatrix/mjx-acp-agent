@@ -46,7 +46,7 @@ Then pick a real agent from the same list.
 
 ## How it works
 
-The server is a **relay with exactly two interception points**. Everything else
+The server is a **relay with exactly four interception points**. Everything else
 passes through untouched — including frames it cannot classify, because a relay
 that only forwards what it understands breaks the day either peer speaks a newer
 protocol version.
@@ -63,6 +63,20 @@ read and written through a jail that canonicalises paths first, so `..` and
 symlinks are resolved before the containment check. Terminals get a real PTY,
 because test runners and build tools change their output when stdout is not a
 TTY, and the point is to show what a terminal would show.
+
+**3. The MCP servers, added on the way to the agent.** `mcpServers` is the ACP
+client's field to fill, and the browser sends it empty — the servers are
+configured in `mjx.toml`, on this side. So the server merges them into
+`session/new`, `session/load`, `session/fork` and `session/resume` as they pass,
+by name, so a client that configures its own keeps it. See
+[Configuration](#mcp-servers).
+
+**4. `mcp/*`, on its way from the agent — when, and only when, something is
+configured `transport = "acp"`.** Then this server spawns the MCP server and
+holds it, and the agent reaches it through `mcp/connect` and `mcp/message`
+without ever being told the command or its environment. With nothing configured
+these are forwarded like everything else, which is honest: the browser does not
+implement them.
 
 That leaves the UI with a blind spot — it never sees the traffic the server
 answered — so every outcome is mirrored back over an `_mjx/*` extension
@@ -130,7 +144,8 @@ drawer is built from what the connected agent said in `initialize` and nothing
 else — every button is one capability, and an agent that lists but cannot fork
 gets no Fork.
 
-The relay forwards all six untouched. There is no fourth interception here: what
+The relay forwards all six untouched. The session lifecycle is not intercepted:
+what
 the server adds is the *fold*, because it keeps a thread per session and a
 `session/load` replays a whole conversation back as `session/update`
 notifications. Those arrive **during** the call, before its response, so both
@@ -226,16 +241,54 @@ id = "kilo"
 name = "Kilo"
 command = "kilo"
 args = ["acp"]
+
+[[mcp_servers]]              # offered to every agent this server starts
+name = "git"
+command = "npx"              # a bare name resolves on PATH; "./x" against this file
+args = ["-y", "@modelcontextprotocol/server-git"]
+env_from = { GITHUB_TOKEN = "GITHUB_MCP_TOKEN" }   # read from the environment
 ```
 
 Configured agents lead the picker, in the order you wrote them.
 
+### MCP servers
+
+The browser is the ACP client, so `mcpServers` is nominally its to fill in — but
+the servers are configured here, their paths resolve against this file, and their
+credentials must not travel to a browser to be sent straight back. So the server
+adds them to `session/new`, `session/load`, `session/fork` and `session/resume`
+on the way past, merging by name so a client that configures its own keeps it.
+
+`transport` is one of:
+
+| `transport` | Who connects to it | Fields |
+|---|---|---|
+| `stdio` (default) | the agent | `command`, `args`, `env`, `env_from` |
+| `http`, `sse` | the agent | `url`, `headers`, `headers_from` |
+| `acp` | **this server** | `command`, `args`, `env`, `env_from` |
+
+Only `stdio` is mandatory for an agent. An `http`, `sse` or `acp` server is
+dropped for an agent that did not declare that transport in `mcpCapabilities`,
+with the reason shown in the sidebar — an agent silently discards `mcpServers`
+entries it does not understand, so nothing else would say so.
+
+`acp` is MCP-over-ACP: this server spawns the MCP server and holds it, and the
+agent reaches it through `mcp/connect` and `mcp/message`. It is offered as a name
+and nothing else, so the command, its environment and therefore its credentials
+never reach the agent — and an agent that could not spawn it (sandboxed, or
+elsewhere) can still use it. Stdio commands only; the streamable-HTTP MCP
+transport is not implemented here.
+
+`env_from` and `headers_from` name an environment variable rather than holding a
+token, so a working configuration can be committed. A variable that is not set
+leaves that server configured but unoffered, with the reason in the sidebar.
+
 ## Development
 
 ```bash
-cargo test   --workspace          # 183 tests
+cargo test   --workspace          # 338 tests
 cargo clippy --workspace --all-targets
-npm --prefix web test             # 60 tests
+npm --prefix web test             # 191 tests
 npm --prefix web run typecheck
 
 npm --prefix web run dev          # hot reload against a `cargo run` server
@@ -268,6 +321,7 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 | `crates/mjx-acp-thread` | The thread model — a GPUI-free port of Zed's `acp_thread` |
 | `crates/mjx-agent-catalog` | ACP registry fetch and agent command resolution |
 | `crates/mjx-workspace` | Filesystem jail and PTY terminal manager |
+| `crates/mjx-mcp` | An MCP server this process holds open, for MCP-over-ACP |
 | `crates/mjx-acp-server` | The relay: static assets, `/api/*`, `/ws`, and the pool of running agents |
 | `crates/mjx-mock-agent` | Scripted credential-free agent, for the demo and the tests |
 | `web/` | The browser client; `web/src/acp/` is protocol-only and React-free |
@@ -304,14 +358,22 @@ browser is strict, and real bugs have only ever shown up in Chromium.
   names, and there is no editor here to open it in.
 - **A mention is always a `resource_link`, never embedded content**, even when
   the agent advertises `embeddedContext`. The browser cannot read a file to
-  embed it; the server could, but that would be a fourth interception and it
-  needs its own reason written down.
+  embed it; the server could, but that would be another interception and it needs
+  its own reason written down.
 - **The composer shows the raw `[@name](uri)` while you type.** The text is the
   model, the way Zed's is; the sent message shows a chip.
 - **The file picker is not `.gitignore`-aware** and is capped at 500 entries. A
   `.env` under a workspace root is offered by name. See
   [SECURITY.md](SECURITY.md).
-- **No MCP passthrough** yet.
+- **MCP-over-ACP hosts stdio servers only.** An `acp`-transport entry runs a
+  command; the streamable-HTTP MCP transport is a subsystem of its own.
+- **MCP servers cannot be chosen per session** from the UI. The list is per
+  connection, from `mjx.toml`, which is read at startup — changing it needs a
+  restart.
+- **`mcp/*` is forwarded when nothing is configured to be hosted here.** An agent
+  that reaches for MCP-over-ACP uninvited is talking to a browser that does not
+  implement it, and gets `method not found`. That is the truth: pretending
+  otherwise would leave the agent's request parked forever on the re-ask list.
 - **No authentication.** See below.
 
 ## Security

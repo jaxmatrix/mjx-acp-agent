@@ -39,6 +39,32 @@ description = "The open source coding agent."
 command = "kilo"
 args = ["acp"]
 
+# MCP servers offered to every agent this server starts. `transport` is one of
+# stdio (the default), http, sse or acp. Only stdio is mandatory for agents; the
+# rest are dropped, with a reason in the sidebar, for an agent that did not
+# declare them.
+#
+# The one below is `acp`: *this server* runs it and the agent reaches it over ACP,
+# so its command and environment — and therefore any credential in them — never
+# reach the agent. It is the mock agent in its MCP mode, so the demo has an MCP
+# server to show with nothing installed.
+[[mcp_servers]]
+name = "mock-mcp"
+transport = "acp"
+command = "target/debug/mjx-mock-agent"
+args = ["--mcp"]
+env = { MJX_MOCK_MCP_TOKEN = "not-a-real-token" }
+
+# A server the *agent* spawns, with its token read from this server's environment
+# rather than written here. An `env_from`/`headers_from` variable that is not set
+# leaves the server configured but unavailable, and the sidebar says which one.
+#
+# [[mcp_servers]]
+# name = "github"
+# transport = "http"
+# url = "https://api.githubcopilot.com/mcp/"
+# headers_from = { Authorization = "GITHUB_MCP_TOKEN" }
+
 # claude-acp, gemini and codex-acp resolve from the registry:
 #
 #   claude-acp  npx -y @agentclientprotocol/claude-agent-acp@<pinned>

@@ -67,6 +67,39 @@ pub struct AgentInfo {
     /// handshake was answered from what the agent said the first time round.
     /// The browser reads it to decide whether to ask for a replay.
     pub resumed: bool,
+    /// The MCP servers configured for this agent, and whether it got them.
+    ///
+    /// Here rather than in a notification of its own because the browser must be
+    /// told on every attachment, and this is the message that is already sent
+    /// once per attachment — including to one that reattached, where nothing
+    /// else runs.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerInfo>,
+}
+
+/// One configured MCP server, as the sidebar shows it.
+///
+/// Deliberately not the configuration. A `headers` or `env` *value* is a
+/// credential, and the browser is the one place it must never travel — the whole
+/// reason the server injects these rather than asking the browser to send them.
+/// The names are here because "this server carries a token called X" is worth
+/// seeing; the values are not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerInfo {
+    /// The name the agent knows it by.
+    pub name: String,
+    /// `stdio`, `http`, `sse` or `acp`.
+    pub transport: String,
+    /// The command line or the URL. Never a credential.
+    pub target: String,
+    /// The names — never the values — of the environment variables or headers it
+    /// carries.
+    pub secrets: Vec<String>,
+    /// Why this server was not offered to this agent, if it was not: an
+    /// unsupported transport, or a credential that is not in the environment.
+    /// `None` means the agent has it.
+    pub unavailable: Option<String>,
 }
 
 /// Payload of [`AGENT_STDERR`].
@@ -218,9 +251,27 @@ mod tests {
             cwd: "/w".into(),
             connection_id: "c1".into(),
             resumed: true,
+            mcp_servers: vec![],
         })
         .unwrap();
         assert!(json.contains(r#""connectionId":"c1""#), "{json}");
         assert!(json.contains(r#""resumed":true"#), "{json}");
+    }
+
+    #[test]
+    fn an_mcp_server_is_described_without_its_credentials() {
+        let json = serde_json::to_string(&McpServerInfo {
+            name: "github".into(),
+            transport: "http".into(),
+            target: "https://api.example.test/mcp".into(),
+            secrets: vec!["Authorization".into()],
+            unavailable: None,
+        })
+        .unwrap();
+        assert!(json.contains(r#""secrets":["Authorization"]"#), "{json}");
+        // The struct has nowhere to put a value, which is the point: this is the
+        // one payload that reaches a browser, and a token that got this far would
+        // be on the wire the injection exists to keep it off.
+        assert!(!json.contains("Bearer"), "{json}");
     }
 }

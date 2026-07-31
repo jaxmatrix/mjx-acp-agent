@@ -1276,6 +1276,7 @@ dependencies = [
  "mjx-acp-core",
  "mjx-acp-thread",
  "mjx-agent-catalog",
+ "mjx-mcp",
  "mjx-workspace",
  "reqwest",
  "serde",
@@ -1314,6 +1315,18 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "mjx-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mjx-acp-core",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

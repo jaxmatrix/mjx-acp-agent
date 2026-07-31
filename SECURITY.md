@@ -19,15 +19,35 @@ read files, write files, and execute commands.
   resolves the root it was asked for through the same `resolve_within` the
   filesystem jail uses, never follows a symlinked directory out of a root,
   returns at most 500 paths, and never returns a byte of a file's contents.
-- **No credential brokering.** The server never handles API keys. Real agents
-  authenticate themselves the same way they do from a terminal (`claude-acp`
-  reuses the `claude` CLI's own session, etc.).
+- **No credential brokering for agents.** The server never handles an agent's API
+  keys. Real agents authenticate themselves the same way they do from a terminal
+  (`claude-acp` reuses the `claude` CLI's own session, etc.).
+- **An MCP credential never reaches the browser.** `[[mcp_servers]]` entries are
+  merged into `session/new` by the server rather than sent by the browser, so an
+  `env` or `headers` value travels server → agent only. The sidebar is told the
+  *names* of the variables and headers a server carries and never their values;
+  `ext::McpServerInfo` has nowhere to put one. The injected frame is also the one
+  thing deliberately **not** mirrored to the inspector, which renders in the
+  browser.
+- **`transport = "acp"` keeps a credential from the agent too.** The server spawns
+  that MCP server itself and the agent reaches it over ACP, so it is offered as a
+  name and never as a command with an environment. It is not downgraded to stdio
+  for an agent that cannot do MCP-over-ACP — that would hand over the thing the
+  setting protects — but skipped, with the reason in the sidebar.
 
 ## What we do *not* do
 
 - Terminals are **not** sandboxed. `terminal/create` runs the command the agent
   asked for, with the server process's privileges and environment. The
   filesystem jail does not apply to it.
+- **An MCP server is a subprocess, exactly as a terminal is.** A `[[mcp_servers]]`
+  entry with `transport = "acp"` is spawned by this server with its privileges and
+  its environment plus whatever `env`/`env_from` adds; every other transport is
+  spawned or dialled by the *agent*. Either way the filesystem jail does not apply
+  to it, and configuring one is as much a decision as configuring an agent.
+- **A credential in `mjx.toml` is plaintext in a file.** Prefer `env_from` and
+  `headers_from`, which name an environment variable instead, so the file can be
+  committed and the secret stays in the environment of whoever starts the server.
 - There is no rate limiting, no session isolation between browser tabs beyond
   one subprocess per connection, and no audit log beyond the in-memory
   inspector.
