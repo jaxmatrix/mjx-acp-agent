@@ -52,7 +52,11 @@ export function ToolCallCard({
   const hasContent = toolCall.content.length > 0;
 
   return (
-    <div className={`tool-call tool-call--${toolCall.status}`}>
+    <div
+      className={`tool-call tool-call--${toolCall.status}`}
+      data-testid="tool-call"
+      data-status={toolCall.status}
+    >
       <button
         type="button"
         className="tool-call__header"

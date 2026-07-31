@@ -37,7 +37,7 @@ export function ThreadView({
   }
 
   return (
-    <div className="thread" ref={scroller} onScroll={onScroll}>
+    <div className="thread" data-testid="thread" ref={scroller} onScroll={onScroll}>
       {thread.entries.length === 0 && (
         <p className="thread__empty dim">
           Ask the agent something. Try “fix the median bug in stats.js”.
@@ -48,7 +48,7 @@ export function ThreadView({
         switch (entry.type) {
           case "user":
             return (
-              <article key={entry.id} className="message message--user">
+              <article key={entry.id} className="message message--user" data-testid="user-message">
                 {/* One paragraph holding an inline run, not one per block: a
                     mention sits inside the sentence it belongs to. */}
                 <p className="message__body">
@@ -65,7 +65,11 @@ export function ThreadView({
 
           case "assistant":
             return (
-              <article key={entry.id} className="message message--assistant">
+              <article
+                key={entry.id}
+                className="message message--assistant"
+                data-testid="assistant-message"
+              >
                 {entry.chunks.map((chunk, i) => (
                   <ChunkView key={i} chunk={chunk} />
                 ))}

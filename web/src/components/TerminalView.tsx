@@ -91,7 +91,7 @@ export function TerminalView({ terminal }: { terminal: Terminal }) {
         )}
         {!exited && <span className="pill pill--in_progress">running</span>}
       </figcaption>
-      <div className="terminal__screen" ref={host} />
+      <div className="terminal__screen" data-testid="terminal" ref={host} />
     </figure>
   );
 }

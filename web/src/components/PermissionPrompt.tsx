@@ -35,6 +35,8 @@ export function PermissionPrompt({
             key={option.optionId}
             type="button"
             className={`permission__button permission__button--${option.kind}`}
+            data-testid="permission-option"
+            data-kind={option.kind}
             // The label is truncated when an agent puts a whole shell command
             // in it, so the full text has to be reachable somewhere.
             title={option.name}

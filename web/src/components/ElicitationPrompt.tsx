@@ -141,7 +141,7 @@ function FormMode({
   }
 
   return (
-    <form className="elicitation__form" onSubmit={submit}>
+    <form className="elicitation__form" data-testid="elicitation-form" onSubmit={submit}>
       {schema.description && <p className="dim">{schema.description}</p>}
 
       {fields.map(([name, property]) => (
@@ -159,6 +159,7 @@ function FormMode({
         <button
           type="submit"
           className="permission__button permission__button--allow_once"
+          data-testid="elicitation-send"
           disabled={missing.length > 0}
           // Saying which field is missing beats a button that just refuses.
           title={missing.length > 0 ? `Still needed: ${missing.join(", ")}` : undefined}

@@ -93,6 +93,7 @@ function Conversation({
         <button
           type="button"
           className="link-button"
+          data-testid="inspector-toggle"
           onClick={() => setShowInspector((v) => !v)}
           aria-pressed={showInspector}
         >
@@ -171,15 +172,32 @@ function Conversation({
   );
 }
 
+/** What the pill says, and the class that colours it, per connection state. */
+const STATUS: Record<string, { label: string; modifier?: string }> = {
+  connecting: { label: "connecting…" },
+  failed: { label: "disconnected", modifier: "failed" },
+  takenOver: { label: "other tab", modifier: "failed" },
+  closed: { label: "closed", modifier: "failed" },
+};
+
 function StatusPill({ session }: { session: ReturnType<typeof useSession> }) {
   const { status, thread } = session;
-  if (status.state === "connecting") return <span className="pill">connecting…</span>;
-  if (status.state === "failed") return <span className="pill pill--failed">disconnected</span>;
-  if (status.state === "takenOver") return <span className="pill pill--failed">other tab</span>;
-  if (status.state === "closed") return <span className="pill pill--failed">closed</span>;
+  const working = thread.status === "generating";
+  const { label, modifier } = STATUS[status.state] ?? {
+    label: working ? "working" : "ready",
+    modifier: working ? "in_progress" : "completed",
+  };
+
+  // One element rather than five returns, so what is on screen can be read
+  // from outside — by a browser check, or by anyone reading the DOM.
   return (
-    <span className={`pill pill--${thread.status === "generating" ? "in_progress" : "completed"}`}>
-      {thread.status === "generating" ? "working" : "ready"}
+    <span
+      className={modifier ? `pill pill--${modifier}` : "pill"}
+      data-testid="status"
+      data-state={status.state}
+      data-busy={working}
+    >
+      {label}
     </span>
   );
 }
