@@ -125,7 +125,10 @@ impl Thread {
     ) -> Vec<ThreadEvent> {
         if let Some(Entry::User(message)) = self.entries.last_mut()
             && message.is_optimistic
-            && message.content.iter().any(|block| same_block(block, &content))
+            && message
+                .content
+                .iter()
+                .any(|block| same_block(block, &content))
             && can_merge_message_chunks(message.protocol_id.as_deref(), message_id.as_deref())
         {
             if message.protocol_id.is_none() {
@@ -592,7 +595,10 @@ mod tests {
             "sessionUpdate": "tool_call_update", "toolCallId": "orphan", "status": "in_progress"
         })]);
 
-        assert_eq!(thread.tool_call("orphan").unwrap().status, acp::ToolCallStatus::InProgress);
+        assert_eq!(
+            thread.tool_call("orphan").unwrap().status,
+            acp::ToolCallStatus::InProgress
+        );
     }
 
     #[test]

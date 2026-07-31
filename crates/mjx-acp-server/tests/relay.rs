@@ -1609,12 +1609,17 @@ async fn a_deleted_session_leaves_neither_a_listing_nor_a_thread() {
     );
 
     client
-        .request(method::agent::SESSION_DELETE, json!({ "sessionId": session_id }))
+        .request(
+            method::agent::SESSION_DELETE,
+            json!({ "sessionId": session_id }),
+        )
         .await;
 
     let sessions = list_sessions(&mut client, json!({})).await;
     assert!(
-        !sessions.iter().any(|s| s["sessionId"] == session_id.as_str()),
+        !sessions
+            .iter()
+            .any(|s| s["sessionId"] == session_id.as_str()),
         "the agent still lists a deleted session: {sessions:#?}"
     );
     // And the server let go of it too: replaying a session the agent has

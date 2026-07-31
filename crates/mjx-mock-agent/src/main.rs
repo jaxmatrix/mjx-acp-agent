@@ -1225,7 +1225,8 @@ mod tests {
     fn a_prompt_of_only_mentions_still_produces_a_title() {
         // Reading only `text` would leave such a turn untitled and unrecorded,
         // and the whole point of a mention is that it can be the whole prompt.
-        let link = json!({ "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" });
+        let link =
+            json!({ "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" });
         assert_eq!(block_text(&link).as_deref(), Some("@stats.js"));
         assert_eq!(summarise(&block_text(&link).unwrap()), "@stats.js");
 
@@ -1248,7 +1249,10 @@ mod tests {
 
     #[test]
     fn a_title_is_one_line_and_short_enough_to_read() {
-        assert_eq!(summarise("fix the median bug\nand the mean"), "fix the median bug");
+        assert_eq!(
+            summarise("fix the median bug\nand the mean"),
+            "fix the median bug"
+        );
         let long = summarise(&"a".repeat(200));
         assert!(long.ends_with('…') && long.chars().count() == 61, "{long}");
     }

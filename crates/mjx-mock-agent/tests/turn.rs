@@ -206,7 +206,11 @@ impl Driver {
                 self.transcript.completed_elicitations.push(params);
             }
             Frame::Notification { method, params } => {
-                assert_eq!(method, method::client::SESSION_UPDATE, "unexpected notification");
+                assert_eq!(
+                    method,
+                    method::client::SESSION_UPDATE,
+                    "unexpected notification"
+                );
                 let params: Value =
                     serde_json::from_str(params.expect("session/update has params").get()).unwrap();
 
@@ -297,7 +301,8 @@ async fn connect_declaring(driver: &mut Driver, capabilities: Value) -> String {
             }),
         )
         .await;
-    serde_json::from_value::<acp::InitializeResponse>(init.clone()).expect("valid InitializeResponse");
+    serde_json::from_value::<acp::InitializeResponse>(init.clone())
+        .expect("valid InitializeResponse");
     assert_eq!(init["protocolVersion"], mjx_acp_core::PROTOCOL_VERSION);
 
     let session = driver
@@ -306,7 +311,8 @@ async fn connect_declaring(driver: &mut Driver, capabilities: Value) -> String {
             json!({ "cwd": env!("CARGO_MANIFEST_DIR"), "mcpServers": [] }),
         )
         .await;
-    serde_json::from_value::<acp::NewSessionResponse>(session.clone()).expect("valid NewSessionResponse");
+    serde_json::from_value::<acp::NewSessionResponse>(session.clone())
+        .expect("valid NewSessionResponse");
     session["sessionId"].as_str().unwrap().to_string()
 }
 
@@ -323,8 +329,14 @@ async fn a_full_turn_exercises_every_ui_surface() {
             method::client::SESSION_REQUEST_PERMISSION,
             json!({ "outcome": { "outcome": "selected", "optionId": "allow_once" } }),
         )
-        .answer(method::client::TERMINAL_CREATE, json!({ "terminalId": "t1" }))
-        .answer(method::client::TERMINAL_WAIT_FOR_EXIT, json!({ "exitCode": 0 }))
+        .answer(
+            method::client::TERMINAL_CREATE,
+            json!({ "terminalId": "t1" }),
+        )
+        .answer(
+            method::client::TERMINAL_WAIT_FOR_EXIT,
+            json!({ "exitCode": 0 }),
+        )
         .answer(method::client::TERMINAL_RELEASE, json!({}));
 
     let session_id = connect(&mut driver).await;
@@ -391,7 +403,12 @@ async fn a_full_turn_exercises_every_ui_surface() {
         .flatten()
         .find(|c| c["type"] == "diff")
         .expect("no diff in the transcript");
-    assert!(diff["oldText"].as_str().unwrap().contains("return sorted[mid];"));
+    assert!(
+        diff["oldText"]
+            .as_str()
+            .unwrap()
+            .contains("return sorted[mid];")
+    );
     assert!(diff["newText"].as_str().unwrap().contains("/ 2"));
 
     // A terminal was attached to a tool call, so the UI renders a live console
@@ -852,10 +869,16 @@ async fn a_fork_is_a_second_session_carrying_the_first_ones_history() {
         .unwrap_or_else(|e| panic!("invalid ForkSessionResponse: {e}\n{forked:#}"));
 
     let fork_id = forked["sessionId"].as_str().expect("a forked session id");
-    assert_ne!(fork_id, session_id, "a fork is a new session, not the old one");
+    assert_ne!(
+        fork_id, session_id,
+        "a fork is a new session, not the old one"
+    );
 
     let sessions = list_sessions(&mut driver, json!({})).await;
-    assert!(listed(&sessions, fork_id).is_some(), "the fork is not listed");
+    assert!(
+        listed(&sessions, fork_id).is_some(),
+        "the fork is not listed"
+    );
 
     driver.shutdown().await;
 }
@@ -877,7 +900,10 @@ async fn deleting_forgets_a_session_and_closing_only_frees_it() {
         .to_string();
 
     driver
-        .request(method::agent::SESSION_CLOSE, json!({ "sessionId": session_id }))
+        .request(
+            method::agent::SESSION_CLOSE,
+            json!({ "sessionId": session_id }),
+        )
         .await;
     let sessions = list_sessions(&mut driver, json!({})).await;
     assert!(
@@ -886,10 +912,16 @@ async fn deleting_forgets_a_session_and_closing_only_frees_it() {
     );
 
     driver
-        .request(method::agent::SESSION_DELETE, json!({ "sessionId": &doomed }))
+        .request(
+            method::agent::SESSION_DELETE,
+            json!({ "sessionId": &doomed }),
+        )
         .await;
     let sessions = list_sessions(&mut driver, json!({})).await;
-    assert!(listed(&sessions, &doomed).is_none(), "a deleted session is still listed");
+    assert!(
+        listed(&sessions, &doomed).is_none(),
+        "a deleted session is still listed"
+    );
 
     driver.shutdown().await;
 }
