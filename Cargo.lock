@@ -1305,6 +1305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mjx-agent-auth"
+version = "0.1.0"
+dependencies = [
+ "mjx-acp-core",
+ "mjx-agent-catalog",
+ "tracing",
+]
+
+[[package]]
 name = "mjx-agent-catalog"
 version = "0.1.0"
 dependencies = [

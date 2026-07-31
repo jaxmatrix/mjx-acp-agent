@@ -1,0 +1,13 @@
+[package]
+name = "mjx-agent-auth"
+description = "Pluggable providers for an agent's own credentials: the seam behind ACP's authMethods."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mjx-acp-core.workspace = true
+mjx-agent-catalog.workspace = true
+tracing.workspace = true

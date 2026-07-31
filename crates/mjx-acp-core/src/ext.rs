@@ -292,7 +292,7 @@ pub struct AuthMethodInfo {
 }
 
 /// One variable a method needs, and whether the server has it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthSecret {
     /// The environment variable's name.
@@ -307,7 +307,7 @@ pub struct AuthSecret {
 }
 
 /// One provider's reason for not handling a method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthDecline {
     /// Which provider.
