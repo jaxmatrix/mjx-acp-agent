@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 mjx-acp-core.workspace = true
 mjx-acp-thread.workspace = true
+mjx-agent-auth.workspace = true
 mjx-agent-catalog.workspace = true
 mjx-mcp.workspace = true
 mjx-workspace.workspace = true

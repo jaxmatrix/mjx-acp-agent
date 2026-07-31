@@ -23,10 +23,13 @@ use axum::routing::get;
 use clap::Parser;
 use futures::StreamExt;
 use mjx_acp_core::ext;
+use mjx_agent_auth::AuthRegistry;
 use mjx_agent_catalog::Catalog;
 use serde::{Deserialize, Serialize};
 
 mod agent_process;
+mod auth;
+mod auth_interceptor;
 mod config;
 mod id_bridge;
 mod mcp;
@@ -36,8 +39,18 @@ mod sessions;
 mod workspace_interceptor;
 
 use agent_process::AgentProcess;
+use auth_interceptor::AuthInterceptor;
 use config::Config;
+use relay::Chain;
 use workspace_interceptor::WorkspaceInterceptor;
+
+/// The two interceptors this server installs, in the order they see a frame.
+///
+/// `WorkspaceInterceptor` first: it rewrites `initialize` to declare the
+/// filesystem and terminal capabilities, and the auth one must see that
+/// rewritten frame to add its own beside them rather than to a copy that is
+/// thrown away.
+type Interceptors = Chain<WorkspaceInterceptor, AuthInterceptor>;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +82,10 @@ struct AppState {
     config: Config,
     catalog: Catalog,
     connections: Connections,
+    /// How agents get their credentials. Built once from `mjx.toml`, and shared
+    /// by every connection: a provider holds resolved values, and resolving them
+    /// again per socket would be work for no difference.
+    auth: Arc<AuthRegistry>,
 }
 
 /// Agents that outlive their sockets, keyed by the id a browser passes back as
@@ -83,7 +100,7 @@ struct Pooled {
     /// it — an id is a handle to one conversation, not to the pool.
     agent_id: String,
     cwd: PathBuf,
-    connection: Arc<relay::Connection<WorkspaceInterceptor>>,
+    connection: Arc<relay::Connection<Interceptors>>,
     /// When the last socket went away; `None` while one is attached.
     idle_since: std::sync::Mutex<Option<Instant>>,
 }
@@ -226,6 +243,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| config.base_dir.join("web/dist"));
     let bind = config.bind;
     let state = Arc::new(AppState {
+        auth: auth::registry(&config.auth_providers),
         config,
         catalog,
         connections: Connections::default(),
@@ -375,7 +393,10 @@ async fn list_files(
     Query(query): Query<FilesQuery>,
 ) -> Response {
     let root = query.root.as_ref().map(PathBuf::from);
-    let limit = query.limit.unwrap_or(FILES_LIMIT_DEFAULT).min(FILES_LIMIT_MAX);
+    let limit = query
+        .limit
+        .unwrap_or(FILES_LIMIT_DEFAULT)
+        .min(FILES_LIMIT_MAX);
 
     let listing = match mjx_workspace::fs::list_within(
         &state.config.workspace_roots,
@@ -470,13 +491,25 @@ async fn websocket(
     // Everything that can fail is checked before the upgrade, so a bad request
     // gets a real HTTP status instead of a socket that opens and immediately
     // closes for no visible reason.
-    let Some(command) = state.catalog.resolve(&connect.agent) else {
+    let Some(mut command) = state.catalog.resolve(&connect.agent) else {
         return (
             StatusCode::NOT_FOUND,
             format!("unknown agent: {}", connect.agent),
         )
             .into_response();
     };
+
+    // Credentials the auth providers supply, merged before the agent starts.
+    // It has to be here: a process inherits its environment at spawn, so a
+    // variable set after `initialize` reaches it only on the next connection —
+    // which is exactly what the auth panel tells the operator.
+    //
+    // Over the catalog's own `env`, because an `[[auth_providers]]` entry is
+    // the more specific statement: `[[agents]]` says how to *run* the agent,
+    // this says how to authenticate it.
+    for (name, value) in state.auth.environment(&connect.agent) {
+        command.env.insert(name, value);
+    }
 
     let cwd = match &connect.cwd {
         Some(cwd) => {
@@ -548,17 +581,32 @@ async fn websocket(
             // The jail is the session's cwd plus every configured root, so an
             // agent can read a shared library directory while writing only its
             // own project.
-            let interceptor = Arc::new(WorkspaceInterceptor::new(
+            let workspace_interceptor = WorkspaceInterceptor::new(
                 state.config.workspace_roots.clone(),
                 cwd.clone(),
                 &state.config.mcp_servers,
-            ));
+            );
+            // One workspace, shared: a login terminal belongs in the same set as
+            // the agent's, or it would not be released when the connection ends
+            // and would outlive everything that could stop it.
+            let auth_interceptor = AuthInterceptor::new(
+                connect.agent.clone(),
+                command.clone(),
+                state.auth.clone(),
+                workspace_interceptor.workspace(),
+            );
+            let interceptor = Arc::new(Chain::new(workspace_interceptor, auth_interceptor));
 
             tracing::info!(connection = %id, agent = %info.agent_id, cwd = %info.cwd, "agent started");
             let pooled = Arc::new(Pooled {
                 agent_id: connect.agent.clone(),
                 cwd: cwd.clone(),
-                connection: relay::start(interceptor, agent, info, state.config.mcp_servers.clone()),
+                connection: relay::start(
+                    interceptor,
+                    agent,
+                    info,
+                    state.config.mcp_servers.clone(),
+                ),
                 idle_since: std::sync::Mutex::new(Some(Instant::now())),
             });
             // With resuming turned off there is nothing to come back to, so the

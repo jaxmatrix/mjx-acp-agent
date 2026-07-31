@@ -4,6 +4,7 @@ members = [
     "crates/mjx-acp-core",
     "crates/mjx-acp-thread",
     "crates/mjx-agent-catalog",
+    "crates/mjx-agent-auth",
     "crates/mjx-workspace",
     "crates/mjx-mcp",
     "crates/mjx-acp-server",
@@ -22,6 +23,7 @@ publish = false
 mjx-acp-core = { path = "crates/mjx-acp-core" }
 mjx-acp-thread = { path = "crates/mjx-acp-thread" }
 mjx-agent-catalog = { path = "crates/mjx-agent-catalog" }
+mjx-agent-auth = { path = "crates/mjx-agent-auth" }
 mjx-workspace = { path = "crates/mjx-workspace" }
 mjx-mcp = { path = "crates/mjx-mcp" }
 

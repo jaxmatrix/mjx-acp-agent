@@ -46,6 +46,16 @@ impl WorkspaceInterceptor {
         }
     }
 
+    /// The workspace this interceptor serves.
+    ///
+    /// Shared with the auth interceptor, which starts login terminals in it. One
+    /// workspace per connection is the point: a login terminal has to be in the
+    /// same set as the agent's, or it would not be released when the connection
+    /// ends and would outlive everything that could stop it.
+    pub fn workspace(&self) -> Arc<Workspace> {
+        self.workspace.clone()
+    }
+
     /// Whether this frame is MCP-over-ACP traffic we have undertaken to answer.
     fn is_ours(&self, method: &str) -> bool {
         method::is_server_provided_capability(method)
@@ -135,6 +145,55 @@ impl Interceptor for WorkspaceInterceptor {
         Disposition::Intercept
     }
 
+    fn on_extension_request(&self, frame: &Frame, outbox: &Outbox) -> bool {
+        let Frame::Request { id, method, .. } = frame else {
+            return false;
+        };
+
+        // Driving a terminal the browser is already watching. Answered here
+        // rather than in the auth interceptor that opens the login, because the
+        // terminals are this one's — and because the *refusal* is the important
+        // half: `Terminals` allows a write only on one this server opened for a
+        // login, so a browser cannot type into anything the agent started.
+        let outcome = match method.as_str() {
+            ext::TERMINAL_INPUT => frame
+                .params_as::<ext::TerminalInput>()
+                .map_err(JsonRpcError::invalid_params)
+                .and_then(|params| {
+                    let params =
+                        params.ok_or_else(|| JsonRpcError::invalid_params("missing params"))?;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(&params.bytes)
+                        .map_err(JsonRpcError::invalid_params)?;
+                    self.workspace
+                        .write_terminal(&params.terminal_id, &bytes)
+                        .map_err(to_rpc_error)
+                }),
+            ext::TERMINAL_RESIZE => frame
+                .params_as::<ext::TerminalResize>()
+                .map_err(JsonRpcError::invalid_params)
+                .and_then(|params| {
+                    let params =
+                        params.ok_or_else(|| JsonRpcError::invalid_params("missing params"))?;
+                    self.workspace
+                        .resize_terminal(&params.terminal_id, params.rows, params.cols)
+                        .map_err(to_rpc_error)
+                }),
+            _ => return false,
+        };
+
+        let reply = match outcome {
+            Ok(()) => Frame::result(id.clone(), &json!({}))
+                .unwrap_or_else(|err| Frame::error(id.clone(), JsonRpcError::internal(err))),
+            Err(error) => {
+                tracing::debug!(%method, error = %error.message, "refused a terminal request");
+                Frame::error(id.clone(), error)
+            }
+        };
+        outbox.to_browser(&reply);
+        true
+    }
+
     fn stop(&self) {
         // Redundant with `Workspace`'s own Drop, but the interceptor may outlive
         // the connection by a moment and a stray build should not.
@@ -194,11 +253,8 @@ async fn handle(
 
         m::TERMINAL_CREATE => {
             let request: acp::CreateTerminalRequest = params(frame)?;
-            let env: Vec<(String, String)> = request
-                .env
-                .into_iter()
-                .map(|v| (v.name, v.value))
-                .collect();
+            let env: Vec<(String, String)> =
+                request.env.into_iter().map(|v| (v.name, v.value)).collect();
             let terminal_id = workspace
                 .create_terminal(
                     &request.command,
@@ -400,7 +456,11 @@ mod tests {
         // -32602, not -32002: the request was wrong, the file is not "missing".
         // An agent told "not found" for a file it can see would keep retrying.
         assert_eq!(err.code, -32602);
-        assert!(err.message.contains("outside the workspace"), "{}", err.message);
+        assert!(
+            err.message.contains("outside the workspace"),
+            "{}",
+            err.message
+        );
     }
 
     #[tokio::test]

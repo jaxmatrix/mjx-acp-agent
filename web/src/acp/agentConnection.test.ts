@@ -214,6 +214,7 @@ function watcher(): {
       terminals: (next) => (terminals = next),
       agentInfo: () => {},
       capabilities: () => {},
+      auth: () => {},
       replaying: (sessionId) => replaying.push(sessionId ?? "—"),
       sessionOpened: (sessionId) => opened.push(sessionId),
       sessionClosed: (sessionId) => closed.push(sessionId),
@@ -554,5 +555,125 @@ describe("a prompt that carries more than text", () => {
     const entries = seen.thread().entries;
     const user = entries.find((entry) => entry.type === "user");
     expect(user?.content).toEqual(prompt);
+  });
+});
+
+describe("an agent that will not start until it is authenticated", () => {
+  /** The methods a refusing agent advertises, in the shapes the schema defines. */
+  const AUTH_METHODS = [
+    { id: "own", name: "Sign in" },
+    {
+      type: "env_var",
+      id: "api-key",
+      name: "API key",
+      vars: [{ name: "OPENAI_API_KEY" }],
+      link: "https://example.test/keys",
+    },
+  ];
+
+  /** The detail the server attaches to a `-32000`, mirroring `ext::AuthState`. */
+  const DETAIL = {
+    required: true,
+    authenticated: false,
+    refusedMethod: "session/new",
+    methods: [
+      {
+        id: "api-key",
+        name: "API key",
+        kind: "envVar",
+        instructions: "Set OPENAI_API_KEY in the environment the server runs in.",
+        secrets: [{ name: "OPENAI_API_KEY", present: false, optional: false }],
+        declines: [],
+        satisfied: false,
+      },
+    ],
+  };
+
+  /** An agent that advertises `AUTH_METHODS` and refuses `session/new`. */
+  function refusingAgent(error: acp.RequestError): acp.Stream {
+    const toAgent = new TransformStream<acp.AnyMessage, acp.AnyMessage>();
+    const toClient = new TransformStream<acp.AnyMessage, acp.AnyMessage>();
+    const app = acp
+      .agent({ name: "locked-agent" })
+      .onRequest(acp.methods.agent.initialize, async (ctx) => {
+        await ctx.client.notify("_mjx/agent/info" as never, {
+          agentId: "locked",
+          name: "Locked",
+          command: [],
+          cwd: "/w",
+          connectionId: "c1",
+          resumed: false,
+        } as never);
+        return {
+          protocolVersion: acp.PROTOCOL_VERSION,
+          agentCapabilities: {},
+          authMethods: AUTH_METHODS,
+        } as never;
+      })
+      .onRequest(acp.methods.agent.session.new, () => {
+        throw error;
+      });
+    void app.connect({ readable: toAgent.readable, writable: toClient.writable });
+    return { readable: toClient.readable, writable: toAgent.writable };
+  }
+
+  async function refused(error: acp.RequestError) {
+    const seen = watcher();
+    const states: unknown[] = [];
+    const session = new AgentConnection({
+      ...seen.events,
+      auth: (state) => states.push(state),
+      status: (status) => states.push(status),
+    });
+    await session.connect({ agentId: "locked", cwd: "/w" }, () => refusingAgent(error));
+    return { session, states };
+  }
+
+  test("reports what the agent offered instead of throwing", async () => {
+    // The whole change, in one assertion: this used to reject, and the page
+    // showed `Connection failed: {"code":-32000,...}`.
+    const { session } = await refused(
+      new acp.RequestError(-32000, "authenticate first", DETAIL),
+    );
+
+    expect(session.auth?.required).toBe(true);
+    expect(session.auth?.authenticated).toBe(false);
+    expect(session.auth?.methods[0]?.secrets?.[0]?.name).toBe("OPENAI_API_KEY");
+    expect(session.auth?.refusedMethod).toBe("session/new");
+  });
+
+  test("keeps the methods off the handshake, refusal or not", async () => {
+    // Read from `initialize`, which is where they are, so the panel has
+    // something even from a server too old to attach the detail.
+    const { session } = await refused(
+      new acp.RequestError(-32000, "authenticate first", DETAIL),
+    );
+    expect(session.authMethods.map((m) => m.kind)).toEqual(["agent", "envVar"]);
+    expect(session.authMethods[1]?.link).toBe("https://example.test/keys");
+  });
+
+  test("says it needs authenticating rather than that it failed", async () => {
+    const { states } = await refused(
+      new acp.RequestError(-32000, "authenticate first", DETAIL),
+    );
+    const status = states.filter(
+      (s): s is { state: string } =>
+        typeof s === "object" && s !== null && "state" in s && typeof s.state === "string",
+    );
+    expect(status.some((s) => s.state === "needsAuth")).toBe(true);
+    expect(status.some((s) => s.state === "failed")).toBe(false);
+  });
+
+  test("a -32000 with no detail is still an auth refusal", async () => {
+    // The code is the part the agent guaranteed. An empty panel saying
+    // "authenticate" beats a stringified error object.
+    const { session } = await refused(new acp.RequestError(-32000, "nope"));
+    expect(session.auth?.required).toBe(true);
+    expect(session.auth?.methods).toEqual([]);
+  });
+
+  test("every other failure still fails", async () => {
+    // The auth path must not swallow a genuinely broken agent.
+    await expect(refused(new acp.RequestError(-32603, "the agent exploded"))).rejects.toThrow();
   });
 });

@@ -68,6 +68,21 @@ pub struct Agent {
     elicitation_form: AtomicBool,
     /// Whether the client said it can send the user to a URL.
     elicitation_url: AtomicBool,
+    /// Whether this agent was started with `--needs-auth`.
+    ///
+    /// The default is the opposite, and stays that way: this agent's whole
+    /// point is that it works with nothing installed and nothing configured.
+    /// The flag exists so the auth path has a peer that really refuses.
+    needs_auth: bool,
+    /// Whether `authenticate` has succeeded. Meaningless unless [`Agent::needs_auth`].
+    authenticated: AtomicBool,
+    /// Whether the client said it can run an interactive terminal login.
+    ///
+    /// A conformant agent offers a `terminal` method only when the client
+    /// declared `auth.terminal` — the same rule the elicitation flags above
+    /// follow, for the same reason: offering something the client cannot do
+    /// leaves the user stuck on a choice that goes nowhere.
+    auth_terminal: AtomicBool,
     /// How many `mcp/message` notifications the client has sent us.
     ///
     /// A hosted MCP server speaks unprompted — `notifications/tools/list_changed`
@@ -406,6 +421,33 @@ impl Agent {
     }
 }
 
+/// The `--login` mode: a login flow that really needs a person at a keyboard.
+///
+/// It prompts, waits for a line, and exits 0 only if it got one. That is the
+/// shape that matters — a real `claude login` prints a URL and then blocks on
+/// input, and a client that streams its output without being able to answer it
+/// looks broken rather than being honest about it.
+async fn run_login() -> Result<()> {
+    let mut out = tokio::io::stdout();
+    out.write_all(b"mjx mock login\r\nPaste your code and press enter: ")
+        .await?;
+    out.flush().await?;
+
+    let mut line = String::new();
+    let read = BufReader::new(tokio::io::stdin())
+        .read_line(&mut line)
+        .await?;
+    if read == 0 || line.trim().is_empty() {
+        out.write_all(b"\r\nno code given\r\n").await?;
+        out.flush().await?;
+        std::process::exit(1);
+    }
+
+    out.write_all(b"\r\nsigned in\r\n").await?;
+    out.flush().await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Logs go to stderr; stdout is the protocol channel and must stay clean.
@@ -423,6 +465,16 @@ async fn main() -> Result<()> {
         return mcp::serve().await;
     }
 
+    // `--login` is what the `terminal` auth method points at: an interactive
+    // login, run in a PTY, that the operator types into. It is this binary
+    // because `AuthMethodTerminal.args` are arguments to *the agent's own
+    // command* — the client never gets to choose a program.
+    if std::env::args().any(|arg| arg == "--login") {
+        return run_login().await;
+    }
+
+    let needs_auth = std::env::args().any(|arg| arg == "--needs-auth");
+
     let (outbox, mut outbox_rx) = mpsc::unbounded_channel::<Frame>();
     let agent = Arc::new(Agent {
         outbox,
@@ -432,6 +484,9 @@ async fn main() -> Result<()> {
         config: Mutex::new(HashMap::new()),
         elicitation_form: AtomicBool::new(false),
         elicitation_url: AtomicBool::new(false),
+        needs_auth,
+        authenticated: AtomicBool::new(false),
+        auth_terminal: AtomicBool::new(false),
         mcp_notifications: AtomicI64::new(0),
         sessions: std::sync::Mutex::new(HashMap::new()),
     });
@@ -516,8 +571,103 @@ async fn dispatch(agent: Arc<Agent>, frame: Frame) {
     }
 }
 
+/// The methods `--needs-auth` answers before it has been authenticated.
+///
+/// `initialize` has to work, or the client would never learn what to do about
+/// it; `authenticate` and `logout` are the way out. Everything else is refused.
+const OPEN_BEFORE_AUTH: [&str; 3] = [
+    method::agent::INITIALIZE,
+    method::agent::AUTHENTICATE,
+    method::agent::LOGOUT,
+];
+
+/// The auth methods this agent advertises, as wire JSON.
+///
+/// Written by hand rather than built from the schema types, like everything else
+/// here: the mock is a fixture, and the point is to check our understanding of
+/// the protocol rather than a serializer against itself. `script.rs` re-parses
+/// all of it with the real types.
+fn auth_methods(needs_auth: bool, client_has_terminal: bool) -> Value {
+    if !needs_auth {
+        return json!([]);
+    }
+
+    let mut methods = vec![
+        // No `type`, which the schema reads as `agent`: the agent handles this
+        // itself and the client has nothing to do but ask.
+        json!({
+            "id": "mock-agent-managed",
+            "name": "Sign in with the mock agent",
+            "description": "Pretends to have a session of its own already."
+        }),
+        json!({
+            "type": "env_var",
+            "id": "mock-api-key",
+            "name": "API key",
+            "description": "Set these in the environment the server runs in.",
+            "vars": [
+                { "name": "MJX_MOCK_API_KEY", "label": "Mock API key", "secret": true },
+                { "name": "MJX_MOCK_ORG", "label": "Organisation", "secret": false, "optional": true }
+            ],
+            "link": "https://example.test/mock/keys"
+        }),
+    ];
+
+    // Only when the client said it can run one. An agent that offers a terminal
+    // login to a client with no terminal has offered a dead end.
+    if client_has_terminal {
+        methods.push(json!({
+            "type": "terminal",
+            "id": "mock-terminal-login",
+            "name": "Log in interactively",
+            "description": "Runs this agent's own binary with `--login`.",
+            // Arguments to *the agent's command*, per the schema. The client
+            // supplies the program; it never chooses one.
+            "args": ["--login"],
+            "env": { "MJX_MOCK_LOGIN": "1" }
+        }));
+    }
+
+    json!(methods)
+}
+
+/// What this agent advertises right now, from its own state.
+fn advertised_auth_methods(agent: &Arc<Agent>) -> Value {
+    auth_methods(
+        agent.needs_auth,
+        agent.auth_terminal.load(Ordering::Relaxed),
+    )
+}
+
+/// The ids of the methods [`auth_methods`] advertised, so `authenticate` can
+/// refuse one that was never offered.
+fn auth_method_ids(agent: &Arc<Agent>) -> Vec<String> {
+    advertised_auth_methods(agent)
+        .as_array()
+        .map(|methods| {
+            methods
+                .iter()
+                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value, JsonRpcError> {
     use mjx_acp_core::method::agent as m;
+
+    // The refusal that makes this mode worth having. A real agent answers this
+    // to `session/new`, and to `session/prompt` too when a token expires
+    // mid-conversation — so it is gated here, once, rather than per method.
+    if agent.needs_auth
+        && !agent.authenticated.load(Ordering::Relaxed)
+        && !OPEN_BEFORE_AUTH.contains(&method)
+    {
+        return Err(JsonRpcError::auth_required(
+            "authenticate before starting a session",
+        ));
+    }
+
     match method {
         m::INITIALIZE => {
             // Remember what the client offered, because the script has steps
@@ -531,6 +681,12 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
             agent
                 .elicitation_url
                 .store(elicitation["url"].is_object(), Ordering::Relaxed);
+            // A plain bool here, unlike `elicitation` above: in this version of
+            // the schema `AuthCapabilities.terminal` is a `bool`, not an object.
+            agent.auth_terminal.store(
+                params["clientCapabilities"]["auth"]["terminal"] == json!(true),
+                Ordering::Relaxed,
+            );
 
             Ok(json!({
                 "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
@@ -554,10 +710,37 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                     // was declared here can be caught doing it.
                     "mcpCapabilities": { "http": true, "sse": false, "acp": true }
                 },
-                // No auth methods: this agent is the whole point of "works out
-                // of the box".
-                "authMethods": []
+                // Empty unless `--needs-auth`: this agent is the whole point of
+                // "works out of the box".
+                "authMethods": advertised_auth_methods(agent)
             }))
+        }
+
+        m::AUTHENTICATE => {
+            let method_id = params["methodId"].as_str().unwrap_or_default();
+            if !auth_method_ids(agent).iter().any(|id| id == method_id) {
+                // -32602 rather than -32000: the request itself was wrong, and
+                // repeating it will not help. Answering "authenticate first"
+                // to an attempt to authenticate would be a loop.
+                return Err(JsonRpcError::invalid_params(format!(
+                    "no such auth method: {method_id}"
+                )));
+            }
+            // `MJX_MOCK_AUTH_REFUSE` makes every attempt fail, so a client can
+            // be tested against an agent that says no for a reason it will not
+            // elaborate on — which is what a wrong API key looks like.
+            if std::env::var("MJX_MOCK_AUTH_REFUSE").is_ok() {
+                return Err(JsonRpcError::auth_required(
+                    "the credential was rejected by the mock agent",
+                ));
+            }
+            agent.authenticated.store(true, Ordering::Relaxed);
+            Ok(json!({}))
+        }
+
+        m::LOGOUT => {
+            agent.authenticated.store(false, Ordering::Relaxed);
+            Ok(json!({}))
         }
 
         m::SESSION_NEW => {
@@ -744,8 +927,6 @@ async fn handle(agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value
                 .await;
             Ok(json!({ "configOptions": options }))
         }
-
-        m::AUTHENTICATE => Ok(json!({})),
 
         // The other direction of MCP-over-ACP: a server the client is holding has
         // something to ask, and this agent is its MCP client. Answered as an MCP
@@ -1173,6 +1354,88 @@ fn short_id() -> String {
 mod tests {
     use super::*;
 
+    /// Every shape this agent advertises is one the protocol really defines.
+    /// The same check `script.rs` makes of the updates, for the same reason: the
+    /// JSON is written by hand, so a typo has to fail the build.
+    fn parse_methods(value: &Value) -> Vec<acp::AuthMethod> {
+        serde_json::from_value(value.clone())
+            .unwrap_or_else(|e| panic!("not valid AuthMethods: {e}\n{value:#}"))
+    }
+
+    #[test]
+    fn the_default_agent_advertises_no_auth_methods() {
+        // The one that must not regress: this agent works out of the box, and
+        // an auth method here would make the demo ask for credentials.
+        assert_eq!(auth_methods(false, false), json!([]));
+        assert_eq!(auth_methods(false, true), json!([]));
+    }
+
+    #[test]
+    fn needs_auth_advertises_every_shape_the_schema_defines() {
+        let methods = parse_methods(&auth_methods(true, true));
+        assert_eq!(methods.len(), 3);
+
+        // Untagged: no `type` at all, which the schema reads as `agent`.
+        assert!(matches!(methods[0], acp::AuthMethod::Agent(_)));
+
+        let acp::AuthMethod::EnvVar(env) = &methods[1] else {
+            panic!("expected an env_var method, got {:?}", methods[1]);
+        };
+        assert_eq!(env.vars.len(), 2);
+        assert_eq!(env.vars[0].name, "MJX_MOCK_API_KEY");
+        assert!(env.vars[0].secret);
+        // The second is the one a client must not insist on: `optional` is what
+        // says the login works without it.
+        assert!(env.vars[1].optional);
+        assert!(!env.vars[1].secret);
+        assert!(env.link.is_some(), "the docs link is what the panel shows");
+
+        let acp::AuthMethod::Terminal(terminal) = &methods[2] else {
+            panic!("expected a terminal method, got {:?}", methods[2]);
+        };
+        // Arguments to *the agent's own binary*, per the schema. The client
+        // supplies the program.
+        assert_eq!(terminal.args, ["--login"]);
+        assert_eq!(
+            terminal.env.get("MJX_MOCK_LOGIN").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn a_terminal_login_is_not_offered_to_a_client_that_cannot_run_one() {
+        // Offering it anyway would leave the user on a choice that goes
+        // nowhere — the same failure this whole change exists to remove.
+        let methods = parse_methods(&auth_methods(true, false));
+        assert_eq!(methods.len(), 2);
+        assert!(
+            !methods
+                .iter()
+                .any(|m| matches!(m, acp::AuthMethod::Terminal(_)))
+        );
+    }
+
+    #[test]
+    fn the_request_this_agent_accepts_is_the_one_acp_defines() {
+        let request: acp::AuthenticateRequest =
+            serde_json::from_value(json!({ "methodId": "mock-api-key" })).unwrap();
+        assert_eq!(request.method_id.0.as_ref(), "mock-api-key");
+    }
+
+    #[test]
+    fn only_the_handshake_and_the_way_out_are_open_before_authenticating() {
+        // `initialize` has to work or the client would never learn what to do,
+        // and `authenticate` answering "authenticate first" would be a loop.
+        assert!(OPEN_BEFORE_AUTH.contains(&method::agent::INITIALIZE));
+        assert!(OPEN_BEFORE_AUTH.contains(&method::agent::AUTHENTICATE));
+        assert!(OPEN_BEFORE_AUTH.contains(&method::agent::LOGOUT));
+        // A token can expire mid-conversation, so prompting is refused too —
+        // not just starting a session.
+        assert!(!OPEN_BEFORE_AUTH.contains(&method::agent::SESSION_NEW));
+        assert!(!OPEN_BEFORE_AUTH.contains(&method::agent::SESSION_PROMPT));
+        assert!(!OPEN_BEFORE_AUTH.contains(&method::agent::SESSION_LOAD));
+    }
+
     #[test]
     fn every_mcp_transport_is_understood_and_reported() {
         let meta = mcp_servers_meta(&json!({
@@ -1225,7 +1488,8 @@ mod tests {
     fn a_prompt_of_only_mentions_still_produces_a_title() {
         // Reading only `text` would leave such a turn untitled and unrecorded,
         // and the whole point of a mention is that it can be the whole prompt.
-        let link = json!({ "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" });
+        let link =
+            json!({ "type": "resource_link", "uri": "file:///w/stats.js", "name": "stats.js" });
         assert_eq!(block_text(&link).as_deref(), Some("@stats.js"));
         assert_eq!(summarise(&block_text(&link).unwrap()), "@stats.js");
 
@@ -1248,7 +1512,10 @@ mod tests {
 
     #[test]
     fn a_title_is_one_line_and_short_enough_to_read() {
-        assert_eq!(summarise("fix the median bug\nand the mean"), "fix the median bug");
+        assert_eq!(
+            summarise("fix the median bug\nand the mean"),
+            "fix the median bug"
+        );
         let long = summarise(&"a".repeat(200));
         assert!(long.ends_with('…') && long.chars().count() == 61, "{long}");
     }

@@ -224,6 +224,46 @@ start rather than hiding it.
 Agents published only as a binary download are listed but not installed for you:
 fetch one and point an `[[agents]]` entry at it.
 
+## Agent authentication
+
+Most registry agents will not start until they have credentials. They say so in
+`initialize`, by advertising `authMethods`, and then answer `session/new` with
+`-32000` until one has been used.
+
+The viewer reads both. Instead of a connection failure it shows a panel naming
+every method the agent offered, which variables each wants and whether they are
+set, the documentation link the agent supplied, and — where nothing is
+configured — why each provider passed on it. An agent that needs an API key you
+have not set says so by name.
+
+**These credentials are the server operator's, not any viewer's.** They come
+from the environment the server was started in and from `mjx.toml`, and every
+browser attached acts as that one operator. Values never travel to the browser;
+only names and reasons do.
+
+How an agent gets them is pluggable. `[[auth_providers]]` entries are tried in
+order, and the first that can handle a method is the one that does:
+
+```toml
+# An API key, given to the agent when it starts.
+[[auth_providers]]
+name = "anthropic"
+kind = "env"
+agents = ["claude-acp"]           # absent = every agent
+env_from = { ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY" }
+
+# An interactive login, run in a PTY you can type into from the browser.
+[[auth_providers]]
+name = "interactive"
+kind = "terminal"
+```
+
+An `env` provider contributes at spawn, because a process inherits its
+environment when it starts — a variable set after that reaches the agent only on
+the next connection, which is what the panel tells you. A `terminal` provider
+runs **the agent's own binary** with the arguments the agent asked for; nothing
+outside the server ever chooses what runs.
+
 ## Configuration
 
 Everything in `mjx.toml` has a working default; the file is optional and a
@@ -326,6 +366,7 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 | `crates/mjx-acp-thread` | The thread model — a GPUI-free port of Zed's `acp_thread` |
 | `crates/mjx-agent-catalog` | ACP registry fetch and agent command resolution |
 | `crates/mjx-workspace` | Filesystem jail and PTY terminal manager |
+| `crates/mjx-agent-auth` | Pluggable providers for an agent's own credentials |
 | `crates/mjx-mcp` | An MCP server this process holds open, for MCP-over-ACP |
 | `crates/mjx-acp-server` | The relay: static assets, `/api/*`, `/ws`, and the pool of running agents |
 | `crates/mjx-mock-agent` | Scripted credential-free agent, for the demo and the tests |
@@ -353,8 +394,10 @@ browser is strict, and real bugs have only ever shown up in Chromium.
 - **A dropped connection is not reconnected for you.** A new socket can rejoin
   a running agent, but nothing retries automatically after a network blip —
   reload the page.
-- **Terminals are display-only.** ACP gives a client no way to type into a
-  terminal the agent started, so neither does this.
+- **A terminal the agent started is display-only.** ACP gives a client no way to
+  type into one, so neither does this. The exception is a login terminal the
+  server opened for an auth method, which is the only place keystrokes go
+  anywhere — see [Agent authentication](#agent-authentication).
 - **Binary-only registry agents are not installed for you.** Roughly fifteen
   publish no `npx`/`uvx` distribution; they are listed with an explanation.
 - **A form's half-filled answer does not survive a reload.** The question and

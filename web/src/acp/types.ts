@@ -168,6 +168,75 @@ export interface Terminal {
   truncated: boolean;
   exitCode?: number | null;
   signal?: string | null;
+  /**
+   * Whether this terminal accepts keystrokes.
+   *
+   * True only for one the server opened for a login. A terminal the *agent*
+   * asked for is read-only: it owns that process, and ACP has no notion of a
+   * client typing into it. The server refuses a write to one either way; this
+   * is so the UI does not offer what would be refused.
+   */
+  interactive?: boolean;
+}
+
+/**
+ * How the agent will accept being authenticated, and what this server can do
+ * about it. Mirrors `ext::AuthMethodInfo`.
+ *
+ * Every field is a name or a reason. There is nowhere here to put a credential,
+ * which is the point: the server holds them so the browser does not have to.
+ */
+export interface AuthMethodInfo {
+  id: string;
+  name: string;
+  description?: string;
+  kind: string;
+  /** The provider that would handle it, if one would. */
+  provider?: string;
+  /** What the operator must do, when the server cannot get further alone. */
+  instructions?: string;
+  link?: string;
+  secrets?: AuthSecret[];
+  declines?: AuthDecline[];
+  satisfied: boolean;
+}
+
+/** One variable a method needs, and whether the server has it. Never its value. */
+export interface AuthSecret {
+  name: string;
+  label?: string;
+  present: boolean;
+  optional: boolean;
+}
+
+/** Why one provider passed on a method. */
+export interface AuthDecline {
+  provider: string;
+  reason: string;
+}
+
+/** Mirrors `ext::AuthState`: what this connection knows about authenticating. */
+export interface AuthState {
+  required: boolean;
+  authenticated: boolean;
+  methods: AuthMethodInfo[];
+  refusedMethod?: string;
+}
+
+/** Mirrors `ext::AuthAttemptResult`. */
+export interface AuthAttemptResult {
+  authenticated: boolean;
+  message: string;
+  /** A login terminal to show and type into, if the attempt started one. */
+  terminalId?: string;
+}
+
+/** Mirrors `ext::AuthProgress`: how an attempt that outlived its request went. */
+export interface AuthProgress {
+  methodId: string;
+  message: string;
+  /** Absent while the attempt is still running. */
+  authenticated?: boolean;
 }
 
 /** Token and cost accounting, for the usage bar. */

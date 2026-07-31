@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub mod fs;
 pub mod terminal;
 
-pub use terminal::{ExitStatus, Terminals};
+pub use terminal::{ExitStatus, TerminalSpec, Terminals};
 
 /// Why an operation could not be performed.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +34,9 @@ pub enum WorkspaceError {
     /// No terminal with that id, or it was already released.
     #[error("no such terminal: {0}")]
     NoSuchTerminal(String),
+    /// The terminal exists but takes no input, because the agent owns it.
+    #[error("terminal {0} does not take input")]
+    NotInteractive(String),
 }
 
 impl WorkspaceError {
@@ -46,7 +49,9 @@ impl WorkspaceError {
         match self {
             // -32002 is ACP's "resource not found".
             Self::NotFound(_) | Self::NoSuchTerminal(_) => -32002,
-            Self::OutsideWorkspace(_) | Self::NotAbsolute(_) => -32602,
+            // Refused, not absent: the terminal is right there, and asking
+            // again will not change the answer.
+            Self::OutsideWorkspace(_) | Self::NotAbsolute(_) | Self::NotInteractive(_) => -32602,
             Self::Io(..) | Self::Terminal(_) => -32603,
         }
     }
@@ -161,14 +166,61 @@ impl Workspace {
 
         // `Terminals::create` emits `TerminalCreated` itself, before it starts
         // reading, so no output can precede the announcement.
+        //
+        // Never interactive. This is the door the *agent* comes through, and it
+        // owns the process on the other side.
         self.terminals.create(
-            command,
-            args,
-            env,
-            cwd,
-            output_byte_limit,
+            TerminalSpec {
+                command,
+                args,
+                env,
+                cwd,
+                output_byte_limit,
+                interactive: false,
+            },
             self.events.clone(),
         )
+    }
+
+    /// Starts a terminal for a login flow, which the browser may type into.
+    ///
+    /// A separate door from [`Workspace::create_terminal`] rather than a flag on
+    /// it, so the agent's path has no way to ask for a writable terminal even by
+    /// mistake. What runs here is never the browser's choice: the caller builds
+    /// the command from the agent's own binary and the arguments the agent
+    /// advertised.
+    pub fn create_login_terminal(
+        &self,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<String, WorkspaceError> {
+        self.terminals.create(
+            TerminalSpec {
+                command,
+                args,
+                env,
+                cwd: self.cwd.clone(),
+                output_byte_limit: None,
+                interactive: true,
+            },
+            self.events.clone(),
+        )
+    }
+
+    /// Writes to a login terminal's stdin. Refused on the agent's own terminals.
+    pub fn write_terminal(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), WorkspaceError> {
+        self.terminals.write(terminal_id, bytes)
+    }
+
+    /// Tells a terminal how large the browser is showing it.
+    pub fn resize_terminal(
+        &self,
+        terminal_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), WorkspaceError> {
+        self.terminals.resize(terminal_id, rows, cols)
     }
 
     /// A terminal's retained output, whether it was truncated, and its exit
@@ -305,6 +357,28 @@ mod tests {
             .create_terminal("echo", &[], &[], Some("/etc".into()), None)
             .unwrap_err();
         assert!(matches!(err, WorkspaceError::OutsideWorkspace(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn only_a_login_terminal_can_be_typed_into() {
+        // Two doors rather than a flag on one, so the agent's path has no way to
+        // ask for a writable terminal even by mistake. This test is what says
+        // the two doors really differ.
+        let (_dir, workspace, _events) = workspace();
+
+        let agents = workspace
+            .create_terminal("sleep", &["60".into()], &[], None, None)
+            .unwrap();
+        let err = workspace.write_terminal(&agents, b"whoami\n").unwrap_err();
+        assert!(matches!(err, WorkspaceError::NotInteractive(_)), "{err}");
+
+        let login = workspace.create_login_terminal("cat", &[], &[]).unwrap();
+        workspace.write_terminal(&login, b"ok\n").unwrap();
+
+        // Size is not input, so it is allowed on both: the worst a wrong one
+        // does is make output wrap badly, and the browser renders both.
+        workspace.resize_terminal(&agents, 40, 100).unwrap();
+        workspace.resize_terminal(&login, 40, 100).unwrap();
     }
 
     #[tokio::test]

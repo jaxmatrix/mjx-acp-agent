@@ -10,7 +10,7 @@
 //! output discarded first, and a `truncated` flag once anything has been lost.
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -72,11 +72,22 @@ struct Terminal {
     exit: watch::Receiver<Option<ExitStatus>>,
     /// Kills the process. `None` once it has been used or the process ended.
     killer: Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
-    /// Kept alive so the PTY isn't closed while the process still runs.
+    /// Kept alive so the PTY isn't closed while the process still runs, and so
+    /// an interactive terminal can be resized to the size the browser shows it
+    /// at — a login prompt laid out for 120 columns in an 80-column pane wraps
+    /// into nonsense.
     ///
     /// Behind a mutex only to make `Terminal` `Sync`: `MasterPty` is `Send`
     /// but not `Sync`, and the workspace is shared across connection tasks.
-    _master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    /// The write half, present only on an interactive terminal.
+    ///
+    /// `None` is the *refusal*, not an absence: a terminal the agent asked for
+    /// is one the agent owns, and nothing in ACP lets a client type into it. It
+    /// is taken at creation rather than on demand because `take_writer` can only
+    /// be called once, so a lazy version would need its own locking to be no
+    /// more capable.
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
 }
 
 /// Every terminal belonging to one connection.
@@ -90,20 +101,50 @@ pub struct Terminals {
 /// size Zed uses.
 const DEFAULT_OUTPUT_LIMIT: usize = 1024 * 1024;
 
+/// What to start, and how the caller may drive it.
+///
+/// A struct rather than a longer argument list, so `interactive` is named at
+/// every call site. A bare `true` in seventh position deciding whether a browser
+/// may type into a process is not something a reader should have to count
+/// commas to find.
+pub struct TerminalSpec<'a> {
+    /// Program name.
+    pub command: &'a str,
+    /// Arguments.
+    pub args: &'a [String],
+    /// Extra environment, on top of what this process inherits.
+    pub env: &'a [(String, String)],
+    /// Working directory. Already resolved; this type does no jailing.
+    pub cwd: PathBuf,
+    /// How much output to retain, defaulting to [`DEFAULT_OUTPUT_LIMIT`].
+    pub output_byte_limit: Option<usize>,
+    /// Whether anything may be written to it.
+    ///
+    /// False for every terminal the *agent* asks for, and true only for a login
+    /// flow this server started on the operator's behalf. The difference is the
+    /// whole security boundary: a browser that could write to any terminal would
+    /// be a shell, on a viewer that has no authentication of its own.
+    pub interactive: bool,
+}
+
 impl Terminals {
-    /// Starts `command` in `cwd` and begins streaming its output.
+    /// Starts a terminal and begins streaming its output.
     ///
     /// `events` receives an incremental chunk per read, so the browser can show
     /// output as it appears rather than only when the process exits.
     pub fn create(
         &self,
-        command: &str,
-        args: &[String],
-        env: &[(String, String)],
-        cwd: PathBuf,
-        output_byte_limit: Option<usize>,
+        spec: TerminalSpec<'_>,
         events: tokio::sync::mpsc::UnboundedSender<WorkspaceEvent>,
     ) -> Result<String, WorkspaceError> {
+        let TerminalSpec {
+            command,
+            args,
+            env,
+            cwd,
+            output_byte_limit,
+            interactive,
+        } = spec;
         let id = format!(
             "term-{}",
             self.next_id
@@ -140,6 +181,16 @@ impl Terminals {
             .master
             .try_clone_reader()
             .map_err(|err| WorkspaceError::Terminal(err.to_string()))?;
+
+        let writer = if interactive {
+            Some(
+                pty.master
+                    .take_writer()
+                    .map_err(|err| WorkspaceError::Terminal(err.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let output = Arc::new(Mutex::new(Output::new(
             output_byte_limit.unwrap_or(DEFAULT_OUTPUT_LIMIT).max(1),
@@ -208,15 +259,19 @@ impl Terminals {
             });
         }
 
-        self.terminals.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            id.clone(),
-            Arc::new(Terminal {
-                output,
-                exit: exit_rx,
-                killer: Mutex::new(Some(killer)),
-                _master: Mutex::new(pty.master),
-            }),
-        );
+        self.terminals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                id.clone(),
+                Arc::new(Terminal {
+                    output,
+                    exit: exit_rx,
+                    killer: Mutex::new(Some(killer)),
+                    master: Mutex::new(pty.master),
+                    writer: Mutex::new(writer),
+                }),
+            );
 
         Ok(id)
     }
@@ -245,6 +300,49 @@ impl Terminals {
                 return Ok(ExitStatus::default());
             }
         }
+    }
+
+    /// Writes to an interactive terminal's stdin.
+    ///
+    /// Refused on any other, with [`WorkspaceError::NotInteractive`] rather than
+    /// a generic failure: "this terminal does not take input" and "there is no
+    /// such terminal" are different answers, and only the first means the caller
+    /// asked for the wrong thing.
+    pub fn write(&self, id: &str, bytes: &[u8]) -> Result<(), WorkspaceError> {
+        let terminal = self.get(id)?;
+        let mut writer = terminal.writer.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(writer) = writer.as_mut() else {
+            return Err(WorkspaceError::NotInteractive(id.to_string()));
+        };
+        writer
+            .write_all(bytes)
+            .and_then(|()| writer.flush())
+            .map_err(|err| WorkspaceError::Terminal(err.to_string()))
+    }
+
+    /// Tells the PTY how large the browser is showing it.
+    ///
+    /// Allowed on any terminal, unlike [`Terminals::write`]. Size is not input:
+    /// the worst a wrong one does is make output wrap badly, and a terminal the
+    /// agent started is still one the browser has to render.
+    pub fn resize(&self, id: &str, rows: u16, cols: u16) -> Result<(), WorkspaceError> {
+        // A zero in either dimension means the browser has not laid the pane out
+        // yet. Passing it through would tell the process it has no screen.
+        if rows == 0 || cols == 0 {
+            return Ok(());
+        }
+        let terminal = self.get(id)?;
+        terminal
+            .master
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| WorkspaceError::Terminal(err.to_string()))
     }
 
     /// Signals the process. Killing an already-dead terminal is not an error.
@@ -346,7 +444,17 @@ mod tests {
         let terminals = Terminals::default();
         let (tx, _rx) = channel();
         let id = terminals
-            .create("echo", &["hello".into()], &[], cwd(), None, tx)
+            .create(
+                TerminalSpec {
+                    command: "echo",
+                    args: &["hello".into()],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: false,
+                },
+                tx,
+            )
             .unwrap();
 
         let status = terminals.wait_for_exit(&id).await.unwrap();
@@ -363,7 +471,17 @@ mod tests {
         let terminals = Terminals::default();
         let (tx, mut rx) = channel();
         let id = terminals
-            .create("echo", &["streamed".into()], &[], cwd(), None, tx)
+            .create(
+                TerminalSpec {
+                    command: "echo",
+                    args: &["streamed".into()],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: false,
+                },
+                tx,
+            )
             .unwrap();
 
         let mut streamed = Vec::new();
@@ -402,9 +520,22 @@ mod tests {
         let terminals = Terminals::default();
         let (tx, _rx) = channel();
         let id = terminals
-            .create("sh", &["-c".into(), "exit 3".into()], &[], cwd(), None, tx)
+            .create(
+                TerminalSpec {
+                    command: "sh",
+                    args: &["-c".into(), "exit 3".into()],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: false,
+                },
+                tx,
+            )
             .unwrap();
-        assert_eq!(terminals.wait_for_exit(&id).await.unwrap().exit_code, Some(3));
+        assert_eq!(
+            terminals.wait_for_exit(&id).await.unwrap().exit_code,
+            Some(3)
+        );
     }
 
     #[tokio::test]
@@ -413,11 +544,14 @@ mod tests {
         let (tx, _rx) = channel();
         let id = terminals
             .create(
-                "sh",
-                &["-c".into(), "echo $MJX_TERM_TEST; pwd".into()],
-                &[("MJX_TERM_TEST".into(), "set".into())],
-                cwd(),
-                None,
+                TerminalSpec {
+                    command: "sh",
+                    args: &["-c".into(), "echo $MJX_TERM_TEST; pwd".into()],
+                    env: &[("MJX_TERM_TEST".into(), "set".into())],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: false,
+                },
                 tx,
             )
             .unwrap();
@@ -434,11 +568,17 @@ mod tests {
         // Far more output than the 64-byte budget allows.
         let id = terminals
             .create(
-                "sh",
-                &["-c".into(), "for i in $(seq 1 500); do echo line$i; done".into()],
-                &[],
-                cwd(),
-                Some(64),
+                TerminalSpec {
+                    command: "sh",
+                    args: &[
+                        "-c".into(),
+                        "for i in $(seq 1 500); do echo line$i; done".into(),
+                    ],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: Some(64),
+                    interactive: false,
+                },
                 tx,
             )
             .unwrap();
@@ -449,7 +589,11 @@ mod tests {
 
         let (output, truncated, _) = terminals.output(&id).unwrap();
         assert!(truncated, "the truncation flag was never set");
-        assert!(output.len() <= 64, "kept {} bytes of a 64 budget", output.len());
+        assert!(
+            output.len() <= 64,
+            "kept {} bytes of a 64 budget",
+            output.len()
+        );
         // The *end* is what survives: recent output is the useful part.
         assert!(output.contains("line500"), "{output:?}");
         assert!(!output.contains("line1\n"), "{output:?}");
@@ -460,7 +604,17 @@ mod tests {
         let terminals = Terminals::default();
         let (tx, _rx) = channel();
         let id = terminals
-            .create("sleep", &["60".into()], &[], cwd(), None, tx)
+            .create(
+                TerminalSpec {
+                    command: "sleep",
+                    args: &["60".into()],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: false,
+                },
+                tx,
+            )
             .unwrap();
 
         terminals.kill(&id).unwrap();
@@ -468,7 +622,11 @@ mod tests {
             .await
             .expect("kill did not take effect")
             .unwrap();
-        assert_ne!(status.exit_code, Some(0), "a killed process exited cleanly?");
+        assert_ne!(
+            status.exit_code,
+            Some(0),
+            "a killed process exited cleanly?"
+        );
 
         // Killing twice is not an error.
         assert!(terminals.kill(&id).is_ok());
@@ -479,7 +637,17 @@ mod tests {
         let terminals = Terminals::default();
         let (tx, _rx) = channel();
         let id = terminals
-            .create("echo", &["x".into()], &[], cwd(), None, tx)
+            .create(
+                TerminalSpec {
+                    command: "echo",
+                    args: &["x".into()],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: false,
+                },
+                tx,
+            )
             .unwrap();
 
         terminals.wait_for_exit(&id).await.unwrap();
@@ -505,11 +673,117 @@ mod tests {
     async fn a_command_that_does_not_exist_fails_with_its_name() {
         let terminals = Terminals::default();
         let (tx, _rx) = channel();
-        let result = terminals.create("mjx-no-such-command", &[], &[], cwd(), None, tx);
+        let result = terminals.create(
+            TerminalSpec {
+                command: "mjx-no-such-command",
+                args: &[],
+                env: &[],
+                cwd: cwd(),
+                output_byte_limit: None,
+                interactive: false,
+            },
+            tx,
+        );
         let Err(err) = result else {
             panic!("spawning a nonexistent command should fail");
         };
         assert!(err.to_string().contains("mjx-no-such-command"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_interactive_terminal_reads_what_is_written_to_it() {
+        let terminals = Terminals::default();
+        let (tx, _rx) = channel();
+        // `cat` is the smallest thing that proves the write reached the far end:
+        // it echoes stdin back, so the bytes come out through the same reader
+        // the browser is watching.
+        let id = terminals
+            .create(
+                TerminalSpec {
+                    command: "cat",
+                    args: &[],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: true,
+                },
+                tx,
+            )
+            .unwrap();
+
+        terminals
+            .write(&id, b"a-secret-typed-by-the-operator\n")
+            .unwrap();
+
+        // A PTY echoes as well as `cat` doing so, which is exactly what a login
+        // prompt relies on; either copy proves the write landed.
+        output_containing(&terminals, &id, "a-secret-typed-by-the-operator").await;
+        terminals.kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_terminal_the_agent_owns_takes_no_input() {
+        // The security boundary. Every terminal `terminal/create` produces is
+        // built this way, and a browser that could type into one would be a
+        // shell on a server with no authentication of its own.
+        let terminals = Terminals::default();
+        let (tx, _rx) = channel();
+        let id = terminals
+            .create(
+                TerminalSpec {
+                    command: "sleep",
+                    args: &["60".into()],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: false,
+                },
+                tx,
+            )
+            .unwrap();
+
+        let err = terminals.write(&id, b"whoami\n").unwrap_err();
+        assert!(matches!(err, WorkspaceError::NotInteractive(_)), "{err}");
+        // Refused, not absent: the caller asked for the wrong thing, and
+        // asking again will not change the answer.
+        assert_eq!(err.code(), -32602);
+        terminals.kill(&id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn writing_to_a_terminal_that_is_gone_says_so() {
+        let terminals = Terminals::default();
+        let err = terminals.write("term-999", b"x").unwrap_err();
+        assert!(matches!(err, WorkspaceError::NoSuchTerminal(_)), "{err}");
+        assert_eq!(err.code(), -32002, "absent, not refused");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_can_be_told_the_size_it_is_shown_at() {
+        let terminals = Terminals::default();
+        let (tx, _rx) = channel();
+        let id = terminals
+            .create(
+                TerminalSpec {
+                    command: "sh",
+                    args: &["-c".into(), "sleep 60".into()],
+                    env: &[],
+                    cwd: cwd(),
+                    output_byte_limit: None,
+                    interactive: true,
+                },
+                tx,
+            )
+            .unwrap();
+
+        terminals.resize(&id, 40, 100).unwrap();
+        // A pane that has not been laid out yet reports zero. Passing that on
+        // would tell the process it has no screen, so it is ignored rather than
+        // refused — the browser is not doing anything wrong.
+        terminals.resize(&id, 0, 0).unwrap();
+
+        assert!(terminals.resize("term-999", 40, 100).is_err());
+        terminals.kill(&id).unwrap();
     }
 
     #[test]
