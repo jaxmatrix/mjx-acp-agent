@@ -30,6 +30,10 @@
 use mjx_acp_core::{acp, ext};
 use mjx_agent_catalog::AgentCommand;
 
+pub mod env_var;
+
+pub use env_var::EnvVarProvider;
+
 /// One thing that knows how to satisfy some auth methods.
 ///
 /// Every hook but [`AuthProvider::name`] has a default, and each default
