@@ -204,6 +204,19 @@ impl Outbox {
         )
     }
 
+    /// As [`Outbox::for_test`], with a socket already attached so what the
+    /// browser would receive can be read too.
+    #[cfg(test)]
+    pub fn for_test_with_browser() -> (
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (outbox, to_agent_rx) = Self::for_test();
+        let (_generation, to_browser_rx) = outbox.to_browser.attach();
+        (outbox, to_agent_rx, to_browser_rx)
+    }
+
     /// Sends an already-serialized line towards one side.
     ///
     /// The relay forwards frames verbatim, including ones it could not parse,
@@ -742,8 +755,18 @@ impl<I: Interceptor> Relay<I> {
             Direction::AgentToClient => self.interceptor.on_agent_frame(&frame, &self.outbox),
         };
 
-        match disposition {
-            Disposition::Forward => {
+        // A rewritten frame takes the forwarded frame's place and is otherwise
+        // treated identically. Giving it a path of its own is what let it
+        // silently lose `ends_turn`, and would have let it lose the re-ask list
+        // and the announcement next.
+        let forwarded = match &disposition {
+            Disposition::Forward => Some(&frame),
+            Disposition::Rewrite(rewritten) => Some(rewritten),
+            Disposition::Intercept => None,
+        };
+
+        match forwarded {
+            Some(frame) => {
                 // Only what really reaches the browser is worth re-asking. The
                 // interceptor's `fs/*` and `terminal/*` traffic is answered by
                 // the server and never seen there.
@@ -757,12 +780,11 @@ impl<I: Interceptor> Relay<I> {
                 if direction == Direction::AgentToClient && matches!(frame, Frame::Request { .. }) {
                     self.unanswered.lock().await.push(frame.clone());
                 }
-                self.forward(direction, &frame, ends_turn).await;
-                self.announce_after_handshake(direction, &frame, label.as_deref())
+                self.forward(direction, frame, ends_turn).await;
+                self.announce_after_handshake(direction, frame, label.as_deref())
                     .await;
             }
-            Disposition::Rewrite(rewritten) => self.forward(direction, &rewritten, None).await,
-            Disposition::Intercept => {
+            None => {
                 // The browser never sees this frame, so mirror it to the
                 // inspector; otherwise a tool whose job is showing the protocol
                 // would have a blind spot exactly where the server is busiest.
@@ -1068,6 +1090,107 @@ pub fn merge_client_capabilities(frame: &Frame, fs: bool, terminal: bool) -> Opt
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// An interceptor that replaces every response the agent sends, so the
+    /// [`Disposition::Rewrite`] path can be exercised without a real one.
+    struct RewriteResponses;
+
+    impl Interceptor for RewriteResponses {
+        fn on_agent_frame(&self, frame: &Frame, _outbox: &Outbox) -> Disposition {
+            let Frame::Response { id, .. } = frame else {
+                return Disposition::Forward;
+            };
+            Disposition::Rewrite(Frame::error(
+                id.clone(),
+                JsonRpcError::internal("rewritten by the test"),
+            ))
+        }
+    }
+
+    /// A relay with no agent behind it, for exercising `handle` directly.
+    fn relay_for_test<I: Interceptor>(
+        interceptor: I,
+    ) -> (
+        Relay<I>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (outbox, to_agent, to_browser) = Outbox::for_test_with_browser();
+        let relay = Relay {
+            interceptor: Arc::new(interceptor),
+            correlator: tokio::sync::Mutex::new(MethodCorrelator::new()),
+            ids: tokio::sync::Mutex::new(IdBridge::new()),
+            outbox,
+            agent_info: ext::AgentInfo {
+                agent_id: "test".into(),
+                name: "Test".into(),
+                command: Vec::new(),
+                cwd: String::new(),
+                connection_id: "c1".into(),
+                resumed: false,
+                mcp_servers: Vec::new(),
+            },
+            mcp_servers: Vec::new(),
+            handshake: tokio::sync::Mutex::new(Handshake::default()),
+            unanswered: tokio::sync::Mutex::new(Vec::new()),
+            reasked: AtomicBool::new(false),
+            sessions: tokio::sync::Mutex::new(SessionStore::new()),
+        };
+        (relay, to_agent, to_browser)
+    }
+
+    /// The `_mjx/*` notifications sent to the browser, in order.
+    fn notifications(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Vec<(String, String)> {
+        let mut seen = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            if let Ok(Frame::Notification { method, .. }) = Frame::parse(&line) {
+                seen.push((method, line));
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_rewritten_prompt_response_still_says_the_turn_is_over() {
+        // A response that is rewritten reaches the browser by the same path as
+        // one that is forwarded, so it must carry the same news. Before the two
+        // paths were merged the rewrite dropped `ends_turn`, and a browser that
+        // inherited the turn would have shown "generating" for ever.
+        let (relay, _to_agent, mut to_browser) = relay_for_test(RewriteResponses);
+
+        let prompt = Frame::Request {
+            id: mjx_acp_core::RequestId::Number(1),
+            method: method::agent::SESSION_PROMPT.into(),
+            params: Some(
+                serde_json::value::to_raw_value(&json!({ "sessionId": "s1", "prompt": [] }))
+                    .unwrap(),
+            ),
+        };
+        relay
+            .handle(Direction::ClientToAgent, prompt.to_line())
+            .await;
+
+        // The browser that asked goes away, exactly as a reload does.
+        relay.ids.lock().await.reattach();
+
+        let answer = Frame::Response {
+            id: mjx_acp_core::RequestId::Number(1),
+            payload: ResponsePayload::Result(
+                serde_json::value::to_raw_value(&json!({ "stopReason": "end_turn" })).unwrap(),
+            ),
+        };
+        relay
+            .handle(Direction::AgentToClient, answer.to_line())
+            .await;
+
+        let ended = notifications(&mut to_browser)
+            .into_iter()
+            .find(|(method, _)| method == ext::SESSION_TURN_ENDED)
+            .expect("a rewritten prompt response must still end the turn");
+        assert!(ended.1.contains("\"sessionId\":\"s1\""));
+    }
 
     fn initialize(params: serde_json::Value) -> Frame {
         Frame::Request {
