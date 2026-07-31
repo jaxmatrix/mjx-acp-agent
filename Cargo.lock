@@ -1275,6 +1275,7 @@ dependencies = [
  "futures",
  "mjx-acp-core",
  "mjx-acp-thread",
+ "mjx-agent-auth",
  "mjx-agent-catalog",
  "mjx-mcp",
  "mjx-workspace",

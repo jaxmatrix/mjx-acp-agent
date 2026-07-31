@@ -327,6 +327,32 @@ impl Client {
         }
     }
 
+    /// As [`Client::request`], but hands back a failure instead of panicking.
+    ///
+    /// For the tests that are *about* an error — an agent refusing to start a
+    /// session until it is authenticated, most of all.
+    async fn try_request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, mjx_acp_core::JsonRpcError> {
+        let id = self.start_request(method, params).await;
+        loop {
+            match self.next_frame().await {
+                Frame::Response {
+                    id: ref got,
+                    ref payload,
+                } if *got == id => {
+                    return match payload {
+                        ResponsePayload::Result(r) => Ok(serde_json::from_str(r.get()).unwrap()),
+                        ResponsePayload::Error(e) => Err(e.clone()),
+                    };
+                }
+                other => self.handle(other).await,
+            }
+        }
+    }
+
     async fn handle(&mut self, frame: Frame) {
         match frame {
             Frame::Notification { method, params } => {
@@ -1117,9 +1143,7 @@ async fn a_browser_restoring_several_conversations_is_asked_the_parked_question_
         .to_string();
     // A second conversation on the same socket, so the restore below really
     // does replay more than once. This is the shape the viewer's tabs have.
-    let other = first
-        .request(method::agent::SESSION_NEW, new_session)
-        .await["sessionId"]
+    let other = first.request(method::agent::SESSION_NEW, new_session).await["sessionId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1169,7 +1193,10 @@ async fn a_browser_restoring_several_conversations_is_asked_the_parked_question_
     // outbox is one ordered channel, and anything queued by the replay above
     // reaches us before this answer does.
     second
-        .request(ext::SESSION_REPLAY, json!({ "sessionId": "no-such-session" }))
+        .request(
+            ext::SESSION_REPLAY,
+            json!({ "sessionId": "no-such-session" }),
+        )
         .await;
 
     let asked = second
@@ -1697,12 +1724,17 @@ async fn a_deleted_session_leaves_neither_a_listing_nor_a_thread() {
     );
 
     client
-        .request(method::agent::SESSION_DELETE, json!({ "sessionId": session_id }))
+        .request(
+            method::agent::SESSION_DELETE,
+            json!({ "sessionId": session_id }),
+        )
         .await;
 
     let sessions = list_sessions(&mut client, json!({})).await;
     assert!(
-        !sessions.iter().any(|s| s["sessionId"] == session_id.as_str()),
+        !sessions
+            .iter()
+            .any(|s| s["sessionId"] == session_id.as_str()),
         "the agent still lists a deleted session: {sessions:#?}"
     );
     // And the server let go of it too: replaying a session the agent has
@@ -2102,6 +2134,276 @@ async fn mcp_over_acp_is_forwarded_when_nothing_is_hosted_here() {
             .any(|method| method.starts_with("mcp/")),
         "the agent asked for MCP over ACP uninvited: {:?}",
         client.client_requests
+    );
+
+    server.stop().await;
+}
+
+/// A server whose `[[agents]]` list also holds an agent that demands
+/// authentication, plus whatever `providers` configure.
+async fn server_with_an_agent_that_needs_auth(providers: &str) -> Server {
+    Server::start_with(ServerOptions {
+        extra_config: format!(
+            r#"
+            [[agents]]
+            id = "locked"
+            name = "Locked Agent"
+            command = "{}"
+            args = ["--needs-auth"]
+
+            {providers}
+            "#,
+            mock_agent_binary().display(),
+        ),
+        ..Default::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn an_agent_that_needs_authentication_says_which_methods_it_offers() {
+    // The whole point of MJX-192. Before this, the agent's -32000 reached the
+    // browser as a stringified JSON-RPC object and thirty-odd agents in the
+    // picker looked broken for no stated reason.
+    let server = server_with_an_agent_that_needs_auth("").await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+
+    let init = client
+        .request(
+            method::agent::INITIALIZE,
+            json!({
+                "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
+                "clientCapabilities": {}
+            }),
+        )
+        .await;
+
+    // The methods really are on the handshake, and really are the shapes the
+    // schema defines — the browser reads them from here.
+    let methods: Vec<acp::AuthMethod> =
+        serde_json::from_value(init["authMethods"].clone()).expect("valid AuthMethods");
+    assert_eq!(methods.len(), 3, "{:?}", init["authMethods"]);
+    // The terminal one is offered because this server declares it can run a
+    // login, which the browser never asked for and could not provide itself.
+    assert!(
+        methods
+            .iter()
+            .any(|m| matches!(m, acp::AuthMethod::Terminal(_))),
+        "the server must declare auth.terminal on the browser's behalf"
+    );
+    let info = client.wait_for_ext(ext::AGENT_INFO).await;
+
+    let error = client
+        .try_request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await
+        .expect_err("the agent must refuse until it is authenticated");
+
+    assert!(error.is_auth_required(), "{error:?}");
+    // The agent's own message survives; what is added is the part it could not
+    // know — what this server can and cannot do about it.
+    assert_eq!(error.message, "authenticate before starting a session");
+
+    let detail: ext::AuthState = serde_json::from_str(
+        error
+            .data
+            .as_ref()
+            .expect("the error must carry detail")
+            .get(),
+    )
+    .expect("valid AuthState");
+    assert!(detail.required);
+    assert!(!detail.authenticated);
+    assert_eq!(detail.refused_method.as_deref(), Some("session/new"));
+    assert_eq!(detail.methods.len(), 3);
+
+    let env = detail
+        .methods
+        .iter()
+        .find(|m| m.kind == "envVar")
+        .expect("the env_var method must be described");
+    // With nothing configured it still names the variable and links the docs,
+    // which is what stops the picker over-promising.
+    assert_eq!(env.secrets[0].name, "MJX_MOCK_API_KEY");
+    assert!(!env.secrets[0].present);
+    assert!(env.link.is_some());
+    assert!(
+        env.instructions
+            .as_deref()
+            .is_some_and(|i| i.contains("MJX_MOCK_API_KEY")),
+        "{env:?}"
+    );
+    // Names and reasons only. A value reaching the browser is the thing the
+    // server holding credentials exists to prevent.
+    assert!(
+        !client
+            .received
+            .iter()
+            .any(|line| line.contains("not-a-real")),
+        "no credential may reach the browser"
+    );
+
+    // Beside the error, not instead of it: the refusal belongs to the
+    // connection, and the panel that renders it outlives the one request.
+    let announced = client.wait_for_ext(ext::AUTH_REQUIRED).await;
+    assert_eq!(announced["required"], true);
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn the_auth_state_can_be_asked_for_by_a_browser_that_missed_the_refusal() {
+    // A pull rather than a push, because the refusal may have arrived while a
+    // different browser was attached — or none at all.
+    let server = server_with_an_agent_that_needs_auth("").await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+    let info = handshake(&mut client).await;
+
+    let state = client.request(ext::AUTH_STATE, json!({})).await;
+    let state: ext::AuthState = serde_json::from_value(state).expect("valid AuthState");
+    // Nothing has been refused yet, so nothing is required — but the methods
+    // are already known, because they came off `initialize`.
+    assert!(!state.required);
+    assert_eq!(state.methods.len(), 3);
+
+    let _ = client
+        .try_request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+
+    let state = client.request(ext::AUTH_STATE, json!({})).await;
+    let state: ext::AuthState = serde_json::from_value(state).expect("valid AuthState");
+    assert!(state.required, "the refusal must outlive the request");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_configured_provider_supplies_the_credential_and_says_who_did() {
+    // `env` reaches the agent at spawn — before `initialize`, which is why the
+    // provider keys on the agent id and not on what the agent later asks for.
+    let server = server_with_an_agent_that_needs_auth(
+        r#"
+        [[auth_providers]]
+        name = "mock-keys"
+        kind = "env"
+        agents = ["locked"]
+        env = { MJX_MOCK_API_KEY = "not-a-real-key" }
+        "#,
+    )
+    .await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+    let info = handshake(&mut client).await;
+
+    let error = client
+        .try_request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await
+        .expect_err("the mock refuses until `authenticate`, whatever is in its environment");
+
+    let detail: ext::AuthState = serde_json::from_str(error.data.as_ref().unwrap().get()).unwrap();
+    let env = detail
+        .methods
+        .iter()
+        .find(|m| m.kind == "envVar")
+        .expect("the env_var method must be described");
+
+    assert_eq!(env.provider.as_deref(), Some("mock-keys"));
+    assert!(env.secrets[0].present, "the provider supplies it");
+    // The fail-loud case: everything is set and the agent said no anyway, so
+    // the honest report is that the value is wrong — never that it worked.
+    assert!(
+        env.instructions
+            .as_deref()
+            .is_some_and(|i| i.contains("refused")),
+        "{env:?}"
+    );
+    // The name travelled. The value did not.
+    assert!(
+        !client
+            .received
+            .iter()
+            .any(|line| line.contains("not-a-real-key")),
+        "a credential reached the browser"
+    );
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_terminal_provider_offers_to_run_the_agents_own_login() {
+    let server = server_with_an_agent_that_needs_auth(
+        r#"
+        [[auth_providers]]
+        name = "interactive"
+        kind = "terminal"
+        "#,
+    )
+    .await;
+    let mut client = Client::connect(&server.ws("agent=locked")).await;
+    let info = handshake(&mut client).await;
+
+    let error = client
+        .try_request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await
+        .expect_err("the agent must refuse");
+
+    let detail: ext::AuthState = serde_json::from_str(error.data.as_ref().unwrap().get()).unwrap();
+    let terminal = detail
+        .methods
+        .iter()
+        .find(|m| m.kind == "terminal")
+        .expect("the terminal method must be described");
+    assert_eq!(terminal.provider.as_deref(), Some("interactive"));
+
+    // The env provider is not configured, so it is not the one that answered —
+    // and the terminal one declines the env method for a reason the panel keeps
+    // rather than reducing to "unsupported".
+    let env = detail.methods.iter().find(|m| m.kind == "envVar").unwrap();
+    assert_eq!(env.provider, None);
+    assert_eq!(env.declines[0].provider, "interactive");
+
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_agent_that_needs_nothing_is_untouched() {
+    // The regression that would be easiest to miss: the mock in its normal
+    // mode advertises no auth methods, and none of this may show up for it.
+    let server = Server::start().await;
+    let mut client = Client::connect(&server.ws("agent=mock")).await;
+
+    let init = client
+        .request(
+            method::agent::INITIALIZE,
+            json!({
+                "protocolVersion": mjx_acp_core::PROTOCOL_VERSION,
+                "clientCapabilities": {}
+            }),
+        )
+        .await;
+    assert_eq!(init["authMethods"], json!([]));
+    let info = client.wait_for_ext(ext::AGENT_INFO).await;
+
+    let session = client
+        .request(
+            method::agent::SESSION_NEW,
+            json!({ "cwd": info["cwd"], "mcpServers": [] }),
+        )
+        .await;
+    assert!(session["sessionId"].is_string());
+    assert!(
+        !client.saw_ext(ext::AUTH_REQUIRED),
+        "an agent that asked for nothing must not produce an auth panel"
     );
 
     server.stop().await;
