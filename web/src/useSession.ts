@@ -1,11 +1,11 @@
-/** React binding for {@link Session}. */
+/** React binding for {@link AgentConnection}. */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ContentBlock } from "@agentclientprotocol/sdk";
 
 import { noCapabilities, type AgentCapabilities } from "./acp/capabilities";
 import { resumeStore, sessionStore } from "./acp/resume";
-import { Session, type SessionStatus } from "./acp/session";
+import { AgentConnection, type ConnectionStatus } from "./acp/agentConnection";
 import {
   emptyThread,
   type AgentInfo,
@@ -18,7 +18,7 @@ import {
 /** Everything a connected view needs. */
 export interface SessionState {
   thread: Thread;
-  status: SessionStatus;
+  status: ConnectionStatus;
   agentInfo?: AgentInfo;
   /** What the agent said it can do; the history UI offers nothing else. */
   capabilities: AgentCapabilities;
@@ -67,7 +67,7 @@ const sessions = sessionStore();
 /** Opens a session against `agentId` in `cwd`, and keeps React in step. */
 export function useSession(agentId: string | null, cwd: string | null): SessionState {
   const [thread, setThread] = useState<Thread>(emptyThread);
-  const [status, setStatus] = useState<SessionStatus>({ state: "connecting" });
+  const [status, setStatus] = useState<ConnectionStatus>({ state: "connecting" });
   const [agentInfo, setAgentInfo] = useState<AgentInfo>();
   const [frames, setFrames] = useState<InspectorEntry[]>([]);
   const [error, setError] = useState<string>();
@@ -79,7 +79,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
   /** Bumped to reopen the socket; see `reconnect`. */
   const [attempt, setAttempt] = useState(0);
 
-  const session = useRef<Session>(null);
+  const session = useRef<AgentConnection>(null);
   const nextSeq = useRef(0);
 
   useEffect(() => {
@@ -103,7 +103,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
       clear: () => sessions.clear(agentId, cwd ?? ""),
     };
 
-    const active = new Session(emptyThread(), {
+    const active = new AgentConnection(emptyThread(), {
       thread: setThread,
       capabilities: setCapabilities,
       replaying: setReplayingSessionId,
@@ -180,7 +180,7 @@ export function useSession(agentId: string | null, cwd: string | null): SessionS
 
   /** Runs one lifecycle call, and refreshes the list it just changed. */
   const lifecycle = useCallback(
-    (run: (session: Session) => Promise<unknown>, listAgain = true) => {
+    (run: (session: AgentConnection) => Promise<unknown>, listAgain = true) => {
       const active = session.current;
       if (!active) return;
       run(active)

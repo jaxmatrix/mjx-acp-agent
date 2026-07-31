@@ -1,5 +1,5 @@
 /**
- * Drives {@link Session} against a real ACP agent, in process.
+ * Drives {@link AgentConnection} against a real ACP agent, in process.
  *
  * The agent here is the SDK's own agent app rather than a hand-written double,
  * so every frame is parsed by the generated schemas on the way past — a request
@@ -11,7 +11,7 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { describe, expect, test } from "vitest";
 
-import { Session, type SessionEvents, type SessionMemory } from "./session";
+import { AgentConnection, type ConnectionEvents, type OpenSessions } from "./agentConnection";
 import { emptyThread, type Thread } from "./types";
 
 /** A conversation the fake agent remembers, as the updates that built it. */
@@ -30,7 +30,7 @@ interface AgentLog {
 }
 
 /**
- * An ACP agent that lists, loads and forks, wired straight to `Session`.
+ * An ACP agent that lists, loads and forks, wired straight to `AgentConnection`.
  *
  * A pair of object streams rather than a socket: the SDK reads and writes
  * messages, not bytes, so this is the same code path with the transport taken
@@ -141,8 +141,8 @@ function connectedAgent(
   return { stream: { readable: toClient.readable, writable: toAgent.writable }, log };
 }
 
-/** Everything `Session` reports, collected. */
-function watcher(): { events: SessionEvents; thread: () => Thread; replaying: () => string[] } {
+/** Everything `AgentConnection` reports, collected. */
+function watcher(): { events: ConnectionEvents; thread: () => Thread; replaying: () => string[] } {
   let thread = emptyThread();
   const replaying: string[] = [];
   return {
@@ -161,7 +161,7 @@ function watcher(): { events: SessionEvents; thread: () => Thread; replaying: ()
 }
 
 /** A memory that starts holding `sessionId`, as a reloaded tab's would. */
-function memory(sessionId?: string): SessionMemory & { value: () => string | undefined } {
+function memory(sessionId?: string): OpenSessions & { value: () => string | undefined } {
   let held = sessionId;
   return {
     get: () => held,
@@ -182,7 +182,7 @@ async function connected(capabilities: unknown = LIFECYCLE, held?: string, threa
   // A tab that remembers a session is a tab that reloaded, so the connection it
   // gets back is a resumed one.
   const agent = connectedAgent(capabilities, held !== undefined, threads);
-  const session = new Session(emptyThread(), seen.events, held_);
+  const session = new AgentConnection(emptyThread(), seen.events, held_);
   await session.connect({ agentId: "fake", cwd: "/w" }, () => agent.stream);
   return { session, seen, memory: held_, log: agent.log };
 }

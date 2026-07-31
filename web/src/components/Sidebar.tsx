@@ -1,6 +1,6 @@
 /** The plan, session controls and usage — everything that isn't the timeline. */
 
-import type { SessionStatus } from "../acp/session";
+import type { ConnectionStatus } from "../acp/agentConnection";
 import { mcpServersOf } from "../acp/mcp";
 import type { AgentInfo, Thread } from "../acp/types";
 import { ConfigOptions } from "./ConfigOptions";
@@ -20,7 +20,7 @@ export function Sidebar({
 }: {
   thread: Thread;
   agentInfo?: AgentInfo;
-  status: SessionStatus;
+  status: ConnectionStatus;
   onSetMode(modeId: string): void;
   onSetConfigOption(configId: string, value: string | boolean): void;
 }) {

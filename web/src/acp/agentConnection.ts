@@ -44,7 +44,7 @@ import {
 } from "./types";
 
 /** What the UI subscribes to. */
-export interface SessionEvents {
+export interface ConnectionEvents {
   /** A new thread state. */
   thread(next: Thread): void;
   /** Which agent the server connected us to. */
@@ -58,7 +58,7 @@ export interface SessionEvents {
   /** A frame for the inspector. */
   frame(entry: Omit<InspectorEntry, "seq" | "at">): void;
   /** Connection lifecycle. */
-  status(status: SessionStatus): void;
+  status(status: ConnectionStatus): void;
 }
 
 /**
@@ -69,7 +69,7 @@ export interface SessionEvents {
  * remembered still works, it just comes back to the connection's original
  * conversation.
  */
-export interface SessionMemory {
+export interface OpenSessions {
   get(): string | undefined;
   set(sessionId: string): void;
   clear(): void;
@@ -87,8 +87,8 @@ export interface SessionMemory {
  */
 export type TargetSession = string | { sessionId: string; cwd?: string };
 
-/** Where the session is in its lifecycle. */
-export type SessionStatus =
+/** Where the connection is in its lifecycle. */
+export type ConnectionStatus =
   | { state: "connecting" }
   | { state: "ready"; sessionId: string }
   | { state: "failed"; message: string }
@@ -96,13 +96,13 @@ export type SessionStatus =
   | { state: "takenOver" }
   | { state: "closed" };
 
-/** A live session. */
-export class Session {
+/** A live connection to one agent. */
+export class AgentConnection {
   #connection?: acp.ClientConnection;
   #agent?: acp.ClientContext;
   #sessionId?: string;
   #thread: Thread;
-  #events: SessionEvents;
+  #events: ConnectionEvents;
   /** Resolvers for permission prompts the user hasn't answered yet. */
   #pendingPermissions = new Map<string, (optionId: string | null) => void>();
   /**
@@ -124,7 +124,7 @@ export class Session {
   /** What the agent said it can do, from the `initialize` response. */
   #capabilities: AgentCapabilities = noCapabilities();
   /** Where the session on screen is remembered across a reload. */
-  #memory?: SessionMemory;
+  #memory?: OpenSessions;
   /**
    * The directory this connection was opened for.
    *
@@ -135,7 +135,7 @@ export class Session {
    */
   #cwd = "";
 
-  constructor(initial: Thread, events: SessionEvents, memory?: SessionMemory) {
+  constructor(initial: Thread, events: ConnectionEvents, memory?: OpenSessions) {
     this.#thread = initial;
     this.#events = events;
     this.#memory = memory;
